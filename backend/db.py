@@ -8,6 +8,8 @@ from typing import Any
 from .config import settings
 from .migrations import apply_migrations
 
+MAX_RUN_EVENTS = 500
+
 
 def utcnow() -> str:
     return datetime.now(UTC).isoformat()
@@ -57,6 +59,11 @@ def add_event(run_id: str, event_type: str, message: str, data: Any = None) -> i
         cursor = db.execute(
             "insert into run_events(run_id,event_type,message,data_json,created_at) values(?,?,?,?,?)",
             (run_id, event_type, message, json.dumps(data, ensure_ascii=False) if data is not None else None, utcnow()),
+        )
+        db.execute(
+            "delete from run_events where run_id=? and id not in "
+            "(select id from run_events where run_id=? order by id desc limit ?)",
+            (run_id, run_id, MAX_RUN_EVENTS),
         )
         db.commit()
         return int(cursor.lastrowid)

@@ -176,6 +176,7 @@
             <div class="editor-toolbar">
               <span class="toolbar-label">Chat — <span id="ollamaStatus">connecting…</span></span>
               <span id="workspaceTag" class="workspace-tag hidden" title="Active workspace folder sent to Ollama"></span>
+              <span id="contextTag" class="workspace-tag hidden" title="Pinned files sent to Ollama"></span>
               <button id="applyCodeBtn" title="Apply last code block to the active file">Apply to File</button>
             </div>
             <div id="messages" class="messages">
@@ -202,6 +203,7 @@
           <section id="fileEditor" class="editor-pane hidden">
             <div class="editor-toolbar">
               <span id="fileTitle">No file selected</span>
+              <button id="pinFileBtn" disabled title="Add or remove this file from chat context">Pin to Chat</button>
               <button id="saveFileBtn">Save + Snapshot</button>
             </div>
             <textarea id="editor" spellcheck="false" placeholder="Select a file from Explorer"></textarea>

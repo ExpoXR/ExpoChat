@@ -1,3 +1,4 @@
+import asyncio
 import json
 import threading
 import time
@@ -15,8 +16,8 @@ from .workspace_tools import TOOL_DEFS, execute_tool
 configure_logging()
 app = FastAPI(title="Ollma Isolated Worker", docs_url=None, redoc_url=None)
 JOBS_ROOT = settings.jobs_dir.resolve()
-_cancel_events: dict[str, threading.Event] = {}
-_active_clients: dict[str, httpx.Client] = {}
+_cancel_events: dict[str, asyncio.Event] = {}
+_active_tasks: dict[str, asyncio.Task[Any]] = {}
 _cancel_lock = threading.Lock()
 
 
@@ -41,7 +42,7 @@ def workspace_for(request: WorkRequest) -> Path:
     return path
 
 
-def agent_loop(request: WorkRequest, root: Path, cancelled: threading.Event | None = None) -> dict[str, Any]:
+async def agent_loop(request: WorkRequest, root: Path, cancelled: asyncio.Event | None = None) -> dict[str, Any]:
     writable = request.mode == "implementation"
     tools = TOOL_DEFS if writable else [tool for tool in TOOL_DEFS if tool["function"]["name"] not in {"write_file", "replace_text", "delete_file"}]
     system = {
@@ -58,16 +59,14 @@ def agent_loop(request: WorkRequest, root: Path, cancelled: threading.Event | No
     final = ""
     usage = {"prompt_eval_count": 0, "eval_count": 0, "model_duration_ns": 0, "tool_calls": 0}
     deadline = time.monotonic() + 900
-    with httpx.Client(timeout=300) as client:
-        with _cancel_lock:
-            _active_clients[request.run_id] = client
+    async with httpx.AsyncClient(timeout=300) as client:
         for turn in range(request.max_turns):
             if cancelled and cancelled.is_set():
                 return {"ok": False, "cancelled": True, "content": final, "events": events, "turns": turn, "usage": usage}
             if time.monotonic() >= deadline:
                 return {"ok": False, "content": final[:200_000], "events": events, "turns": turn, "usage": usage, "error": "Agent time limit reached"}
             try:
-                response = client.post(
+                response = await client.post(
                     settings.ollama_url + "/api/chat",
                     headers={"X-Worker-Token": settings.worker_token},
                     json={"model": request.model, "messages": messages, "tools": tools, "stream": False},
@@ -101,7 +100,7 @@ def agent_loop(request: WorkRequest, root: Path, cancelled: threading.Event | No
                     except json.JSONDecodeError:
                         args = {}
                 try:
-                    result = execute_tool(root, name, args, writable)
+                    result = await asyncio.to_thread(execute_tool, root, name, args, writable)
                 except Exception as exc:
                     result = f"Tool error: {type(exc).__name__}: {exc}"
                 events.append({"type": "tool", "turn": turn + 1, "name": name, "args": args, "result": result[:8000]})
@@ -115,28 +114,33 @@ def health() -> dict[str, Any]:
 
 
 @app.post("/execute", dependencies=[Depends(authorize)])
-def execute(request: WorkRequest) -> dict[str, Any]:
+async def execute(request: WorkRequest) -> dict[str, Any]:
     root = workspace_for(request)
-    event = threading.Event()
+    event = asyncio.Event()
+    task = asyncio.current_task()
     with _cancel_lock:
         _cancel_events[request.run_id] = event
+        if task:
+            _active_tasks[request.run_id] = task
     try:
-        return agent_loop(request, root, event)
+        return await agent_loop(request, root, event)
+    except asyncio.CancelledError:
+        return {"ok": False, "cancelled": True, "content": "", "events": [], "turns": 0, "usage": {}}
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Ollama request failed: {exc}") from exc
     finally:
         with _cancel_lock:
             _cancel_events.pop(request.run_id, None)
-            _active_clients.pop(request.run_id, None)
+            _active_tasks.pop(request.run_id, None)
 
 
 @app.post("/cancel/{run_id}", dependencies=[Depends(authorize)])
-def cancel(run_id: str) -> dict[str, Any]:
+async def cancel(run_id: str) -> dict[str, Any]:
     with _cancel_lock:
         event = _cancel_events.get(run_id)
-        client = _active_clients.get(run_id)
+        task = _active_tasks.get(run_id)
         if event:
             event.set()
-    if client:
-        client.close()
+        if task:
+            task.cancel()
     return {"ok": True, "active": event is not None}

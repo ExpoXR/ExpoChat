@@ -1,6 +1,11 @@
 import { createApi } from "/js/api.mjs";
+import { buildChatPayload, chatEventStatus } from "/js/chat.mjs";
 import { escapeHtml, formatBytes, renderMarkdown } from "/js/render.mjs";
+import { artifactPresentation, runStatusLabel } from "/js/runs.mjs";
+import { providerOptions } from "/js/settings.mjs";
 import { consumeSse } from "/js/sse.mjs";
+import { readPreferences, writePreferences } from "/js/state.mjs";
+import { splitCommand, updatePinnedPaths } from "/js/workspace.mjs";
 
 // ---------------------------------------------------------------------------
 // State
@@ -12,6 +17,7 @@ let models = [];
 let chats = [];
 let currentChat = null;
 let currentFile = null;
+let pinnedContextPaths = [];
 let claudeEnabled = false;
 let openaiEnabled = false;
 let allowedRoots = [];
@@ -62,6 +68,45 @@ function setWorkspaceTag(path) {
   } else {
     tag.classList.add("hidden");
   };
+}
+
+function syncPinnedContext() {
+  const tag = $("contextTag");
+  const button = $("pinFileBtn");
+  const currentPinned = Boolean(currentFile && pinnedContextPaths.includes(currentFile));
+  button.disabled = !currentFile;
+  button.textContent = currentPinned ? "Unpin from Chat" : "Pin to Chat";
+  if (pinnedContextPaths.length) {
+    tag.textContent = `📌 ${pinnedContextPaths.length}`;
+    tag.title = `Pinned context:\n${pinnedContextPaths.join("\n")}`;
+    tag.classList.remove("hidden");
+  } else {
+    tag.classList.add("hidden");
+  }
+}
+
+function pinContextPath(path) {
+  if (!path) return;
+  pinnedContextPaths = updatePinnedPaths(pinnedContextPaths, path);
+  syncPinnedContext();
+  savePrefs();
+}
+
+function toggleCurrentFilePin() {
+  if (!currentFile) return;
+  if (pinnedContextPaths.includes(currentFile)) {
+    pinnedContextPaths = updatePinnedPaths(pinnedContextPaths, currentFile, false);
+    syncPinnedContext();
+    savePrefs();
+  } else {
+    pinContextPath(currentFile);
+  }
+}
+
+function resetPinnedContext() {
+  pinnedContextPaths = [];
+  syncPinnedContext();
+  savePrefs();
 }
 
 function showToast(message, type = "info") {
@@ -274,12 +319,12 @@ async function sendPrompt(event) {
         "Content-Type": "application/json",
         "X-CSRF-Token": csrfToken,
       },
-      body: JSON.stringify({
+      body: JSON.stringify(buildChatPayload(
         content,
-        model: $("modelSelect").value,
-        target_path: $("targetPath").value.trim(),
-        context_paths: currentFile ? [currentFile] : [],
-      }),
+        $("modelSelect").value,
+        $("targetPath").value.trim(),
+        pinnedContextPaths,
+      )),
     });
 
     if (!res.ok) {
@@ -303,8 +348,8 @@ async function sendPrompt(event) {
           continue;
         }
         if (parsed.error) throw new Error(parsed.error);
-        if (parsed.phase === "context") setStatus("Inspecting workspace…");
-        if (parsed.tool) setStatus(`Reading workspace: ${parsed.tool}`);
+        const eventStatus = chatEventStatus(parsed);
+        if (eventStatus) setStatus(eventStatus);
         if (parsed.token) {
           fullText += parsed.token;
           renderMessageContent(node, fullText);
@@ -372,6 +417,7 @@ async function openPath(path) {
 async function openFile(path) {
   const data = await api(`/api/file?path=${encodeURIComponent(path)}`);
   currentFile = data.path;
+  pinContextPath(currentFile);
   $("filePath").value = data.path;
   $("fileTitle").textContent = data.path;
   document.querySelector('.editor-tab[data-editor="fileEditor"]').textContent =
@@ -514,9 +560,7 @@ async function runTermCommand() {
     toggleTerm();
   }
   try {
-    const parts = cmd.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
-    const command = (parts.shift() || "").replace(/^['"]|['"]$/g, "");
-    const args = parts.map((item) => item.replace(/^['"]|['"]$/g, ""));
+    const { command, args } = splitCommand(cmd);
     const data = await api(`/api/runs/${currentRun}/console`, {
       method: "POST",
       body: JSON.stringify({ command, args }),
@@ -716,10 +760,6 @@ async function rejectPlan() {
   }
 }
 
-function runStatusLabel(run) {
-  return (run.status || "unknown").replaceAll("_", " ");
-}
-
 function renderCurrentRun(run) {
   currentRun = run.id;
   currentRunData = run;
@@ -767,19 +807,21 @@ function renderRunArtifacts(artifacts) {
     button.onclick = async () => {
       try {
         const data = await api(`/api/runs/${currentRun}/artifacts/${artifact.id}`);
-        if (artifact.kind === "changes") {
-          let content = data.content;
-          try { content = JSON.stringify(JSON.parse(content), null, 2); } catch (_) { /* plain content */ }
-          renderDiff(content);
+        const presentation = artifactPresentation(artifact, data.content);
+        if (presentation.type === "diff") {
+          renderDiff(presentation.content);
           switchEditor("diffEditor");
         } else {
-          let content = data.content;
-          try {
-            const parsed = JSON.parse(content);
-            content = parsed.summary || parsed.content || `\`\`\`json\n${JSON.stringify(parsed, null, 2)}\n\`\`\``;
-          } catch (_) { /* Markdown/plain text */ }
           $("artifactTitle").textContent = `${artifact.kind} · ${artifact.name}`;
-          $("artifactView").innerHTML = renderMarkdown(content);
+          if (presentation.type === "markdown") {
+            $("artifactView").innerHTML = renderMarkdown(presentation.content);
+          } else {
+            $("artifactView").innerHTML = "";
+            const pre = document.createElement("pre");
+            pre.className = presentation.type === "command" ? "term-output" : "artifact-json";
+            pre.textContent = presentation.content;
+            $("artifactView").appendChild(pre);
+          }
           switchEditor("artifactEditor");
         }
       } catch (err) { showToast(err.message, "error"); }
@@ -865,14 +907,14 @@ async function loadBrains() {
 }
 
 function syncProviderOptions() {
-  const enabled = brains.filter((brain) => brain.enabled);
+  const enabled = providerOptions(brains);
   const select = $("planProvider");
   const selected = select.value;
   select.innerHTML = "";
-  enabled.forEach((brain) => {
+  enabled.forEach((provider) => {
     const option = document.createElement("option");
-    option.value = brain.provider;
-    option.textContent = brain.provider === "codex" ? "Codex (OpenAI)" : "Claude (Anthropic)";
+    option.value = provider.value;
+    option.textContent = provider.label;
     select.appendChild(option);
   });
   if (!enabled.length) {
@@ -880,7 +922,7 @@ function syncProviderOptions() {
     option.value = "";
     option.textContent = "No AI provider configured";
     select.appendChild(option);
-  } else if (enabled.some((brain) => brain.provider === selected)) {
+  } else if (enabled.some((provider) => provider.value === selected)) {
     select.value = selected;
   }
 }
@@ -982,24 +1024,18 @@ async function discoverAgentModels() {
 
 function savePrefs() {
   try {
-    localStorage.setItem("ollma_model",  $("modelSelect").value || "");
-    localStorage.setItem("ollma_target", $("targetPath").value  || "");
-    localStorage.setItem("ollma_file",   currentFile            || "");
-    localStorage.setItem("ollma_chat",   currentChat            || "");
+    writePreferences(localStorage, {
+      model: $("modelSelect").value,
+      target: $("targetPath").value,
+      file: currentFile,
+      chat: currentChat,
+      context: pinnedContextPaths,
+    });
   } catch (_) {}
 }
 
 function loadPrefs() {
-  try {
-    return {
-      model:  localStorage.getItem("ollma_model")  || "",
-      target: localStorage.getItem("ollma_target") || "",
-      file:   localStorage.getItem("ollma_file")   || "",
-      chat:   localStorage.getItem("ollma_chat")   || "",
-    };
-  } catch (_) {
-    return {};
-  }
+  return readPreferences(localStorage);
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,6 +1099,8 @@ async function boot() {
   } catch (_) {}
 
   const prefs = loadPrefs();
+  pinnedContextPaths = prefs.context || [];
+  syncPinnedContext();
 
   if (prefs.target) {
     $("targetPath").value = prefs.target;
@@ -1108,11 +1146,16 @@ document.addEventListener("DOMContentLoaded", () => {
     $("ollamaStatus").textContent = $("modelSelect").value || "no model";
     savePrefs();
   };
-  $("targetPath").onchange = () => { hide("targetHint"); setWorkspaceTag($("targetPath").value.trim()); savePrefs(); };
+  $("targetPath").onchange = () => {
+    hide("targetHint");
+    setWorkspaceTag($("targetPath").value.trim());
+    resetPinnedContext();
+  };
   $("targetPath").oninput  = () => { if ($("targetPath").value.trim()) { hide("targetHint"); setWorkspaceTag($("targetPath").value.trim()); } };
 
   // Explorer
   $("openPathBtn").onclick = () => openPath($("filePath").value);
+  $("pinFileBtn").onclick = toggleCurrentFilePin;
   $("saveFileBtn").onclick = saveFile;
 
   // Search

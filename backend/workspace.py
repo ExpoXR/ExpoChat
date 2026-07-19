@@ -90,17 +90,20 @@ def _same_path(left: Path, right: Path) -> bool:
         return False
 
 
+def _runtime_path(path: Path) -> bool:
+    return any(_same_path(path, runtime) for runtime in (settings.data_dir, settings.jobs_dir, settings.snapshot_dir))
+
+
 def _snapshot_entries(path: Path) -> list[tuple[Path, str]]:
     if path.is_file():
         return [(path, path.name)]
     entries: list[tuple[Path, str]] = [(path, path.name)]
-    runtime_dirs = (settings.data_dir, settings.jobs_dir, settings.snapshot_dir)
     for base, dirs, files in os.walk(path):
         base_path = Path(base)
         kept_dirs = []
         for name in sorted(dirs):
             item = base_path / name
-            if name in EXCLUDED_DIRS or item.is_symlink() or any(_same_path(item, runtime) for runtime in runtime_dirs):
+            if name in EXCLUDED_DIRS or item.is_symlink() or _runtime_path(item):
                 continue
             kept_dirs.append(name)
             entries.append((item, str(Path(path.name) / item.relative_to(path))))
@@ -202,6 +205,8 @@ def restore_snapshot(snapshot_id: str) -> dict[str, Any]:
         else:
             target.mkdir(parents=True, exist_ok=True)
             for child in list(target.iterdir()):
+                if child.name in EXCLUDED_DIRS or _runtime_path(child):
+                    continue
                 if child.is_dir() and not child.is_symlink():
                     shutil.rmtree(child)
                 else:
@@ -250,7 +255,10 @@ def cleanup_snapshots(days: int | None = None, dry_run: bool = False) -> int:
         return len(rows)
     for row in rows:
         _archive_path(row["ref"]).unlink(missing_ok=True)
-        db.execute("update snapshots set archive_deleted_at=? where id=?", (db.utcnow(), row["id"]))
+        db.execute(
+            "update snapshots set status='deleted',archive_deleted_at=? where id=?",
+            (db.utcnow(), row["id"]),
+        )
     return len(rows)
 
 
@@ -268,22 +276,24 @@ def cleanup_partial_snapshots() -> int:
 def storage_report() -> dict[str, Any]:
     usage = shutil.disk_usage(settings.snapshot_dir)
     tracked_rows = db.all_rows("select id,ref,archive_bytes,archive_deleted_at from snapshots")
-    tracked_refs = {Path(row["ref"]).name for row in tracked_rows}
+    active_rows = [row for row in tracked_rows if not row.get("archive_deleted_at")]
+    tracked_refs = {Path(row["ref"]).name for row in active_rows}
     tracked_bytes = 0
     missing = []
-    for row in tracked_rows:
+    for row in active_rows:
         archive = _archive_path(row["ref"])
-        if row.get("archive_deleted_at"):
-            continue
-        if archive.is_file():
+        try:
             tracked_bytes += archive.stat().st_size
-        else:
+        except (FileNotFoundError, OSError):
             missing.append(row["id"])
     orphans = []
     for archive in sorted(settings.snapshot_dir.glob("snap-*.tar.gz")):
         if archive.name in tracked_refs:
             continue
-        stat = archive.stat()
+        try:
+            stat = archive.stat()
+        except OSError:
+            continue
         orphans.append(
             {
                 "ref": archive.name,
@@ -295,7 +305,12 @@ def storage_report() -> dict[str, Any]:
     partials = [item.name for item in settings.snapshot_dir.glob(".*.part")]
     return {
         "filesystem": {"total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free},
-        "tracked": {"count": len(tracked_rows), "bytes": tracked_bytes, "missing_ids": missing},
+        "tracked": {
+            "count": len(active_rows),
+            "records": len(tracked_rows),
+            "bytes": tracked_bytes,
+            "missing_ids": missing,
+        },
         "orphans": orphans,
         "orphan_bytes": sum(item["bytes"] for item in orphans),
         "partials": partials,

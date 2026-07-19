@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -55,7 +56,7 @@ def test_migrations_are_idempotent():
     db.init_db()
     db.init_db()
     versions = db.all_rows("select version from schema_migrations order by version")
-    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4]
 
 
 def test_credential_round_trip():
@@ -106,6 +107,28 @@ def test_snapshot_restore_replaces_workspace():
     assert not (target / "new.txt").exists()
 
 
+def test_snapshot_restore_preserves_excluded_directories():
+    clear_workflow_tables()
+    target = WORKSPACES / "restore-preserved"
+    target.mkdir(exist_ok=True)
+    (target / "value.txt").write_text("before")
+    git_dir = target / ".git"
+    dependency_dir = target / "node_modules"
+    git_dir.mkdir(exist_ok=True)
+    dependency_dir.mkdir(exist_ok=True)
+    (git_dir / "HEAD").write_text("current history")
+    (dependency_dir / "package.js").write_text("installed dependency")
+    snapshot = create_snapshot(target)
+    (target / "value.txt").write_text("after")
+    (target / "new.txt").write_text("remove")
+    (git_dir / "HEAD").write_text("new history")
+    restore_snapshot(snapshot["id"])
+    assert (target / "value.txt").read_text() == "before"
+    assert not (target / "new.txt").exists()
+    assert (git_dir / "HEAD").read_text() == "new history"
+    assert (dependency_dir / "package.js").read_text() == "installed dependency"
+
+
 def test_snapshot_records_sizes_and_cleans_failure_artifacts(monkeypatch):
     clear_workflow_tables()
     target = WORKSPACES / "atomic-snapshot"
@@ -142,6 +165,47 @@ def test_snapshot_size_limit(monkeypatch):
     assert not list(Path(workspace.settings.snapshot_dir).glob("*.part"))
 
 
+def test_snapshot_rejects_low_disk_and_cleans_rename_failure(monkeypatch):
+    target = WORKSPACES / "snapshot-faults"
+    target.mkdir(exist_ok=True)
+    (target / "value.txt").write_text("payload")
+    low_space = type("DiskUsage", (), {"free": 0})()
+    monkeypatch.setattr(workspace.shutil, "disk_usage", lambda _: low_space)
+    with pytest.raises(RuntimeError, match="Insufficient snapshot storage"):
+        workspace.create_snapshot(target)
+    monkeypatch.undo()
+
+    archives = set(Path(workspace.settings.snapshot_dir).glob("snap-*.tar.gz"))
+    monkeypatch.setattr(workspace.os, "replace", lambda *_: (_ for _ in ()).throw(OSError("rename failure")))
+    with pytest.raises(OSError, match="rename failure"):
+        workspace.create_snapshot(target)
+    assert not list(Path(workspace.settings.snapshot_dir).glob("*.part"))
+    assert set(Path(workspace.settings.snapshot_dir).glob("snap-*.tar.gz")) == archives
+
+
+def test_snapshot_cleans_tar_and_verification_failures(monkeypatch):
+    target = WORKSPACES / "snapshot-tar-faults"
+    target.mkdir(exist_ok=True)
+    (target / "value.txt").write_text("payload")
+    archives = set(Path(workspace.settings.snapshot_dir).glob("snap-*.tar.gz"))
+    original_open = workspace.tarfile.open
+    monkeypatch.setattr(
+        workspace.tarfile,
+        "open",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("tar failure")),
+    )
+    with pytest.raises(OSError, match="tar failure"):
+        workspace.create_snapshot(target)
+    assert not list(Path(workspace.settings.snapshot_dir).glob("*.part"))
+
+    monkeypatch.setattr(workspace.tarfile, "open", original_open)
+    monkeypatch.setattr(workspace.tarfile.TarFile, "getmembers", lambda _: [])
+    with pytest.raises(RuntimeError, match="verification failed"):
+        workspace.create_snapshot(target)
+    assert not list(Path(workspace.settings.snapshot_dir).glob("*.part"))
+    assert set(Path(workspace.settings.snapshot_dir).glob("snap-*.tar.gz")) == archives
+
+
 def test_orphan_report_requires_explicit_cleanup():
     orphan = Path(workspace.settings.snapshot_dir) / "snap-1000000000-deadbeef.tar.gz"
     orphan.write_bytes(b"orphan")
@@ -171,6 +235,44 @@ def test_router_prefers_role_score_before_global_priority(monkeypatch):
     db.execute("update agent_profiles set role_scores_json=? where id='specialist'", (json.dumps({"research": 90}),))
     monkeypatch.setattr(orchestrator, "discover_agents", lambda: [])
     assert orchestrator.choose_agent("research")["id"] == "specialist"
+
+
+def test_active_job_uniqueness():
+    clear_workflow_tables()
+    target = WORKSPACES / "unique-job"
+    target.mkdir(exist_ok=True)
+    run_id = "c" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "Unique job", "codex", str(target), "researching", now, now),
+    )
+    db.execute(
+        "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,'research','pending',?,?)",
+        (run_id, now, now),
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,'research','running',?,?)",
+            (run_id, now, now),
+        )
+
+
+def test_run_events_and_artifacts_are_bounded(monkeypatch):
+    clear_workflow_tables()
+    run_id = "e" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "Bound history", "codex", str(WORKSPACES), "researching", now, now),
+    )
+    monkeypatch.setattr(db, "MAX_RUN_EVENTS", 2)
+    monkeypatch.setattr(orchestrator, "MAX_RUN_ARTIFACTS", 2)
+    for index in range(3):
+        db.add_event(run_id, "test", f"event {index}")
+        orchestrator.save_artifact(run_id, "test", f"artifact {index}", str(index))
+    assert [row["message"] for row in db.all_rows("select message from run_events order by id")] == ["event 1", "event 2"]
+    assert [row["name"] for row in db.all_rows("select name from run_artifacts order by id")] == ["artifact 1", "artifact 2"]
 
 
 def test_run_state_rejects_invalid_transition():

@@ -25,6 +25,16 @@ executor = ThreadPoolExecutor(max_workers=settings.runner_concurrency, thread_na
 _run_lock = threading.Lock()
 _queue_lock = threading.Lock()
 _active_drainers = 0
+MAX_RUN_ARTIFACTS = 200
+
+
+def _lease_heartbeat(job_id: int, lease_owner: str, stopped: threading.Event) -> None:
+    while not stopped.wait(30):
+        expires = (datetime.now(UTC) + timedelta(minutes=20)).isoformat()
+        db.execute(
+            "update jobs set lease_expires_at=?,updated_at=? where id=? and status='running' and lease_owner=?",
+            (expires, db.utcnow(), job_id, lease_owner),
+        )
 
 
 def enqueue_job(run_id: str, job_type: str) -> None:
@@ -57,6 +67,13 @@ def _drain_jobs() -> None:
     try:
         while True:
             with db.transaction() as conn:
+                now = db.utcnow()
+                conn.execute(
+                    "update jobs set status='pending',error='Expired lease; queued for recovery',lease_owner=null,"
+                    "lease_expires_at=null,updated_at=? where status='running' and lease_expires_at<? "
+                    "and run_id in (select id from runs where status not in ('completed','failed','cancelled','rolled_back'))",
+                    (now, now),
+                )
                 row = conn.execute("select * from jobs where status='pending' order by id limit 1").fetchone()
                 if not row:
                     break
@@ -70,22 +87,46 @@ def _drain_jobs() -> None:
                 )
                 if claimed.rowcount != 1:
                     continue
+            heartbeat_stop = threading.Event()
+            heartbeat = threading.Thread(
+                target=_lease_heartbeat,
+                args=(job["id"], lease_owner, heartbeat_stop),
+                name=f"ollma-lease-{job['id']}",
+                daemon=True,
+            )
+            heartbeat.start()
             try:
                 if job["job_type"] == "research":
                     research_run(job["run_id"])
                 else:
                     implement_run(job["run_id"])
                 now = db.utcnow()
+                final_job = db.one("select cancel_requested_at from jobs where id=?", (job["id"],)) or {}
+                final_run = db.one("select status,error from runs where id=?", (job["run_id"],)) or {}
+                if final_job.get("cancel_requested_at") or final_run.get("status") == "cancelled":
+                    final_status = "cancelled"
+                    final_error = "Cancellation requested"
+                elif final_run.get("status") == "failed":
+                    final_status = "failed"
+                    final_error = final_run.get("error")
+                else:
+                    final_status = "done"
+                    final_error = None
                 db.execute(
-                    "update jobs set status='done',completed_at=?,lease_owner=null,lease_expires_at=null,updated_at=? where id=?",
-                    (now, now, job["id"]),
+                    "update jobs set status=?,error=?,completed_at=?,lease_owner=null,lease_expires_at=null,updated_at=? where id=?",
+                    (final_status, final_error, now, now, job["id"]),
                 )
             except Exception as exc:
                 log.exception("job_failed", extra={"job_id": job["id"], "run_id": job["run_id"]})
+                current = db.one("select cancel_requested_at from jobs where id=?", (job["id"],)) or {}
+                final_status = "cancelled" if current.get("cancel_requested_at") else "failed"
                 db.execute(
-                    "update jobs set status='failed',error=?,completed_at=?,lease_owner=null,lease_expires_at=null,updated_at=? where id=?",
-                    (str(exc)[:4000], db.utcnow(), db.utcnow(), job["id"]),
+                    "update jobs set status=?,error=?,completed_at=?,lease_owner=null,lease_expires_at=null,updated_at=? where id=?",
+                    (final_status, str(exc)[:4000], db.utcnow(), db.utcnow(), job["id"]),
                 )
+            finally:
+                heartbeat_stop.set()
+                heartbeat.join(timeout=1)
     finally:
         with _queue_lock:
             _active_drainers -= 1
@@ -215,10 +256,16 @@ def choose_agent(role: str, exclude: set[str] | None = None, discover: bool = Tr
 
 def save_artifact(run_id: str, kind: str, name: str, content: Any) -> None:
     serialized = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-    db.execute(
-        "insert into run_artifacts(run_id,kind,name,content,created_at) values(?,?,?,?,?)",
-        (run_id, kind, name, serialized[:500_000], db.utcnow()),
-    )
+    with db.transaction() as conn:
+        conn.execute(
+            "insert into run_artifacts(run_id,kind,name,content,created_at) values(?,?,?,?,?)",
+            (run_id, kind, name, serialized[:500_000], db.utcnow()),
+        )
+        conn.execute(
+            "delete from run_artifacts where run_id=? and id not in "
+            "(select id from run_artifacts where run_id=? order by id desc limit ?)",
+            (run_id, run_id, MAX_RUN_ARTIFACTS),
+        )
 
 
 def record_usage(run_id: str, result: dict[str, Any]) -> None:

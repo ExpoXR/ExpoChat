@@ -57,6 +57,7 @@ from .workspace_tools import TOOL_DEFS, execute_tool, run_check, search_text
 configure_logging()
 log = logging.getLogger("ollma.web")
 TERMINAL_STATES = {"completed", "failed", "cancelled", "rolled_back"}
+MAX_TIMELINE_ENTRIES = 5000
 
 
 class LoginBody(BaseModel):
@@ -145,13 +146,16 @@ def parse_json_fields(row: dict[str, Any], fields: list[str]) -> dict[str, Any]:
 
 
 def add_timeline(event_type: str, summary: str, path: str | None = None, chat_id: str | None = None, before: str | None = None, after: str | None = None, diff: str | None = None) -> None:
-    before = before[:100_000] if before else None
-    after = after[:100_000] if after else None
     diff = diff[:200_000] if diff else None
-    db.execute(
-        "insert into timeline(chat_id,event_type,path,summary,before,after,diff,created_at) values(?,?,?,?,?,?,?,?)",
-        (chat_id, event_type, path, summary, before, after, diff, db.utcnow()),
-    )
+    with db.transaction() as conn:
+        conn.execute(
+            "insert into timeline(chat_id,event_type,path,summary,before,after,diff,created_at) values(?,?,?,?,?,?,?,?)",
+            (chat_id, event_type, path, summary[:1000], None, None, diff, db.utcnow()),
+        )
+        conn.execute(
+            "delete from timeline where id not in (select id from timeline order by id desc limit ?)",
+            (MAX_TIMELINE_ENTRIES,),
+        )
 
 
 def list_item(path: Path) -> dict[str, Any]:
@@ -477,6 +481,11 @@ def run_get(run_id: str, _: dict = Depends(require_user)):
     row["history"] = db.one("select * from history_snippets where run_id=?", (run_id,))
     row["approvals"] = db.all_rows("select * from run_approvals where run_id=? order by id", (run_id,))
     row["verification_results"] = db.all_rows("select * from verification_results where run_id=? order by id", (run_id,))
+    row["jobs"] = db.all_rows(
+        "select id,job_type,status,attempts,error,started_at,completed_at,cancel_requested_at,created_at,updated_at "
+        "from jobs where run_id=? order by id",
+        (run_id,),
+    )
     pending = db.one("select id from jobs where run_id=? and status='pending' order by id limit 1", (run_id,))
     row["queue_position"] = None
     if pending:
@@ -766,7 +775,10 @@ def snapshot_delete(snapshot_id: str, _: dict = Depends(require_user)):
     if not row:
         raise HTTPException(404, "Snapshot not found")
     (settings.snapshot_dir / Path(row["ref"]).name).unlink(missing_ok=True)
-    db.execute("update snapshots set archive_deleted_at=? where id=?", (db.utcnow(), snapshot_id))
+    db.execute(
+        "update snapshots set status='deleted',archive_deleted_at=? where id=?",
+        (db.utcnow(), snapshot_id),
+    )
     return {"ok": True}
 
 

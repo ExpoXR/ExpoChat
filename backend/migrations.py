@@ -47,10 +47,24 @@ def _run_usage(db: sqlite3.Connection) -> None:
     _add_columns(db, "runs", {"usage_json": "text not null default '{}'"})
 
 
+def _unique_active_jobs(db: sqlite3.Connection) -> None:
+    db.execute(
+        "update jobs set status='cancelled',error='Duplicate active job removed during migration' "
+        "where status in ('pending','running') and exists ("
+        "select 1 from jobs earlier where earlier.run_id=jobs.run_id and earlier.job_type=jobs.job_type "
+        "and earlier.status in ('pending','running') and earlier.id<jobs.id)"
+    )
+    db.execute(
+        "create unique index if not exists idx_jobs_one_active_type "
+        "on jobs(run_id,job_type) where status in ('pending','running')"
+    )
+
+
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _snapshot_metadata),
     (2, _durable_jobs),
     (3, _run_usage),
+    (4, _unique_active_jobs),
 ]
 
 

@@ -29,7 +29,7 @@ test("authenticated drawers and mobile navigation", async ({ page }, testInfo) =
   expect(overflow).toBeLessThanOrEqual(1);
 });
 
-test("authenticated workspace chat", async ({ page }) => {
+test("authenticated workspace chat", async ({ page }, testInfo) => {
   test.skip(!process.env.E2E_USER || !process.env.E2E_PASSWORD, "E2E credentials not supplied");
   await page.goto("/");
   await page.locator("#username").fill(process.env.E2E_USER);
@@ -40,7 +40,18 @@ test("authenticated workspace chat", async ({ page }) => {
   const workspace = `${config.allowed_roots[0]}/fixture`;
   await page.locator("#activityChat").click();
   await page.locator("#targetPath").fill(workspace);
+  await page.locator("#activityFiles").click();
+  await page.locator("#filePath").fill(workspace);
+  await page.locator("#openPathBtn").click();
+  await page.locator("#fileList .item", { hasText: "sample.py" }).click();
+  await expect(page.locator("#pinFileBtn")).toHaveText("Unpin from Chat");
+  await expect(page.locator("#contextTag")).toContainText("1");
+  await page.locator("#activityChat").click();
   await page.locator("#newChatBtn").click();
+  if (testInfo.project.use.viewport.width <= 767) {
+    await page.locator("#closeSidebarBtn").click();
+  }
+  await page.locator('.editor-tab[data-editor="chatEditor"]').click();
   await page.locator("#prompt").fill("Read workspace fixture");
   await page.locator("#sendBtn").click();
   await expect(page.locator(".msg.assistant .msg-body").last()).toContainText("Workspace fixture answer");

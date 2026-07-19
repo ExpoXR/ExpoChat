@@ -2,6 +2,7 @@ import asyncio
 
 import httpx
 
+from backend import worker
 from backend.main import app
 
 
@@ -36,5 +37,37 @@ def test_health_and_csrf_protection():
                 storage = await client.get("/api/maintenance/storage")
                 assert storage.status_code == 200
                 assert "orphans" in storage.json()
+
+    asyncio.run(run())
+
+
+def test_worker_cancellation_interrupts_active_task(monkeypatch):
+    async def run():
+        run_id = "d" * 24
+        (worker.settings.jobs_dir / run_id / "workspace").mkdir(parents=True, exist_ok=True)
+        started = asyncio.Event()
+
+        async def slow_agent(*_):
+            started.set()
+            await asyncio.sleep(60)
+            return {"ok": True}
+
+        monkeypatch.setattr(worker, "agent_loop", slow_agent)
+        transport = httpx.ASGITransport(app=worker.app)
+        headers = {"X-Worker-Token": worker.settings.worker_token}
+        payload = {
+            "run_id": run_id,
+            "model": "test-model",
+            "mode": "research",
+            "task": "Wait for cancellation",
+        }
+        async with httpx.AsyncClient(transport=transport, base_url="http://worker") as client:
+            request = asyncio.create_task(client.post("/execute", headers=headers, json=payload))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            cancelled = await client.post(f"/cancel/{run_id}", headers=headers)
+            response = await asyncio.wait_for(request, timeout=1)
+        assert cancelled.status_code == 200
+        assert cancelled.json()["active"] is True
+        assert response.json()["cancelled"] is True
 
     asyncio.run(run())
