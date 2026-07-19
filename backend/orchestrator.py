@@ -233,15 +233,19 @@ def discover_agents() -> list[dict[str, Any]]:
         return discovered
 
 
+def _agent_is_eligible(agent: dict[str, Any] | None, role: str, exclude: set[str] | None = None) -> bool:
+    if not agent or not agent.get("enabled") or agent["id"] in (exclude or set()):
+        return False
+    roles = json.loads(agent.get("roles_json") or "[]")
+    capabilities = json.loads(agent.get("capabilities_json") or "[]")
+    return role in roles and (role != "implementation" or "tools" in capabilities)
+
+
 def choose_agent(role: str, exclude: set[str] | None = None, discover: bool = True) -> dict[str, Any]:
     exclude = exclude or set()
     candidates = []
     for row in db.all_rows("select * from agent_profiles where enabled=1"):
-        roles = json.loads(row["roles_json"] or "[]")
-        capabilities = json.loads(row["capabilities_json"] or "[]")
-        if row["id"] in exclude or role not in roles:
-            continue
-        if role == "implementation" and "tools" not in capabilities:
+        if not _agent_is_eligible(row, role, exclude):
             continue
         scores = json.loads(row["role_scores_json"] or "{}")
         candidates.append((int(scores.get(role, 0)), int(row["priority"]), int(row["context_size"]), row["name"], row))
@@ -249,7 +253,9 @@ def choose_agent(role: str, exclude: set[str] | None = None, discover: bool = Tr
         if discover:
             discover_agents()
             return choose_agent(role, exclude, False)
-        raise RuntimeError(f"No eligible {role} agent available")
+        raise RuntimeError(
+            f"No enabled {role} agent available. Open Brains & Agents, enable a compatible Ollama model, then retry."
+        )
     candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].lower()))
     return candidates[0][-1]
 
@@ -298,20 +304,31 @@ def update_run(run_id: str, **values: Any) -> None:
 
 def create_run(task: str, provider: str, target: Path, web_research: bool) -> dict[str, Any]:
     run_id = secrets.token_hex(12)
+    _, model = provider_config(provider)
+    research_agent = choose_agent("research")
+    implementation_agent = choose_agent("implementation")
     stage_workspace(run_id, target)
     baseline = manifest_hash(target)
-    _, model = provider_config(provider)
     now = db.utcnow()
     with db.transaction() as conn:
         conn.execute(
-            "insert into runs(id,task,brain_provider,brain_model,target_path,web_research,status,baseline_hash,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
-            (run_id, task, provider, model, str(target), int(web_research), "researching", baseline, now, now),
+            "insert into runs(id,task,brain_provider,brain_model,target_path,web_research,status,baseline_hash,"
+            "research_agent_id,implementation_agent_id,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                run_id, task, provider, model, str(target), int(web_research), "researching", baseline,
+                research_agent["id"], implementation_agent["id"], now, now,
+            ),
         )
         conn.execute(
             "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,'research','pending',?,?)",
             (run_id, now, now),
         )
-    db.add_event(run_id, "run.created", "Research queued", {"provider": provider, "target": str(target)})
+    db.add_event(
+        run_id,
+        "run.created",
+        f"Research queued with {research_agent['name']}",
+        {"provider": provider, "target": str(target), "research_agent": research_agent["id"]},
+    )
     start_job_queue()
     return db.one("select * from runs where id=?", (run_id,)) or {}
 
@@ -321,7 +338,9 @@ def research_run(run_id: str) -> None:
         run = db.one("select * from runs where id=?", (run_id,))
         if not run or run["status"] == "cancelled":
             return
-        agent = choose_agent("research")
+        agent = db.one("select * from agent_profiles where id=?", (run.get("research_agent_id"),))
+        if not _agent_is_eligible(agent, "research"):
+            agent = choose_agent("research")
         update_run(run_id, research_agent_id=agent["id"], status="researching")
         db.add_event(run_id, "research.started", f"Research started with {agent['name']}")
         result = worker_call(run_id, agent["model"], "research", agent_task(agent, run["task"]), max_turns=18)

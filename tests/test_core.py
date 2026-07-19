@@ -237,6 +237,22 @@ def test_router_prefers_role_score_before_global_priority(monkeypatch):
     assert orchestrator.choose_agent("research")["id"] == "specialist"
 
 
+def test_run_preflight_rejects_missing_agents_before_staging(monkeypatch):
+    clear_workflow_tables()
+    target = WORKSPACES / "preflight-target"
+    target.mkdir(exist_ok=True)
+    (target / "app.py").write_text("print('safe')\n")
+    monkeypatch.setattr(orchestrator, "provider_config", lambda _: ("key", "model"))
+    monkeypatch.setattr(
+        orchestrator,
+        "choose_agent",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("No enabled research agent available")),
+    )
+    with pytest.raises(RuntimeError, match="No enabled research agent"):
+        orchestrator.create_run("Preflight failure", "codex", target, False)
+    assert not db.one("select id from runs where task='Preflight failure'")
+
+
 def test_active_job_uniqueness():
     clear_workflow_tables()
     target = WORKSPACES / "unique-job"
