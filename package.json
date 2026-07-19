@@ -1,0 +1,12 @@
+{
+  "name": "ollma-ui-tests",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/js/*.test.js",
+    "test:e2e": "playwright test",
+    "check": "npm test && npm run test:e2e"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}

@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#007acc">
+    <title>Ollma UI</title>
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <!-- ── Login ─────────────────────────────────────────────────────── -->
+    <main id="login" class="login hidden">
+      <form id="loginForm" class="login-panel">
+        <div class="login-mark">O</div>
+        <h1>Ollma UI</h1>
+        <input id="username" autocomplete="username" placeholder="Username">
+        <input id="password" type="password" autocomplete="current-password" placeholder="Password">
+        <button type="submit">Login</button>
+        <p id="loginError"></p>
+      </form>
+    </main>
+
+    <!-- ── Workbench ──────────────────────────────────────────────────── -->
+    <main id="app" class="workbench hidden">
+      <header class="titlebar">
+        <div class="window-dots"><span></span><span></span><span></span></div>
+        <div class="command-center">Ollma UI</div>
+        <button id="logoutBtn" class="title-action">Logout</button>
+      </header>
+
+      <div class="main-grid">
+
+        <!-- Activity bar -->
+        <nav class="activitybar" aria-label="Primary navigation">
+          <button id="activityChat"     class="activity active" title="Chat" aria-label="Chat">
+            <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          </button>
+          <button id="activityRuns"     class="activity" title="Agent Runs" aria-label="Agent runs">
+            <svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h5M8 17h7"/></svg>
+          </button>
+          <button id="activityFiles"    class="activity" title="Explorer" aria-label="Explorer">
+            <svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+          </button>
+          <button id="activityTools"    class="activity" title="Search" aria-label="Search">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          </button>
+          <button id="activitySnaps"    class="activity" title="Snapshots" aria-label="Snapshots">
+            <svg viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+          </button>
+          <button id="activityTimeline" class="activity" title="Timeline" aria-label="Timeline">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </button>
+          <button id="activityPlan"     class="activity" title="AI Plan Panel" aria-label="Supervisor run" aria-expanded="false">
+            <svg viewBox="0 0 24 24"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg>
+          </button>
+          <button id="activitySettings" class="activity" title="Brains and Agents" aria-label="Brains and agents">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
+          </button>
+          <button id="activityMore" class="activity mobile-only" title="More" aria-label="More">
+            <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg>
+          </button>
+        </nav>
+
+        <!-- Sidebar -->
+        <aside class="sidebar" aria-label="Workspace navigation">
+          <button id="closeSidebarBtn" class="sheet-close" aria-label="Close navigation">Close</button>
+          <!-- Chat pane -->
+          <section id="chatPane" class="side-pane">
+            <div class="section-title">CHAT</div>
+            <label>Model</label>
+            <select id="modelSelect"></select>
+            <label>Target Folder <span class="label-hint">(required for file context)</span></label>
+            <input id="targetPath" placeholder="/datasets/tank/projects">
+            <p id="targetHint" class="field-hint hidden">⚠ Set a target folder so Ollama can see your files.</p>
+            <div class="btn-row">
+              <button id="newChatBtn">New Chat</button>
+              <button id="saveNewChatBtn">Save + New Chat</button>
+            </div>
+            <div class="section-title with-gap">HISTORY</div>
+            <div id="chatList" class="tree"></div>
+            <button id="loadMoreChatsBtn" class="hidden">More chats</button>
+          </section>
+
+          <section id="runsPane" class="side-pane hidden">
+            <div class="section-title">RUN HISTORY</div>
+            <div class="btn-row">
+              <button id="newRunBtn">New Run</button>
+              <button id="refreshRunsBtn">Refresh</button>
+            </div>
+            <div id="runList" class="tree"></div>
+            <button id="loadMoreRunsBtn" class="hidden">More runs</button>
+          </section>
+
+          <!-- Explorer pane -->
+          <section id="filesPane" class="side-pane hidden">
+            <div class="section-title">EXPLORER</div>
+            <div class="pathbar compact">
+              <input id="filePath" placeholder="/datasets/tank">
+              <button id="openPathBtn">Open</button>
+            </div>
+            <p id="explorerContext" class="explorer-ctx hidden"></p>
+            <div id="fileList" class="tree"></div>
+          </section>
+
+          <!-- Search pane -->
+          <section id="toolsPane" class="side-pane hidden">
+            <div class="section-title">SEARCH</div>
+            <input id="searchTerm" placeholder="Search text…">
+            <button id="searchBtn">Search</button>
+            <div id="searchResults" class="tree"></div>
+            <button id="searchMoreBtn" class="hidden">More results</button>
+          </section>
+
+          <!-- Snapshots pane -->
+          <section id="snapsPane" class="side-pane hidden">
+            <div class="section-title">SNAPSHOTS</div>
+            <div class="btn-row">
+              <button id="refreshSnapsBtn">Refresh</button>
+              <button id="cleanSnapsBtn" title="Expire snapshot archives older than 30 days">Expire Old (&gt;30d)</button>
+            </div>
+            <p id="storageSummary" class="field-hint"></p>
+            <div id="orphanList" class="tree"></div>
+            <div id="snapList" class="tree"></div>
+            <button id="loadMoreSnapsBtn" class="hidden">More snapshots</button>
+          </section>
+
+          <!-- Timeline pane -->
+          <section id="timelinePane" class="side-pane hidden">
+            <div class="section-title">TIMELINE</div>
+            <button id="refreshTimelineBtn">Refresh</button>
+            <div id="timelineList" class="tree"></div>
+            <button id="loadMoreTimelineBtn" class="hidden">More events</button>
+          </section>
+
+          <section id="settingsPane" class="side-pane hidden">
+            <div class="section-title">BRAINS</div>
+            <label>Codex model</label>
+            <input id="codexModel" value="gpt-5.6-sol">
+            <label>OpenAI API key</label>
+            <input id="codexKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
+            <div class="btn-row"><button id="saveCodexBtn">Link / Rotate</button><button id="testCodexBtn">Test</button><button id="disconnectCodexBtn">Disconnect</button></div>
+            <p id="codexState" class="field-hint"></p>
+            <label>Claude model</label>
+            <input id="claudeModel" value="claude-sonnet-5">
+            <label>Anthropic API key</label>
+            <input id="claudeKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
+            <div class="btn-row"><button id="saveClaudeBtn">Link / Rotate</button><button id="testClaudeBtn">Test</button><button id="disconnectClaudeBtn">Disconnect</button></div>
+            <p id="claudeState" class="field-hint"></p>
+            <div class="section-title with-gap">OLLAMA AGENTS</div>
+            <button id="discoverAgentsBtn">Discover Models</button>
+            <div id="agentList" class="tree"></div>
+          </section>
+
+          <section id="morePane" class="side-pane hidden">
+            <div class="section-title">MORE</div>
+            <div class="more-menu">
+              <button id="moreToolsBtn">Search</button>
+              <button id="moreSnapsBtn">Snapshots</button>
+              <button id="moreTimelineBtn">Timeline</button>
+              <button id="moreSettingsBtn">Brains &amp; Agents</button>
+            </div>
+          </section>
+        </aside>
+
+        <!-- Editor area -->
+        <section class="editor-area">
+          <div class="tabs-row">
+            <button class="editor-tab active" data-editor="chatEditor">chat.md</button>
+            <button class="editor-tab"        data-editor="fileEditor">file</button>
+            <button class="editor-tab"        data-editor="diffEditor">changes.diff</button>
+            <button class="editor-tab"        data-editor="artifactEditor">evidence.md</button>
+          </div>
+
+          <!-- Chat editor -->
+          <section id="chatEditor" class="editor-pane">
+            <div class="editor-toolbar">
+              <span class="toolbar-label">Chat — <span id="ollamaStatus">connecting…</span></span>
+              <span id="workspaceTag" class="workspace-tag hidden" title="Active workspace folder sent to Ollama"></span>
+              <button id="applyCodeBtn" title="Apply last code block to the active file">Apply to File</button>
+            </div>
+            <div id="messages" class="messages">
+              <span id="streamCursor" class="stream-cursor hidden">▋</span>
+            </div>
+            <form id="chatForm" class="composer">
+              <textarea id="prompt" rows="3" placeholder="Ask Ollama… (Ctrl+Enter to send)"></textarea>
+              <button type="submit" id="sendBtn">Send</button>
+            </form>
+            <!-- Sandboxed console — runs only inside active staged workspace -->
+            <div class="term-section">
+              <button class="term-toggle" id="termToggleBtn">▶  Sandbox Console</button>
+              <div id="termBody" class="hidden">
+                <div class="term-input-row">
+                  <textarea id="termCommand" rows="2" placeholder="Allowlisted command and arguments (Ctrl+Enter)"></textarea>
+                  <button id="termRunBtn">Run</button>
+                </div>
+                <pre id="termOutput" class="term-output"></pre>
+              </div>
+            </div>
+          </section>
+
+          <!-- File editor -->
+          <section id="fileEditor" class="editor-pane hidden">
+            <div class="editor-toolbar">
+              <span id="fileTitle">No file selected</span>
+              <button id="saveFileBtn">Save + Snapshot</button>
+            </div>
+            <textarea id="editor" spellcheck="false" placeholder="Select a file from Explorer"></textarea>
+          </section>
+
+          <!-- Diff viewer -->
+          <section id="diffEditor" class="editor-pane hidden">
+            <div class="editor-toolbar">
+              <span>Changed code from original</span>
+            </div>
+            <pre id="diffView"></pre>
+          </section>
+
+          <section id="artifactEditor" class="editor-pane hidden">
+            <div class="editor-toolbar"><span id="artifactTitle">Evidence</span></div>
+            <div id="artifactView" class="plan-proof"></div>
+          </section>
+        </section>
+
+        <!-- Right panel — Supervisor workflow -->
+        <aside class="panel-area plan-panel" aria-label="Supervisor run panel">
+          <button id="closePlanBtn" class="sheet-close" aria-label="Close supervisor panel">Close</button>
+          <!-- Plan generator form -->
+          <div class="plan-section-title">SUPERVISOR RUN</div>
+          <div id="planFormArea">
+            <label>Target Path</label>
+            <input id="planPath" placeholder="/datasets/tank/myproject">
+            <label>Task</label>
+            <textarea id="planTask" rows="4" placeholder="Describe what to build or fix…"></textarea>
+            <label>Brain</label>
+            <select id="planProvider"></select>
+            <label class="check-label"><input id="webResearch" type="checkbox"> Allow web research for this run</label>
+            <button id="generatePlanBtn">Research &amp; Write Plan</button>
+            <p id="planStatus"></p>
+            <div id="currentRunBadge" class="run-badge hidden"></div>
+          </div>
+
+          <!-- Plan result + proof (shown after generation) -->
+          <div id="planResultArea" class="hidden">
+            <div class="plan-result-bar">
+              <span class="plan-result-label">Generated Plan</span>
+              <div class="plan-result-actions">
+                <button id="approvePlanBtn" class="accent-btn">Approve &amp; Implement</button>
+                <button id="rejectPlanBtn">Reject</button>
+              </div>
+            </div>
+            <!-- Proof: rendered markdown preview of the plan -->
+            <div id="planProof" class="plan-proof"></div>
+            <!-- Raw editable plan -->
+            <label style="margin-top:8px">Edit Plan</label>
+            <textarea id="planEditorContent" class="plan-raw-edit" spellcheck="false" placeholder="Plan will appear here after generation…"></textarea>
+          </div>
+
+          <div id="runProgress" class="hidden plan-review-area">
+            <div class="plan-result-bar">
+              <span class="plan-result-label">RUN PROGRESS</span>
+              <div class="plan-result-actions">
+                <button id="cancelRunBtn">Cancel</button>
+                <button id="resumeRunBtn" class="hidden">Resume</button>
+                <button id="rollbackRunBtn" class="hidden">Rollback</button>
+                <button id="cloneRunBtn" class="hidden">Clone</button>
+              </div>
+            </div>
+            <div id="runEventList" class="run-events"></div>
+            <div class="plan-result-label">EVIDENCE</div>
+            <div id="runArtifactList" class="tree"></div>
+          </div>
+        </aside>
+
+      </div>
+
+      <footer class="statusbar">
+        <button id="menuBtn">Explorer</button>
+        <button id="workspaceBtn">Plan Panel</button>
+        <span id="status">Connecting</span>
+        <span class="status-spacer"></span>
+        <span id="claudeIndicator" class="hidden">Claude ✓</span>
+        <span id="openaiIndicator" class="hidden">OpenAI ✓</span>
+        <span>Ollama</span>
+      </footer>
+    </main>
+
+    <!-- Toast notification -->
+    <div id="toast" class="toast hidden"></div>
+    <button id="drawerBackdrop" class="drawer-backdrop hidden" aria-label="Close open panel"></button>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

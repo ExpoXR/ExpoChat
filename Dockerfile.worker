@@ -1,0 +1,21 @@
+FROM python:3.12-slim
+
+ARG PUID=3000
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    JOBS_DIR=/jobs
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git nodejs npm patch ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid ${PUID} --gid 0 --create-home --home-dir /home/ollma ollma
+
+WORKDIR /app
+COPY requirements-worker.txt /app/requirements-worker.txt
+RUN pip install --no-cache-dir -r /app/requirements-worker.txt
+COPY backend /app/backend
+
+USER ${PUID}:0
+EXPOSE 8090
+CMD ["uvicorn", "backend.worker:app", "--host", "0.0.0.0", "--port", "8090", "--no-access-log"]

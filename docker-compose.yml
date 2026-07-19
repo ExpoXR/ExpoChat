@@ -1,0 +1,125 @@
+services:
+  ollma-init:
+    image: alpine:3.22
+    container_name: ollma-init
+    user: "0:0"
+    restart: "no"
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        mkdir -p /data/provider-home /jobs /snapshots &&
+        chown -R ${PUID:-3000}:0 /data /jobs /snapshots &&
+        chmod -R g+rwX /data /jobs /snapshots
+    volumes:
+      - ./data:/data
+      - ./jobs:/jobs
+      - ./snapshots:/snapshots
+
+  ollma-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PUID: ${PUID:-3000}
+    container_name: ollma-ui
+    restart: unless-stopped
+    user: "${PUID:-3000}:0"
+    group_add:
+      - "${PROJECTS_GID:-3001}"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    ports:
+      - "31001:8080"
+    environment:
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-now}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:-}
+      SESSION_SECRET: ${SESSION_SECRET:-change-this-session-secret}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://192.168.0.78:11434}
+      ALLOWED_ROOTS: ${ALLOWED_ROOTS:-/workspace/apps,/workspace/projects,/datasets/tank,/datasets/apps,/datasets/usb_backup}
+      DATA_DIR: /data
+      JOBS_DIR: /jobs
+      SNAPSHOT_DIR: /snapshots
+      WORKER_URL: http://ollma-worker:8090
+      WORKER_TOKEN: ${WORKER_TOKEN:-change-this-worker-token}
+      COMMAND_TIMEOUT: ${COMMAND_TIMEOUT:-120}
+      SNAPSHOT_RETENTION_DAYS: ${SNAPSHOT_RETENTION_DAYS:-30}
+      SNAPSHOT_MAX_BYTES: ${SNAPSHOT_MAX_BYTES:-21474836480}
+      SNAPSHOT_RESERVE_BYTES: ${SNAPSHOT_RESERVE_BYTES:-2147483648}
+      ORPHAN_GRACE_HOURS: ${ORPHAN_GRACE_HOURS:-24}
+      RUNNER_CONCURRENCY: ${RUNNER_CONCURRENCY:-1}
+      CHAT_CONTEXT_BYTES: ${CHAT_CONTEXT_BYTES:-120000}
+      CLAUDE_API_KEY: ${CLAUDE_API_KEY:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-5}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-sol}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      SECURE_COOKIE: ${SECURE_COOKIE:-false}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    volumes:
+      - ./data:/data
+      - ./jobs:/jobs
+      - ./snapshots:/snapshots
+      - /mnt/apps/docker:/workspace/apps
+      - /mnt/tank/projects:/workspace/projects
+      - /mnt/tank:/datasets/tank
+      - /mnt/apps:/datasets/apps
+      - /mnt/usb_backup:/datasets/usb_backup
+    depends_on:
+      ollma-init:
+        condition: service_completed_successfully
+      ollma-worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/readyz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - ollma-private
+      - ollma-egress
+
+  ollma-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      args:
+        PUID: ${PUID:-3000}
+    container_name: ollma-worker
+    restart: unless-stopped
+    user: "${PUID:-3000}:0"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    environment:
+      JOBS_DIR: /jobs
+      OLLAMA_BASE_URL: http://ollma-ui:8080/internal/ollama
+      WORKER_TOKEN: ${WORKER_TOKEN:-change-this-worker-token}
+      COMMAND_TIMEOUT: ${COMMAND_TIMEOUT:-120}
+    volumes:
+      - ./jobs:/jobs
+    depends_on:
+      ollma-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    networks:
+      - ollma-private
+
+networks:
+  ollma-private:
+    driver: bridge
+    internal: true
+  ollma-egress:
+    driver: bridge

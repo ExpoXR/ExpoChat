@@ -1,0 +1,54 @@
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def _paths(value: str) -> list[Path]:
+    return [Path(item.strip()).resolve() for item in value.split(",") if item.strip()]
+
+
+def _int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+@dataclass(frozen=True)
+class Settings:
+    data_dir: Path = field(default_factory=lambda: Path(os.getenv("DATA_DIR", "/data")))
+    snapshot_dir: Path = field(default_factory=lambda: Path(os.getenv("SNAPSHOT_DIR", "/snapshots")))
+    jobs_dir: Path = field(default_factory=lambda: Path(os.getenv("JOBS_DIR", "/jobs")))
+    allowed_roots: list[Path] = field(
+        default_factory=lambda: _paths(os.getenv("ALLOWED_ROOTS", "/workspace"))
+    )
+    public_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[1] / "public")
+    admin_user: str = field(default_factory=lambda: os.getenv("ADMIN_USER", "admin"))
+    admin_password: str = field(default_factory=lambda: os.getenv("ADMIN_PASSWORD", "change-me-now"))
+    admin_password_hash: str = field(default_factory=lambda: os.getenv("ADMIN_PASSWORD_HASH", ""))
+    session_secret: str = field(default_factory=lambda: os.getenv("SESSION_SECRET", "change-this-session-secret"))
+    credential_key: str = field(default_factory=lambda: os.getenv("CREDENTIAL_ENCRYPTION_KEY", ""))
+    ollama_url: str = field(default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://192.168.0.78:11434").rstrip("/"))
+    worker_url: str = field(default_factory=lambda: os.getenv("WORKER_URL", "http://ollma-worker:8090").rstrip("/"))
+    worker_token: str = field(default_factory=lambda: os.getenv("WORKER_TOKEN", "change-worker-token"))
+    command_timeout: int = field(default_factory=lambda: _int("COMMAND_TIMEOUT", 120, 1))
+    allowed_origins: set[str] = field(
+        default_factory=lambda: {x.strip() for x in os.getenv("ALLOWED_ORIGINS", "").split(",") if x.strip()}
+    )
+    secure_cookie: bool = field(default_factory=lambda: os.getenv("SECURE_COOKIE", "auto").lower() == "true")
+    snapshot_retention_days: int = field(default_factory=lambda: _int("SNAPSHOT_RETENTION_DAYS", 30, 1))
+    snapshot_max_bytes: int = field(default_factory=lambda: _int("SNAPSHOT_MAX_BYTES", 20 * 1024**3, 1))
+    snapshot_reserve_bytes: int = field(default_factory=lambda: _int("SNAPSHOT_RESERVE_BYTES", 2 * 1024**3, 0))
+    orphan_grace_hours: int = field(default_factory=lambda: _int("ORPHAN_GRACE_HOURS", 24, 1))
+    runner_concurrency: int = field(default_factory=lambda: _int("RUNNER_CONCURRENCY", 1, 1))
+    chat_context_bytes: int = field(default_factory=lambda: _int("CHAT_CONTEXT_BYTES", 120_000, 10_000))
+    openai_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
+    openai_model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-5.6-sol"))
+    claude_key: str = field(default_factory=lambda: os.getenv("CLAUDE_API_KEY", ""))
+    claude_model: str = field(default_factory=lambda: os.getenv("CLAUDE_MODEL", "claude-sonnet-5"))
+
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "ollma.sqlite3"
+
+settings = Settings()
