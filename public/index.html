@@ -247,14 +247,18 @@
               <span class="plan-result-label">Generated Plan</span>
               <div class="plan-result-actions">
                 <button id="approvePlanBtn" class="accent-btn">Approve &amp; Implement</button>
-                <button id="rejectPlanBtn">Reject</button>
+                <button id="editPlanBtn">Edit</button>
+                <button id="savePlanBtn" class="hidden">Save Changes</button>
+                <button id="cancelPlanEditBtn" class="hidden">Cancel Edit</button>
+                <button id="redoPlanBtn">Redo</button>
+                <button id="rejectPlanBtn">Reject Plan</button>
               </div>
             </div>
             <!-- Proof: rendered markdown preview of the plan -->
             <div id="planProof" class="plan-proof"></div>
             <!-- Raw editable plan -->
-            <label style="margin-top:8px">Edit Plan</label>
-            <textarea id="planEditorContent" class="plan-raw-edit" spellcheck="false" placeholder="Plan will appear here after generation…"></textarea>
+            <label id="planEditLabel" class="hidden" style="margin-top:8px">Edit Plan</label>
+            <textarea id="planEditorContent" class="plan-raw-edit hidden" spellcheck="false" placeholder="Plan will appear here after generation…"></textarea>
           </div>
 
           <div id="runProgress" class="hidden plan-review-area">
@@ -266,6 +270,10 @@
                 <button id="rollbackRunBtn" class="hidden">Rollback</button>
                 <button id="cloneRunBtn" class="hidden">Clone</button>
               </div>
+            </div>
+            <div id="runTokenCounters" class="token-counters">
+              <div class="token-counter"><span>BRAIN</span><strong id="brainTokenCount">0</strong><small>tokens</small></div>
+              <div class="token-counter"><span>OLLAMA</span><strong id="ollamaTokenCount">0</strong><small>tokens</small></div>
             </div>
             <div id="runEventList" class="run-events"></div>
             <div class="plan-result-label">EVIDENCE</div>

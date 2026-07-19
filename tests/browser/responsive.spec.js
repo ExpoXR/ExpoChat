@@ -17,6 +17,10 @@ test("authenticated drawers and mobile navigation", async ({ page }, testInfo) =
   await expect(page.locator("#app")).toBeVisible();
   expect(await page.locator("#codexModel option").count()).toBeGreaterThan(2);
   expect(await page.locator("#claudeModel option").count()).toBeGreaterThan(2);
+  await expect(page.locator("#editPlanBtn")).toHaveCount(1);
+  await expect(page.locator("#redoPlanBtn")).toHaveCount(1);
+  await expect(page.locator("#brainTokenCount")).toHaveCount(1);
+  await expect(page.locator("#ollamaTokenCount")).toHaveCount(1);
   if (testInfo.project.use.viewport.width <= 767) {
     const visiblePrimary = await page.locator(".activitybar .activity:visible").count();
     expect(visiblePrimary).toBe(4);

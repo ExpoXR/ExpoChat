@@ -29,10 +29,13 @@ from .orchestrator import (
     cancel_run,
     create_run,
     discover_agents,
+    edit_plan,
+    redo_plan,
     resume_run,
     rollback_run,
     start_job_queue,
 )
+from .prompts import CAVEMAN_OUTPUT_INSTRUCTIONS
 from .security import (
     create_session,
     destroy_session,
@@ -551,6 +554,22 @@ def run_approve(run_id: str, body: ApprovalBody, _: dict = Depends(require_user)
         raise HTTPException(409 if "changed" in message else 400, message) from exc
 
 
+@run_router.put("/api/runs/{run_id}/plan")
+def run_plan_edit(run_id: str, body: ApprovalBody, _: dict = Depends(require_user)):
+    try:
+        return edit_plan(run_id, body.plan.strip())
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@run_router.post("/api/runs/{run_id}/redo")
+def run_plan_redo(run_id: str, _: dict = Depends(require_user)):
+    try:
+        return redo_plan(run_id)
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @run_router.post("/api/runs/{run_id}/reject")
 @run_router.post("/api/runs/{run_id}/cancel")
 def run_cancel(run_id: str, _: dict = Depends(require_user)):
@@ -643,7 +662,10 @@ def chat_message(chat_id: str, body: MessageBody, _: dict = Depends(require_user
     target = allowed_path(body.target_path or chat["target_path"]) if (body.target_path or chat["target_path"]) else None
     db.execute("insert into messages(chat_id,role,content,created_at) values(?,?,?,?)", (chat_id, "user", body.content, db.utcnow()))
     history = db.all_rows("select role,content from messages where chat_id=? order by id", (chat_id,))
-    system = "You are an expert software assistant. Inspect supplied workspace with read-only tools before answering. Do not claim direct edits."
+    system = (
+        "You are an expert software assistant. Inspect supplied workspace with read-only tools before answering. "
+        "Do not claim direct edits.\n\n" + CAVEMAN_OUTPUT_INSTRUCTIONS
+    )
     if target:
         system += "\n\n" + workspace_summary(target) + pinned_context(target, body.context_paths)
     messages = [{"role": "system", "content": system}, *history]

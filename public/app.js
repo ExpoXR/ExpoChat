@@ -1,7 +1,7 @@
 import { createApi } from "/js/api.mjs";
 import { buildChatPayload, chatEventStatus } from "/js/chat.mjs";
 import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMarkdown } from "/js/render.mjs";
-import { artifactPresentation, runStatusLabel } from "/js/runs.mjs";
+import { artifactPresentation, runStatusLabel, tokenCounts } from "/js/runs.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
 import { consumeSse } from "/js/sse.mjs";
 import { readPreferences, writePreferences } from "/js/state.mjs";
@@ -35,6 +35,7 @@ let chatNext = null;
 let runNext = null;
 let snapshotNext = null;
 let timelineNext = null;
+let planEditing = false;
 
 // ---------------------------------------------------------------------------
 // Core API helper
@@ -676,6 +677,7 @@ async function loadTimeline(append = false) {
 // ---------------------------------------------------------------------------
 
 async function generatePlan() {
+  planEditing = false;
   const path = $("planPath").value.trim()
             || $("filePath").value.trim()
             || $("targetPath").value.trim();
@@ -750,6 +752,59 @@ async function implementPlan() {
   }
 }
 
+function setPlanEditing(enabled) {
+  planEditing = enabled;
+  $("planProof").classList.toggle("hidden", enabled);
+  $("planEditLabel").classList.toggle("hidden", !enabled);
+  $("planEditorContent").classList.toggle("hidden", !enabled);
+  $("planEditorContent").readOnly = !enabled;
+  $("editPlanBtn").classList.toggle("hidden", enabled);
+  $("savePlanBtn").classList.toggle("hidden", !enabled);
+  $("cancelPlanEditBtn").classList.toggle("hidden", !enabled);
+  if (enabled) $("planEditorContent").focus();
+}
+
+async function savePlanChanges() {
+  if (!currentRun) return;
+  const plan = $("planEditorContent").value.trim();
+  if (!plan) {
+    showToast("Plan cannot be empty.", "error");
+    return;
+  }
+  setBusy(["savePlanBtn"], true);
+  try {
+    const run = await api(`/api/runs/${currentRun}/plan`, {
+      method: "PUT",
+      body: JSON.stringify({ plan }),
+    });
+    planEditing = false;
+    renderCurrentRun(run);
+    await loadRun(currentRun);
+    showToast("Plan changes saved.", "success");
+  } catch (err) {
+    showToast(err.message, "error");
+  } finally {
+    setBusy(["savePlanBtn"], false);
+  }
+}
+
+async function redoPlan() {
+  if (!currentRun || !confirm("Discard current draft and research a new plan?")) return;
+  setBusy(["redoPlanBtn"], true);
+  try {
+    const run = await api(`/api/runs/${currentRun}/redo`, { method: "POST", body: "{}" });
+    planEditing = false;
+    hide("planResultArea");
+    renderCurrentRun(run);
+    subscribeRun(currentRun);
+    await loadRuns();
+  } catch (err) {
+    showToast(err.message, "error");
+  } finally {
+    setBusy(["redoPlanBtn"], false);
+  }
+}
+
 async function rejectPlan() {
   if (!currentRun) return;
   try {
@@ -761,6 +816,7 @@ async function rejectPlan() {
 }
 
 function renderCurrentRun(run) {
+  if (currentRun && currentRun !== run.id) planEditing = false;
   currentRun = run.id;
   currentRunData = run;
   const queue = run.queue_position ? ` · queue #${run.queue_position}` : "";
@@ -769,15 +825,34 @@ function renderCurrentRun(run) {
   show("currentRunBadge");
   show("runProgress");
   $("planStatus").textContent = run.error ? `${runStatusLabel(run)} — ${run.error}` : runStatusLabel(run);
-  const visiblePlan = run.approved_plan || run.draft_plan;
+  const awaitingApproval = run.status === "awaiting_approval";
+  if (!awaitingApproval) planEditing = false;
+  const visiblePlan = awaitingApproval
+    ? (run.draft_plan || run.approved_plan)
+    : (run.approved_plan || run.draft_plan);
   if (visiblePlan) {
     $("planProof").innerHTML = renderMarkdown(visiblePlan);
-    $("planEditorContent").value = visiblePlan;
-    $("planEditorContent").readOnly = run.status !== "awaiting_approval";
-    $("approvePlanBtn").classList.toggle("hidden", run.status !== "awaiting_approval");
-    $("rejectPlanBtn").classList.toggle("hidden", run.status !== "awaiting_approval");
+    if (!planEditing) $("planEditorContent").value = visiblePlan;
+    $("approvePlanBtn").classList.toggle("hidden", !awaitingApproval);
+    $("editPlanBtn").classList.toggle("hidden", !awaitingApproval || planEditing);
+    $("savePlanBtn").classList.toggle("hidden", !awaitingApproval || !planEditing);
+    $("cancelPlanEditBtn").classList.toggle("hidden", !awaitingApproval || !planEditing);
+    $("redoPlanBtn").classList.toggle("hidden", !awaitingApproval);
+    $("rejectPlanBtn").classList.toggle("hidden", !awaitingApproval);
+    $("planProof").classList.toggle("hidden", planEditing);
+    $("planEditLabel").classList.toggle("hidden", !planEditing);
+    $("planEditorContent").classList.toggle("hidden", !planEditing);
+    $("planEditorContent").readOnly = !planEditing;
     show("planResultArea");
+  } else {
+    hide("planResultArea");
   }
+  const usage = tokenCounts(run.usage_json || {});
+  const formatTokens = (value) => new Intl.NumberFormat().format(value);
+  $("brainTokenCount").textContent = formatTokens(usage.brain.total);
+  $("brainTokenCount").title = `${formatTokens(usage.brain.input)} input · ${formatTokens(usage.brain.output)} output`;
+  $("ollamaTokenCount").textContent = formatTokens(usage.ollama.total);
+  $("ollamaTokenCount").title = `${formatTokens(usage.ollama.input)} input · ${formatTokens(usage.ollama.output)} output`;
   $("cancelRunBtn").classList.toggle("hidden", ["completed", "failed", "cancelled", "rolled_back"].includes(run.status));
   $("resumeRunBtn").classList.toggle("hidden", run.status !== "failed");
   $("rollbackRunBtn").classList.toggle("hidden", !run.snapshot_id || !["completed", "failed"].includes(run.status));
@@ -803,7 +878,7 @@ function renderRunArtifacts(artifacts) {
   (artifacts || []).forEach((artifact) => {
     const button = document.createElement("button");
     button.className = "item";
-    button.textContent = `${artifact.kind} · ${artifact.name}`;
+    button.textContent = `${formatLocalDateTime(artifact.created_at)} · ${artifact.kind} · ${artifact.name}`;
     button.onclick = async () => {
       try {
         const data = await api(`/api/runs/${currentRun}/artifacts/${artifact.id}`);
@@ -812,7 +887,7 @@ function renderRunArtifacts(artifacts) {
           renderDiff(presentation.content);
           switchEditor("diffEditor");
         } else {
-          $("artifactTitle").textContent = `${artifact.kind} · ${artifact.name}`;
+          $("artifactTitle").textContent = `${formatLocalDateTime(artifact.created_at)} · ${artifact.kind} · ${artifact.name}`;
           if (presentation.type === "markdown") {
             $("artifactView").innerHTML = renderMarkdown(presentation.content);
           } else {
@@ -869,7 +944,7 @@ function subscribeRun(id) {
   if (runEventSource) runEventSource.close();
   runEventSource = new EventSource(`/api/runs/${id}/events`);
   runEventSource.onmessage = () => loadRun(id).catch(() => {});
-  ["run.created", "research.started", "research.completed", "plan.ready", "plan.approved", "scope.approved", "scope.approval_required", "implementation.started", "verification.completed", "apply.completed", "rollback.completed", "run.completed", "run.failed", "run.cancelled", "plan.stale"].forEach((name) => {
+  ["run.created", "research.started", "research.completed", "plan.ready", "plan.edited", "plan.redo", "plan.approved", "scope.approved", "scope.approval_required", "implementation.started", "verification.completed", "apply.completed", "rollback.completed", "run.completed", "run.failed", "run.cancelled", "plan.stale"].forEach((name) => {
     runEventSource.addEventListener(name, () => {
       loadRun(id).then((run) => {
         loadRuns().catch(() => {});
@@ -1209,6 +1284,13 @@ document.addEventListener("DOMContentLoaded", () => {
   // AI Plan (right panel)
   $("generatePlanBtn").onclick = generatePlan;
   $("approvePlanBtn").onclick  = implementPlan;
+  $("editPlanBtn").onclick = () => setPlanEditing(true);
+  $("savePlanBtn").onclick = savePlanChanges;
+  $("cancelPlanEditBtn").onclick = () => {
+    planEditing = false;
+    if (currentRunData) renderCurrentRun(currentRunData);
+  };
+  $("redoPlanBtn").onclick = redoPlan;
   $("rejectPlanBtn").onclick = rejectPlan;
   $("cancelRunBtn").onclick = () => runAction("cancel");
   $("resumeRunBtn").onclick = () => runAction("resume");
@@ -1222,12 +1304,14 @@ document.addEventListener("DOMContentLoaded", () => {
     if (currentRunData.brain_provider) $("planProvider").value = currentRunData.brain_provider;
     hide("planResultArea");
     hide("runProgress");
+    planEditing = false;
     currentRun = null;
     $("planTask").focus();
   };
 
   $("newRunBtn").onclick = () => {
     currentRun = null;
+    planEditing = false;
     $("planTask").value = "";
     $("planEditorContent").value = "";
     hide("planResultArea");

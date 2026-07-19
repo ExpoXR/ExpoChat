@@ -16,6 +16,7 @@ import httpx
 
 from . import db
 from .config import settings
+from .prompts import with_caveman
 from .run_state import validate_transition
 from .security import decrypt_secret
 from .workspace import apply_stage, create_snapshot, discard_snapshot, manifest_hash, restore_snapshot, stage_workspace
@@ -149,9 +150,15 @@ def provider_config(provider: str) -> tuple[str, str]:
     return key, row["model"]
 
 
-def call_brain(provider: str, prompt: str, allow_web: bool = False, timeout: int = 900) -> str:
+def call_brain_result(provider: str, prompt: str, allow_web: bool = False, timeout: int = 900) -> dict[str, Any]:
     key, model = provider_config(provider)
-    payload = {"provider": provider, "api_key": key, "model": model, "prompt": prompt, "allow_web": allow_web}
+    payload = {
+        "provider": provider,
+        "api_key": key,
+        "model": model,
+        "prompt": with_caveman(prompt),
+        "allow_web": allow_web,
+    }
     env = {
         "PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"),
         "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
@@ -169,7 +176,14 @@ def call_brain(provider: str, prompt: str, allow_web: bool = False, timeout: int
         raise RuntimeError((result.stderr or result.stdout or "Brain returned invalid output")[-4000:]) from exc
     if result.returncode != 0 or not data.get("ok"):
         raise RuntimeError(data.get("error") or "Brain failed")
-    return str(data.get("content", ""))
+    return {
+        "content": str(data.get("content", "")),
+        "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
+    }
+
+
+def call_brain(provider: str, prompt: str, allow_web: bool = False, timeout: int = 900) -> str:
+    return call_brain_result(provider, prompt, allow_web, timeout)["content"]
 
 
 def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = "workspace", max_turns: int = 24) -> dict[str, Any]:
@@ -274,15 +288,21 @@ def save_artifact(run_id: str, kind: str, name: str, content: Any) -> None:
         )
 
 
-def record_usage(run_id: str, result: dict[str, Any]) -> None:
+def record_usage(run_id: str, result: dict[str, Any], source: str = "ollama") -> None:
     usage = result.get("usage") or {}
     if not usage:
         return
     run = db.one("select usage_json from runs where id=?", (run_id,)) or {}
     current = json.loads(run.get("usage_json") or "{}")
+    if source == "ollama" and "ollama" not in current:
+        legacy = {key: value for key, value in current.items() if isinstance(value, (int, float))}
+        for key in legacy:
+            current.pop(key, None)
+        current["ollama"] = legacy
+    bucket = current.setdefault(source, {})
     for key, value in usage.items():
         if isinstance(value, (int, float)):
-            current[key] = current.get(key, 0) + value
+            bucket[key] = bucket.get(key, 0) + value
     update_run(run_id, usage_json=json.dumps(current, ensure_ascii=False))
 
 
@@ -357,7 +377,9 @@ def research_run(run_id: str) -> None:
             "Include architecture, exact behavior, interfaces, failure handling, tests, and acceptance criteria. "
             "Do not implement or edit files.\n\nUSER TASK:\n" + run["task"] + "\n\nWORKER DOSSIER:\n" + dossier
         )
-        plan = call_brain(run["brain_provider"], prompt, bool(run["web_research"]))
+        brain_result = call_brain_result(run["brain_provider"], prompt, bool(run["web_research"]))
+        record_usage(run_id, brain_result, "brain")
+        plan = brain_result["content"]
         if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
             return
         implementation = choose_agent("implementation")
@@ -442,6 +464,38 @@ def approve_run(run_id: str, approved_plan: str) -> dict[str, Any]:
         return db.one("select * from runs where id=?", (run_id,)) or {}
 
 
+def edit_plan(run_id: str, plan: str) -> dict[str, Any]:
+    run = db.one("select * from runs where id=?", (run_id,))
+    if not run or run["status"] != "awaiting_approval":
+        raise RuntimeError("Run is not awaiting plan edits")
+    update_run(run_id, draft_plan=plan, error=None)
+    save_artifact(run_id, "plan_edit", "User-edited plan", plan)
+    db.add_event(run_id, "plan.edited", "Plan changes saved")
+    return db.one("select * from runs where id=?", (run_id,)) or {}
+
+
+def redo_plan(run_id: str) -> dict[str, Any]:
+    with _run_lock:
+        run = db.one("select * from runs where id=?", (run_id,))
+        if not run or run["status"] != "awaiting_approval":
+            raise RuntimeError("Only a plan awaiting approval can be redone")
+        target = Path(run["target_path"])
+        research_agent = choose_agent("research")
+        stage_workspace(run_id, target)
+        update_run(
+            run_id,
+            status="researching",
+            baseline_hash=manifest_hash(target),
+            research_agent_id=research_agent["id"],
+            dossier=None,
+            draft_plan=None,
+            error=None,
+        )
+        db.add_event(run_id, "plan.redo", f"Plan redo queued with {research_agent['name']}")
+        enqueue_job(run_id, "research")
+        return db.one("select * from runs where id=?", (run_id,)) or {}
+
+
 def verification_prompt(run: dict[str, Any], implementation_summary: str) -> str:
     return (
         "Verify approved implementation independently. Inspect staged code and run relevant safe checks. "
@@ -457,7 +511,9 @@ def brain_verdict(run: dict[str, Any], reports: list[str]) -> tuple[bool, str]:
         "Set scope_expansion true when a required repair exceeds approved scope; otherwise repair_task must remain inside scope.\n\nPLAN:\n" + (run["approved_plan"] or "")
         + "\n\nREPORTS:\n" + "\n\n---\n\n".join(reports)
     )
-    raw = call_brain(run["brain_provider"], prompt, False)
+    brain_result = call_brain_result(run["brain_provider"], prompt, False)
+    record_usage(run["id"], brain_result, "brain")
+    raw = brain_result["content"]
     cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
     try:
         value = json.loads(cleaned)

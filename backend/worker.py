@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from .config import settings
 from .logging_utils import configure_logging
+from .prompts import CAVEMAN_OUTPUT_INSTRUCTIONS
 from .workspace_tools import TOOL_DEFS, execute_tool
 
 configure_logging()
@@ -19,6 +20,12 @@ JOBS_ROOT = settings.jobs_dir.resolve()
 _cancel_events: dict[str, asyncio.Event] = {}
 _active_tasks: dict[str, asyncio.Task[Any]] = {}
 _cancel_lock = threading.Lock()
+MODE_PROMPTS = {
+    "research": "Inspect workspace deeply. Use tools before answering. Return architecture, relevant files, risks, tests, and implementation advice. Never edit.",
+    "implementation": "Implement approved task fully in staged workspace. Use precise file tools, run relevant checks, fix failures, then summarize changed files and evidence.",
+    "verification": "Independently verify implementation. Inspect files and run safe checks. Return PASS or FAIL first, then concrete evidence and defects. Never edit.",
+    "console": "Run requested safe check and return exact output. Never edit.",
+}
 
 
 class WorkRequest(BaseModel):
@@ -42,17 +49,18 @@ def workspace_for(request: WorkRequest) -> Path:
     return path
 
 
+def agent_system_prompt(mode: str) -> str:
+    return MODE_PROMPTS[mode] + " Workspace root is current staged directory.\n\n" + CAVEMAN_OUTPUT_INSTRUCTIONS
+
+
 async def agent_loop(request: WorkRequest, root: Path, cancelled: asyncio.Event | None = None) -> dict[str, Any]:
     writable = request.mode == "implementation"
     tools = TOOL_DEFS if writable else [tool for tool in TOOL_DEFS if tool["function"]["name"] not in {"write_file", "replace_text", "delete_file"}]
-    system = {
-        "research": "Inspect workspace deeply. Use tools before answering. Return architecture, relevant files, risks, tests, and implementation advice. Never edit.",
-        "implementation": "Implement approved task fully in staged workspace. Use precise file tools, run relevant checks, fix failures, then summarize changed files and evidence.",
-        "verification": "Independently verify implementation. Inspect files and run safe checks. Return PASS or FAIL first, then concrete evidence and defects. Never edit.",
-        "console": "Run requested safe check and return exact output. Never edit.",
-    }[request.mode]
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system + " Workspace root is current staged directory."},
+        {
+            "role": "system",
+            "content": agent_system_prompt(request.mode),
+        },
         {"role": "user", "content": request.task},
     ]
     events: list[dict[str, Any]] = []

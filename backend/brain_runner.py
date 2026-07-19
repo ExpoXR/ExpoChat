@@ -6,17 +6,22 @@ import sys
 from typing import Any
 
 
-def run_codex(payload: dict[str, Any]) -> str:
+def run_codex(payload: dict[str, Any]) -> dict[str, Any]:
     from openai_codex import Codex, Sandbox
 
     with Codex() as codex:
         codex.login_api_key(payload["api_key"])
         thread = codex.thread_start(model=payload["model"], sandbox=Sandbox.read_only)
         result = thread.run(payload["prompt"])
-        return result.final_response
+        total = getattr(getattr(result, "usage", None), "total", None)
+        usage = {
+            key: int(getattr(total, key, 0) or 0)
+            for key in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")
+        }
+        return {"content": result.final_response or "", "usage": usage}
 
 
-async def run_claude(payload: dict[str, Any]) -> str:
+async def run_claude(payload: dict[str, Any]) -> dict[str, Any]:
     from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
     os.environ["ANTHROPIC_API_KEY"] = payload["api_key"]
@@ -25,6 +30,7 @@ async def run_claude(payload: dict[str, Any]) -> str:
     if not payload.get("allow_web"):
         blocked.extend(["WebSearch", "WebFetch"])
     result = ""
+    usage: dict[str, int | float] = {}
     async for message in query(
         prompt=payload["prompt"],
         options=ClaudeAgentOptions(
@@ -35,8 +41,13 @@ async def run_claude(payload: dict[str, Any]) -> str:
         ),
     ):
         if isinstance(message, ResultMessage):
-            result = message.result
-    return result
+            result = message.result or ""
+            usage = {
+                key: value
+                for key, value in (message.usage or {}).items()
+                if isinstance(value, (int, float))
+            }
+    return {"content": result, "usage": usage}
 
 
 def main() -> None:
@@ -49,7 +60,7 @@ def main() -> None:
             result = asyncio.run(run_claude(payload))
         else:
             raise ValueError("Unsupported brain provider")
-        print(json.dumps({"ok": True, "content": result}, ensure_ascii=False))
+        print(json.dumps({"ok": True, **result}, ensure_ascii=False))
     except Exception as exc:
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
         raise SystemExit(1) from exc

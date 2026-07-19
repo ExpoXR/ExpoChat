@@ -14,8 +14,9 @@ WORKSPACES = TEST_ROOT / "workspaces"
 
 from fastapi import HTTPException  # noqa: E402
 
-from backend import brain_runner, db, orchestrator, workspace  # noqa: E402
+from backend import brain_runner, db, orchestrator, worker, workspace  # noqa: E402
 from backend.main import pinned_context  # noqa: E402
+from backend.prompts import CAVEMAN_OUTPUT_INSTRUCTIONS  # noqa: E402
 from backend.run_state import validate_transition  # noqa: E402
 from backend.security import decrypt_secret, encrypt_secret  # noqa: E402
 from backend.workspace import (  # noqa: E402
@@ -73,7 +74,14 @@ def test_codex_runner_applies_api_key_before_starting_thread(monkeypatch):
     class FakeThread:
         def run(self, prompt):
             calls.append(("run", prompt))
-            return SimpleNamespace(final_response="OK")
+            total = SimpleNamespace(
+                input_tokens=10,
+                cached_input_tokens=2,
+                output_tokens=3,
+                reasoning_output_tokens=1,
+                total_tokens=13,
+            )
+            return SimpleNamespace(final_response="OK", usage=SimpleNamespace(total=total))
 
     class FakeCodex:
         def __enter__(self):
@@ -94,12 +102,35 @@ def test_codex_runner_applies_api_key_before_starting_thread(monkeypatch):
 
     result = brain_runner.run_codex({"api_key": "secret", "model": "gpt-test", "prompt": "ping"})
 
-    assert result == "OK"
+    assert result == {
+        "content": "OK",
+        "usage": {
+            "input_tokens": 10,
+            "cached_input_tokens": 2,
+            "output_tokens": 3,
+            "reasoning_output_tokens": 1,
+            "total_tokens": 13,
+        },
+    }
     assert calls == [
         ("login", "secret"),
         ("start", "gpt-test", "read-only"),
         ("run", "ping"),
     ]
+
+
+def test_caveman_prompt_applies_to_brain_and_ollama(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(orchestrator, "provider_config", lambda _: ("key", "model"))
+
+    def fake_run(*_args, **kwargs):
+        captured.update(json.loads(kwargs["input"]))
+        return SimpleNamespace(returncode=0, stdout='{"ok":true,"content":"OK","usage":{}}\n', stderr="")
+
+    monkeypatch.setattr(orchestrator.subprocess, "run", fake_run)
+    assert orchestrator.call_brain("codex", "Do work") == "OK"
+    assert CAVEMAN_OUTPUT_INSTRUCTIONS in captured["prompt"]
+    assert CAVEMAN_OUTPUT_INSTRUCTIONS in worker.agent_system_prompt("research")
 
 
 def test_allowed_path_rejects_symlink_escape():
@@ -372,3 +403,27 @@ def test_approval_creates_history_snapshot_and_approval_atomically(monkeypatch):
     assert db.one("select * from jobs where run_id=? and status='pending'", (run_id,))
     snapshot = db.one("select * from snapshots where id=?", (result["snapshot_id"],))
     assert snapshot and (TEST_ROOT / "snapshots" / snapshot["ref"]).is_file()
+
+
+def test_plan_can_be_edited_and_redone(monkeypatch):
+    clear_workflow_tables()
+    seed_agent("research", "research-model", ["research"], [], 100)
+    target = WORKSPACES / "redo-target"
+    target.mkdir(exist_ok=True)
+    (target / "main.py").write_text("print('redo')\n")
+    run_id = "f" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,baseline_hash,draft_plan,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
+        (run_id, "Redo plan", "codex", str(target), "awaiting_approval", manifest_hash(target), "Old plan", now, now),
+    )
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+
+    edited = orchestrator.edit_plan(run_id, "Changed plan")
+    assert edited["draft_plan"] == "Changed plan"
+    assert db.one("select id from run_artifacts where run_id=? and kind='plan_edit'", (run_id,))
+
+    redone = orchestrator.redo_plan(run_id)
+    assert redone["status"] == "researching"
+    assert redone["draft_plan"] is None
+    assert db.one("select id from jobs where run_id=? and job_type='research' and status='pending'", (run_id,))

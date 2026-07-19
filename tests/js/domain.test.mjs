@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { buildChatPayload, chatEventStatus } from "../../public/js/chat.mjs";
-import { artifactPresentation, runStatusLabel } from "../../public/js/runs.mjs";
+import { artifactPresentation, runStatusLabel, tokenCounts } from "../../public/js/runs.mjs";
 import { BRAIN_MODELS, modelLabel, modelOptions, providerOptions } from "../../public/js/settings.mjs";
 import { readPreferences, writePreferences } from "../../public/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "../../public/js/workspace.mjs";
@@ -31,6 +31,18 @@ test("run and artifact helpers select explicit render types", () => {
     artifactPresentation({ kind: "research" }, JSON.stringify({ summary: "# Human summary", events: [{ tool: "read" }] })),
     { type: "markdown", content: "# Human summary" },
   );
+});
+
+test("token counters split Brain and Ollama usage", () => {
+  assert.deepEqual(tokenCounts({
+    brain: { input_tokens: 100, output_tokens: 25, total_tokens: 125 },
+    ollama: { prompt_eval_count: 80, eval_count: 20 },
+  }), {
+    brain: { input: 100, output: 25, total: 125 },
+    ollama: { input: 80, output: 20, total: 100 },
+  });
+  assert.equal(tokenCounts({ prompt_eval_count: 7, eval_count: 3 }).ollama.total, 10);
+  assert.equal(tokenCounts('{"brain":{"total_tokens":12}}').brain.total, 12);
 });
 
 test("settings and preferences are pure and bounded", () => {

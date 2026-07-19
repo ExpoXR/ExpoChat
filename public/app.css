@@ -720,6 +720,35 @@ pre {
   flex-wrap: wrap;
 }
 
+.token-counters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.token-counter {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  gap: 2px 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  background: #111;
+}
+
+.token-counter span {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+}
+
+.token-counter strong { color: #ededed; font-size: 17px; }
+.token-counter small { color: var(--muted); font-size: 10px; }
+
 /* Proof: rendered markdown preview of the plan */
 .plan-proof {
   max-height: 300px;
