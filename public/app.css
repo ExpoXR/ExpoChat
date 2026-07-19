@@ -450,29 +450,6 @@ label {
   border-left-color: var(--danger);
 }
 
-.msg.run-activity {
-  border-left-color: #d7ba7d;
-}
-
-.run-activity-body {
-  display: grid;
-  gap: 4px;
-  max-height: 420px;
-  overflow: auto;
-}
-
-.run-activity-row {
-  display: grid;
-  grid-template-columns: 10px minmax(0, 1fr);
-  gap: 7px;
-  align-items: start;
-  color: #bdbdbd;
-  font-family: Consolas, ui-monospace, monospace;
-  font-size: 12px;
-  white-space: normal;
-}
-
-.run-activity-dot,
 .file-status-dot {
   width: 8px;
   height: 8px;
@@ -480,19 +457,13 @@ label {
   background: #777;
 }
 
-.run-activity-dot.working,
 .file-status-dot.working {
   background: #d7ba7d;
   box-shadow: 0 0 5px #d7ba7d99;
 }
 
-.run-activity-dot.changed,
 .file-status-dot.changed {
   background: #73c991;
-}
-
-.run-activity-dot.failed {
-  background: var(--danger);
 }
 
 .msg .role {
@@ -1432,3 +1403,113 @@ pre {
   background: #15351e;
   border-left: 3px solid #76c47c;
 }
+
+/* -----------------------------------------------------------------------
+   Supervisor Run — unified center view
+----------------------------------------------------------------------- */
+
+#runEditor {
+  grid-template-rows: 34px minmax(0, 1fr);
+}
+
+.run-main-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 18px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.run-inline-status {
+  color: var(--muted);
+  text-transform: capitalize;
+  overflow-wrap: anywhere;
+}
+
+#runEditor #currentRunBadge {
+  margin-top: 0;
+  padding: 3px 7px;
+  font-size: 11px;
+}
+
+#runEditor .plan-proof { max-height: none; }
+#runEditor .run-events { max-height: none; }
+
+/* Run action groups relocated to the right panel */
+.panel-actions {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+
+/* -----------------------------------------------------------------------
+   Tree rows with kebab (Explorer + Chat history)
+----------------------------------------------------------------------- */
+
+.tree-row {
+  display: flex;
+  align-items: stretch;
+}
+
+.tree-row .item {
+  flex: 1;
+  min-width: 0;
+}
+
+.kebab {
+  flex: 0 0 auto;
+  width: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.35;
+  transition: opacity 0.1s ease;
+}
+
+.tree-row:hover .kebab,
+.kebab:focus-visible { opacity: 1; }
+
+@media (hover: none) {
+  .kebab { opacity: 0.7; }
+}
+.kebab:hover { background: #2a2d2e; color: var(--text); }
+
+/* -----------------------------------------------------------------------
+   Floating context (kebab) menu
+----------------------------------------------------------------------- */
+
+.context-menu {
+  position: fixed;
+  z-index: 40;
+  min-width: 170px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--side);
+  box-shadow: 0 8px 24px #0009;
+  display: flex;
+  flex-direction: column;
+}
+
+.context-item {
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.context-item:hover:not(:disabled) { background: var(--accent-strong); color: #fff; }
+.context-item:disabled { color: var(--muted); cursor: default; }
+.context-item.danger { color: var(--danger); }
+.context-item.danger:hover:not(:disabled) { background: #5a1d13; color: #ffd7cd; }

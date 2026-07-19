@@ -1,9 +1,42 @@
 # Ollma Chat System
 
+TrueNAS-hosted supervisor for local Ollama workers plus Codex/Claude planning.
+FastAPI backend (`backend/`) + no-build ES-module frontend (`public/`).
 
-## Caveman Skills
+## Architecture (where the AI runs)
 
-Ultra-compressed communication mode available. Cuts ~75% output tokens, full technical accuracy.
+```text
+Browser -> FastAPI web -> SQLite / snapshots / staged jobs
+                    |-> Brain service   -> Codex / Claude   (planning, verdicts)
+                    |-> Worker API       -> Ollama agent     (research, edits, verification)
+                    |-> /api/chats/.../message -> Ollama      (interactive chat)
+```
+
+- `backend/main.py`: HTTP/SSE API, static UI, interactive chat stream, file + `/api/fs/*` ops.
+- `backend/orchestrator.py`: run state machine + all Brain (Codex/Claude) calls.
+- `backend/worker.py`: credential-isolated Ollama agent loop.
+- `backend/prompts.py`: shared caveman output instruction (see below).
+- `public/`: workbench UI (chat, unified Supervisor Run center view, Explorer, Snapshots…).
+
+## Caveman output mode — applied to ALL AI in the app
+
+Every model call the app makes is prefixed with the compact caveman instruction from
+[`backend/prompts.py`](backend/prompts.py) (`CAVEMAN_OUTPUT_INSTRUCTIONS` / `with_caveman()`),
+so responses stay terse with full technical accuracy. The three entry points:
+
+| AI path | Where it runs | Caveman applied at |
+|---------|---------------|--------------------|
+| Interactive chat | Ollama (read-only tools) | `backend/main.py` (chat system prompt) |
+| Supervised worker | Ollama agent (research / implementation / verification) | `backend/worker.py` → `agent_system_prompt()` |
+| Supervisor brain | Codex / Claude (plan + verdict) | `backend/orchestrator.py` → `call_brain_result()` → `with_caveman()` |
+
+The app deliberately injects the **compact** instruction, not the full multi-level skill,
+to keep token savings positive. The full skill and its intensity levels live in
+`.claude/` (below) and drive Claude Code sessions on this repo.
+
+## Caveman Skills (Claude Code, this repo)
+
+Ultra-compressed communication mode. Cuts ~75% output tokens, full technical accuracy.
 
 | Command | What |
 |---------|------|
@@ -14,5 +47,17 @@ Ultra-compressed communication mode available. Cuts ~75% output tokens, full tec
 | `/caveman-help` | Quick-reference card |
 | `/caveman-compress <file>` | Compress .md file → ~46% fewer input tokens |
 
-Stop: "stop caveman" or "normal mode". Skills in `.claude/skills/`, commands in `.claude/commands/`.
+Stop: "stop caveman" or "normal mode".
+Skills in [`.claude/skills/`](.claude/skills/) (canonical: `caveman/SKILL.md`),
+commands in [`.claude/commands/`](.claude/commands/).
 
+## Developer commands
+
+```bash
+make lint       # Ruff
+make test       # Python unit/integration tests (pytest)
+make test-js    # Frontend unit tests (node --test)
+make check      # fast local gate
+make up         # docker compose up -d
+make logs       # follow Compose logs
+```

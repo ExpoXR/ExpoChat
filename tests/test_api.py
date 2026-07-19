@@ -89,6 +89,60 @@ def test_health_and_csrf_protection():
     asyncio.run(run())
 
 
+def test_fs_operations_and_chat_management():
+    async def run():
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                login = await client.post("/api/auth/login", json={"username": "tester", "password": "correct-horse-battery-staple"})
+                csrf = login.json()["csrf"]
+                h = {"X-CSRF-Token": csrf}
+                root = workspace.settings.allowed_roots[0]
+                folder = root / "fsops"
+
+                assert (await client.post("/api/fs/folder", headers=h, json={"path": str(folder)})).status_code == 200
+                assert folder.is_dir()
+
+                src = folder / "a.txt"
+                assert (await client.put("/api/file", headers=h, json={"path": str(src), "content": "hello"})).status_code == 200
+
+                copied = await client.post("/api/fs/copy", headers=h, json={"src": str(src), "dest": str(folder / "b.txt")})
+                assert copied.status_code == 200
+                assert (folder / "b.txt").read_text() == "hello"
+                # copy without overwrite onto an existing path is rejected
+                assert (await client.post("/api/fs/copy", headers=h, json={"src": str(src), "dest": str(folder / "b.txt")})).status_code == 409
+
+                renamed = await client.post("/api/fs/rename", headers=h, json={"path": str(folder / "b.txt"), "new_path": str(folder / "c.txt")})
+                assert renamed.status_code == 200
+                assert (folder / "c.txt").exists() and not (folder / "b.txt").exists()
+
+                # deletion snapshots first, so rollback stays possible
+                before = len((await client.get("/api/snapshots")).json()["snapshots"])
+                deleted = await client.post("/api/fs/delete", headers=h, json={"path": str(folder / "c.txt")})
+                assert deleted.status_code == 200 and deleted.json()["snapshot"]
+                assert not (folder / "c.txt").exists()
+                after = len((await client.get("/api/snapshots")).json()["snapshots"])
+                assert after == before + 1
+
+                # sandbox guards
+                assert (await client.post("/api/fs/delete", headers=h, json={"path": "/etc/hosts"})).status_code == 403
+                assert (await client.post("/api/fs/delete", headers=h, json={"path": str(root)})).status_code == 400
+
+                # chat management
+                c1 = (await client.post("/api/chats", headers=h, json={"title": "Alpha", "model": "m"})).json()["chat"]
+                c2 = (await client.post("/api/chats", headers=h, json={"title": "Beta", "model": "m"})).json()["chat"]
+                renamed_chat = await client.patch(f"/api/chats/{c1['id']}", headers=h, json={"title": "Alpha2"})
+                assert renamed_chat.status_code == 200 and renamed_chat.json()["title"] == "Alpha2"
+                assert (await client.patch(f"/api/chats/{c1['id']}", headers=h, json={"pinned": True})).status_code == 200
+                assert (await client.get("/api/chats")).json()["chats"][0]["id"] == c1["id"]
+                dup = (await client.post(f"/api/chats/{c2['id']}/duplicate", headers=h, json={})).json()["chat"]
+                assert dup["title"] == "Beta (copy)" and dup["id"] != c2["id"]
+                assert (await client.delete(f"/api/chats/{c2['id']}", headers=h)).status_code == 200
+                assert (await client.get(f"/api/chats/{c2['id']}/messages")).status_code == 404
+
+    asyncio.run(run())
+
+
 def test_worker_cancellation_interrupts_active_task(monkeypatch):
     async def run():
         run_id = "d" * 24

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -47,6 +48,7 @@ from .security import (
 )
 from .workspace import (
     EXCLUDED_DIRS,
+    _copy_ignore,
     allowed_path,
     cleanup_orphan_snapshots,
     cleanup_partial_snapshots,
@@ -112,6 +114,26 @@ class ChatBody(BaseModel):
     model: str = Field(default="", max_length=200)
     target_path: str = Field(default="", max_length=4096)
     snapshot: bool = False
+
+
+class ChatUpdateBody(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    pinned: bool | None = None
+
+
+class FsPathBody(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
+
+class FsRenameBody(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    new_path: str = Field(min_length=1, max_length=4096)
+
+
+class FsCopyBody(BaseModel):
+    src: str = Field(min_length=1, max_length=4096)
+    dest: str = Field(min_length=1, max_length=4096)
+    overwrite: bool = False
 
 
 class MessageBody(BaseModel):
@@ -696,7 +718,7 @@ def status_api(_: dict = Depends(require_user)):
 
 @workspace_router.get("/api/chats")
 def chats(cursor: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100), _: dict = Depends(require_user)):
-    rows = db.all_rows("select * from chats order by updated_at desc limit ? offset ?", (limit + 1, cursor))
+    rows = db.all_rows("select * from chats order by pinned desc, updated_at desc limit ? offset ?", (limit + 1, cursor))
     has_more = len(rows) > limit
     return {"chats": rows[:limit], "next_cursor": cursor + limit if has_more else None}
 
@@ -713,6 +735,45 @@ def chat_create(body: ChatBody, _: dict = Depends(require_user)):
     snap = create_snapshot(Path(target), chat_id) if target and body.snapshot else None
     add_timeline("chat", "New chat created", target or None, chat_id)
     return {"chat": db.one("select * from chats where id=?", (chat_id,)), "snapshot": snap}
+
+
+@workspace_router.patch("/api/chats/{chat_id}")
+def chat_update(chat_id: str, body: ChatUpdateBody, _: dict = Depends(require_user)):
+    chat = db.one("select * from chats where id=?", (chat_id,))
+    if not chat:
+        raise HTTPException(404, "Chat not found")
+    title = body.title.strip() if body.title is not None else chat["title"]
+    if not title:
+        raise HTTPException(400, "Title cannot be empty")
+    pinned = int(body.pinned) if body.pinned is not None else chat["pinned"]
+    db.execute(
+        "update chats set title=?,pinned=?,updated_at=? where id=?",
+        (title, pinned, db.utcnow(), chat_id),
+    )
+    return db.one("select * from chats where id=?", (chat_id,))
+
+
+@workspace_router.delete("/api/chats/{chat_id}")
+def chat_delete(chat_id: str, _: dict = Depends(require_user)):
+    if not db.one("select id from chats where id=?", (chat_id,)):
+        raise HTTPException(404, "Chat not found")
+    db.execute("delete from chats where id=?", (chat_id,))
+    return {"ok": True}
+
+
+@workspace_router.post("/api/chats/{chat_id}/duplicate")
+def chat_duplicate(chat_id: str, _: dict = Depends(require_user)):
+    source = db.one("select * from chats where id=?", (chat_id,))
+    if not source:
+        raise HTTPException(404, "Chat not found")
+    new_id = secrets.token_hex(12)
+    now = db.utcnow()
+    title = f"{source['title']} (copy)"[:200]
+    db.execute(
+        "insert into chats(id,title,model,target_path,created_at,updated_at) values(?,?,?,?,?,?)",
+        (new_id, title, source["model"], source["target_path"], now, now),
+    )
+    return {"chat": db.one("select * from chats where id=?", (new_id,))}
 
 
 @workspace_router.get("/api/chats/{chat_id}/messages")
@@ -844,6 +905,99 @@ def file_put(body: FileBody, _: dict = Depends(require_user)):
     diff = "".join(difflib.unified_diff(before.splitlines(True), body.content.splitlines(True), fromfile=f"{target} original", tofile=f"{target} changed"))
     add_timeline("file_change", f"Changed {target.name}", str(target), body.chat_id, before, body.content, diff)
     return {"ok": True, "snapshot": snapshot, "diff": diff}
+
+
+def _is_allowed_root(path: Path) -> bool:
+    return any(path == root for root in settings.allowed_roots)
+
+
+def _path_bytes(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for base, dirs, files in os.walk(path):
+        dirs[:] = [name for name in dirs if name not in EXCLUDED_DIRS]
+        for name in files:
+            item = Path(base) / name
+            with contextlib.suppress(OSError):
+                if not item.is_symlink():
+                    total += item.stat().st_size
+    return total
+
+
+@workspace_router.post("/api/fs/folder")
+def fs_folder(body: FsPathBody, _: dict = Depends(require_user)):
+    target = allowed_path(body.path, must_exist=False)
+    if target.exists():
+        raise HTTPException(409, "Path already exists")
+    target.mkdir(parents=True, exist_ok=False)
+    add_timeline("fs_mkdir", f"Created folder {target.name}", str(target))
+    return {"ok": True, "path": str(target)}
+
+
+@workspace_router.post("/api/fs/rename")
+def fs_rename(body: FsRenameBody, _: dict = Depends(require_user)):
+    source = allowed_path(body.path)
+    dest = allowed_path(body.new_path, must_exist=False)
+    if source.is_symlink():
+        raise HTTPException(400, "Cannot move a symlink")
+    if _is_allowed_root(source):
+        raise HTTPException(400, "Cannot move a workspace root")
+    if dest == source:
+        raise HTTPException(400, "Source and destination are identical")
+    if source == dest or source in dest.parents:
+        raise HTTPException(400, "Destination is inside source")
+    if dest.exists():
+        raise HTTPException(409, "Destination already exists")
+    snapshot = create_snapshot(source)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(dest))
+    add_timeline("fs_rename", f"Moved {source.name} → {dest.name}", str(dest), diff=str(source))
+    return {"ok": True, "path": str(dest), "snapshot": snapshot}
+
+
+@workspace_router.post("/api/fs/copy")
+def fs_copy(body: FsCopyBody, _: dict = Depends(require_user)):
+    source = allowed_path(body.src)
+    dest = allowed_path(body.dest, must_exist=False)
+    if source.is_symlink():
+        raise HTTPException(400, "Cannot copy a symlink")
+    if dest == source or source in dest.parents:
+        raise HTTPException(400, "Destination is inside source")
+    if _path_bytes(source) > settings.snapshot_max_bytes:
+        raise HTTPException(413, "Copy source exceeds size limit")
+    snapshot = None
+    if dest.exists():
+        if not body.overwrite:
+            raise HTTPException(409, "Destination already exists")
+        if _is_allowed_root(dest):
+            raise HTTPException(400, "Cannot overwrite a workspace root")
+        snapshot = create_snapshot(dest)
+        if dest.is_dir():
+            shutil.rmtree(dest)
+        else:
+            dest.unlink()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, dest, ignore=_copy_ignore)
+    else:
+        shutil.copy2(source, dest)
+    add_timeline("fs_copy", f"Copied {source.name} → {dest.name}", str(dest), diff=str(source))
+    return {"ok": True, "path": str(dest), "snapshot": snapshot}
+
+
+@workspace_router.post("/api/fs/delete")
+def fs_delete(body: FsPathBody, _: dict = Depends(require_user)):
+    target = allowed_path(body.path)
+    if _is_allowed_root(target):
+        raise HTTPException(400, "Cannot delete a workspace root")
+    snapshot = create_snapshot(target)
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    add_timeline("fs_delete", f"Deleted {target.name}", str(target), diff=str(target))
+    return {"ok": True, "path": str(target), "snapshot": snapshot}
 
 
 @workspace_router.get("/api/search")

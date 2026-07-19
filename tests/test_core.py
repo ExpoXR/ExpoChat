@@ -16,6 +16,7 @@ from fastapi import HTTPException  # noqa: E402
 
 from backend import brain_runner, db, orchestrator, worker, workspace  # noqa: E402
 from backend.main import pinned_context  # noqa: E402
+from backend.migrations import MIGRATIONS  # noqa: E402
 from backend.prompts import CAVEMAN_OUTPUT_INSTRUCTIONS  # noqa: E402
 from backend.run_state import validate_transition  # noqa: E402
 from backend.security import decrypt_secret, encrypt_secret  # noqa: E402
@@ -59,7 +60,7 @@ def test_migrations_are_idempotent():
     db.init_db()
     db.init_db()
     versions = db.all_rows("select version from schema_migrations order by version")
-    assert [row["version"] for row in versions] == [1, 2, 3, 4]
+    assert [row["version"] for row in versions] == [version for version, _ in MIGRATIONS]
 
 
 def test_credential_round_trip():

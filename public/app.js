@@ -1,11 +1,12 @@
 import { createApi } from "/js/api.mjs";
 import { buildChatPayload, chatEventStatus } from "/js/chat.mjs";
 import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMarkdown } from "/js/render.mjs";
-import { artifactPresentation, explorerActivityState, fileActivity, runEventData, runStatusLabel, tokenCounts } from "/js/runs.mjs";
+import { artifactPresentation, explorerActivityState, fileActivity, runStatusLabel, tokenCounts } from "/js/runs.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
 import { consumeSse } from "/js/sse.mjs";
 import { readPreferences, writePreferences } from "/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "/js/workspace.mjs";
+import { baseName, duplicateName, joinPath, parentDir, pasteTarget } from "/js/fsops.mjs";
 
 // ---------------------------------------------------------------------------
 // State
@@ -38,6 +39,7 @@ let timelineNext = null;
 let planEditing = false;
 let snapshotRetentionDays = 30;
 let runFileActivity = new Map();
+let clipboard = null; // { mode: "copy" | "cut", path }
 
 // ---------------------------------------------------------------------------
 // Core API helper
@@ -120,6 +122,38 @@ function showToast(message, type = "info") {
   t._tid = setTimeout(() => t.classList.add("hidden"), 3500);
 }
 
+// Floating kebab / context menu. items: [{ label, handler, danger?, disabled? }]
+function closeContextMenu() {
+  const menu = $("contextMenu");
+  menu.classList.add("hidden");
+  menu.innerHTML = "";
+}
+
+function openContextMenu(anchorEl, items) {
+  const menu = $("contextMenu");
+  menu.innerHTML = "";
+  items.filter(Boolean).forEach((item) => {
+    const btn = document.createElement("button");
+    btn.className = "context-item" + (item.danger ? " danger" : "");
+    btn.textContent = item.label;
+    btn.disabled = Boolean(item.disabled);
+    btn.setAttribute("role", "menuitem");
+    btn.onclick = (event) => {
+      event.stopPropagation();
+      closeContextMenu();
+      item.handler();
+    };
+    menu.appendChild(btn);
+  });
+  menu.classList.remove("hidden");
+  const rect = anchorEl.getBoundingClientRect();
+  const width = menu.offsetWidth || 180;
+  const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
+  const top = Math.min(rect.bottom + 4, window.innerHeight - menu.offsetHeight - 8);
+  menu.style.left = `${left}px`;
+  menu.style.top = `${Math.max(8, top)}px`;
+}
+
 // ---------------------------------------------------------------------------
 // Layout switches
 // ---------------------------------------------------------------------------
@@ -153,7 +187,7 @@ function closeDrawers() {
 }
 
 function switchEditor(id) {
-  ["chatEditor", "fileEditor", "diffEditor", "artifactEditor"].forEach((pane) =>
+  ["chatEditor", "runEditor", "fileEditor", "diffEditor", "artifactEditor"].forEach((pane) =>
     $(pane).classList.toggle("hidden", pane !== id)
   );
   document.querySelectorAll(".editor-tab").forEach((tab) =>
@@ -208,12 +242,66 @@ function addMessage(role, content) {
 function renderChats() {
   $("chatList").innerHTML = "";
   chats.forEach((chat) => {
+    const row = document.createElement("div");
+    row.className = "tree-row";
     const btn = document.createElement("button");
     btn.className = "item" + (chat.id === currentChat ? " active" : "");
-    btn.textContent = chat.title || "New chat";
+    btn.textContent = (chat.pinned ? "📌 " : "") + (chat.title || "New chat");
     btn.onclick = () => loadChat(chat.id);
-    $("chatList").appendChild(btn);
+    const kebab = document.createElement("button");
+    kebab.className = "kebab";
+    kebab.textContent = "⋯";
+    kebab.title = "Chat actions";
+    kebab.setAttribute("aria-label", `Actions for ${chat.title || "chat"}`);
+    kebab.onclick = (event) => { event.stopPropagation(); openChatMenu(kebab, chat); };
+    row.append(btn, kebab);
+    $("chatList").appendChild(row);
   });
+}
+
+function openChatMenu(anchorEl, chat) {
+  openContextMenu(anchorEl, [
+    { label: "Rename", handler: () => renameChat(chat) },
+    { label: chat.pinned ? "Unpin" : "Pin", handler: () => pinChat(chat) },
+    { label: "Duplicate", handler: () => duplicateChat(chat) },
+    { label: "Delete", danger: true, handler: () => deleteChat(chat) },
+  ]);
+}
+
+async function renameChat(chat) {
+  const title = (prompt("Rename chat:", chat.title || "") || "").trim();
+  if (!title || title === chat.title) return;
+  try {
+    await api(`/api/chats/${chat.id}`, { method: "PATCH", body: JSON.stringify({ title }) });
+    await loadChats();
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function pinChat(chat) {
+  try {
+    await api(`/api/chats/${chat.id}`, { method: "PATCH", body: JSON.stringify({ pinned: !chat.pinned }) });
+    await loadChats();
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function duplicateChat(chat) {
+  try {
+    const data = await api(`/api/chats/${chat.id}/duplicate`, { method: "POST", body: "{}" });
+    await loadChats();
+    if (data.chat) await loadChat(data.chat.id);
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function deleteChat(chat) {
+  if (!confirm(`Delete chat "${chat.title || "New chat"}" and all its messages?`)) return;
+  try {
+    await api(`/api/chats/${chat.id}`, { method: "DELETE" });
+    if (currentChat === chat.id) {
+      currentChat = null;
+      $("messages").innerHTML = '<span id="streamCursor" class="stream-cursor hidden">▋</span>';
+    }
+    await loadChats();
+  } catch (err) { showToast(err.message, "error"); }
 }
 
 async function loadModels() {
@@ -435,13 +523,22 @@ async function openPath(path) {
   }
 
   (data.items || []).forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "tree-row";
     const btn = document.createElement("button");
     btn.className = "item";
     btn.innerHTML = `<span class="file-icon">${item.is_dir ? "📁" : "📄"}</span>${escapeHtml(item.name)}`;
     btn.dataset.path = item.path;
     btn.dataset.directory = String(Boolean(item.is_dir));
     btn.onclick = () => (item.is_dir ? openPath(item.path) : openFile(item.path));
-    $("fileList").appendChild(btn);
+    const kebab = document.createElement("button");
+    kebab.className = "kebab";
+    kebab.textContent = "⋯";
+    kebab.title = "Actions";
+    kebab.setAttribute("aria-label", `Actions for ${item.name}`);
+    kebab.onclick = (event) => { event.stopPropagation(); openEntryMenu(kebab, item.path, Boolean(item.is_dir)); };
+    row.append(btn, kebab);
+    $("fileList").appendChild(row);
   });
   renderExplorerActivity();
 }
@@ -490,6 +587,107 @@ async function saveFile() {
   } finally {
     setBusy(["saveFileBtn"], false);
   }
+}
+
+// ---------------------------------------------------------------------------
+// File / folder operations (Explorer)
+// ---------------------------------------------------------------------------
+
+function currentExplorerDir() {
+  return $("filePath").value.trim();
+}
+
+async function fsRefresh() {
+  await openPath(currentExplorerDir());
+}
+
+function syncPasteButton() {
+  $("pasteHereBtn").classList.toggle("hidden", !clipboard);
+}
+
+async function fsCreateFolder(dir) {
+  if (!dir) { showToast("Open a folder first.", "error"); return; }
+  const name = (prompt("New folder name:") || "").trim();
+  if (!name) return;
+  try {
+    await api("/api/fs/folder", { method: "POST", body: JSON.stringify({ path: joinPath(dir, name) }) });
+    showToast("Folder created.", "success");
+    await fsRefresh();
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function fsCreateFile(dir) {
+  if (!dir) { showToast("Open a folder first.", "error"); return; }
+  const name = (prompt("New file name:") || "").trim();
+  if (!name) return;
+  try {
+    await api("/api/file", { method: "PUT", body: JSON.stringify({ path: joinPath(dir, name), content: "", chat_id: currentChat }) });
+    showToast("File created.", "success");
+    await fsRefresh();
+    await openFile(joinPath(dir, name));
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function fsRename(path) {
+  const next = (prompt("Rename to:", baseName(path)) || "").trim();
+  if (!next || next === baseName(path)) return;
+  try {
+    await api("/api/fs/rename", { method: "POST", body: JSON.stringify({ path, new_path: joinPath(parentDir(path), next) }) });
+    showToast("Renamed.", "success");
+    await fsRefresh();
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function fsDelete(path, isDir) {
+  if (!confirm(`Permanently delete ${isDir ? "folder" : "file"} "${baseName(path)}"? A snapshot is saved first for rollback.`)) return;
+  try {
+    await api("/api/fs/delete", { method: "POST", body: JSON.stringify({ path }) });
+    showToast("Deleted (snapshot saved).", "success");
+    if (currentFile === path) { currentFile = null; syncPinnedContext(); }
+    await fsRefresh();
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+async function fsDuplicate(path) {
+  try {
+    await api("/api/fs/copy", { method: "POST", body: JSON.stringify({ src: path, dest: duplicateName(path) }) });
+    showToast("Duplicated.", "success");
+    await fsRefresh();
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+function fsSetClipboard(mode, path) {
+  clipboard = { mode, path };
+  syncPasteButton();
+  showToast(`${mode === "cut" ? "Cut" : "Copied"}: ${baseName(path)}`, "info");
+}
+
+async function fsPasteInto(dir) {
+  if (!clipboard || !dir) return;
+  const dest = pasteTarget(dir, clipboard.path);
+  try {
+    if (clipboard.mode === "cut") {
+      await api("/api/fs/rename", { method: "POST", body: JSON.stringify({ path: clipboard.path, new_path: dest }) });
+      clipboard = null;
+      syncPasteButton();
+    } else {
+      await api("/api/fs/copy", { method: "POST", body: JSON.stringify({ src: clipboard.path, dest }) });
+    }
+    showToast("Pasted.", "success");
+    await fsRefresh();
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+function openEntryMenu(anchorEl, path, isDir) {
+  openContextMenu(anchorEl, [
+    { label: isDir ? "Open" : "Open file", handler: () => (isDir ? openPath(path) : openFile(path)) },
+    { label: "Rename", handler: () => fsRename(path) },
+    { label: "Copy", handler: () => fsSetClipboard("copy", path) },
+    { label: "Cut", handler: () => fsSetClipboard("cut", path) },
+    isDir && clipboard ? { label: `Paste into “${baseName(path)}”`, handler: () => fsPasteInto(path) } : null,
+    { label: "Duplicate", handler: () => fsDuplicate(path) },
+    { label: "Delete", danger: true, handler: () => fsDelete(path, isDir) },
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -760,8 +958,10 @@ async function generatePlan() {
     return;
   }
   setBusy(["generatePlanBtn"], true);
+  switchEditor("runEditor");
   $("planStatus").textContent = "Creating staged research run…";
   hide("planResultArea");
+  hide("planActions");
   show("runProgress");
   $("runEventList").innerHTML = "";
 
@@ -805,11 +1005,12 @@ async function implementPlan() {
       body: JSON.stringify({ plan }),
     });
     hide("planResultArea");
+    hide("planActions");
     renderCurrentRun(data);
     subscribeRun(currentRun);
     await loadRuns();
     setStatus("Implementation running");
-    switchEditor("chatEditor");
+    switchEditor("runEditor");
   } catch (err) {
     showToast(err.message, "error");
     if (err.message.includes("research restarted")) subscribeRun(currentRun);
@@ -861,7 +1062,9 @@ async function redoPlan() {
   try {
     const run = await api(`/api/runs/${currentRun}/redo`, { method: "POST", body: "{}" });
     planEditing = false;
+    switchEditor("runEditor");
     hide("planResultArea");
+    hide("planActions");
     renderCurrentRun(run);
     subscribeRun(currentRun);
     await loadRuns();
@@ -886,17 +1089,20 @@ function renderCurrentRun(run) {
   if (currentRun && currentRun !== run.id) planEditing = false;
   currentRun = run.id;
   currentRunData = run;
+  hide("runEmptyHint");
   const queue = run.queue_position ? ` · queue #${run.queue_position}` : "";
   const chosen = (run.selected_agents || []).map((agent) => agent.name).join(" → ");
   $("currentRunBadge").textContent = `${run.id.slice(0, 8)} · ${runStatusLabel(run)}${queue}${chosen ? ` · ${chosen}` : ""}`;
   show("currentRunBadge");
   show("runProgress");
+  show("runActions");
   $("planStatus").textContent = run.error ? `${runStatusLabel(run)} — ${run.error}` : runStatusLabel(run);
   const awaitingApproval = run.status === "awaiting_approval";
   if (!awaitingApproval) planEditing = false;
   const visiblePlan = awaitingApproval
     ? (run.draft_plan || run.approved_plan)
     : (run.approved_plan || run.draft_plan);
+  $("planActions").classList.toggle("hidden", !(visiblePlan && awaitingApproval));
   if (visiblePlan) {
     $("planProof").innerHTML = renderMarkdown(visiblePlan);
     if (!planEditing) $("planEditorContent").value = visiblePlan;
@@ -939,42 +1145,6 @@ function renderRunEvents(events) {
   list.scrollTop = list.scrollHeight;
   runFileActivity = fileActivity(events, currentRunData?.target_path || "", currentRunData?.status || "");
   renderExplorerActivity();
-  renderRunActivity(events);
-}
-
-function renderRunActivity(events) {
-  let card = $("runActivityCard");
-  const visible = (events || []).filter((event) =>
-    event.event_type === "agent.activity" ||
-    ["implementation.started", "verification.completed", "apply.completed", "run.completed", "run.failed", "rollback.completed"].includes(event.event_type)
-  ).slice(-100);
-  if (!visible.length) {
-    card?.remove();
-    return;
-  }
-  if (!card) {
-    card = document.createElement("article");
-    card.id = "runActivityCard";
-    card.className = "msg run-activity";
-    card.innerHTML = '<div class="role"></div><div class="run-activity-body"></div>';
-    const cursor = $("streamCursor");
-    $("messages").insertBefore(card, cursor?.parentElement === $("messages") ? cursor : null);
-  }
-  card.querySelector(".role").textContent = `plan run · ${runStatusLabel(currentRunData || {})}`;
-  const body = card.querySelector(".run-activity-body");
-  body.innerHTML = "";
-  visible.forEach((event) => {
-    const data = runEventData(event);
-    const row = document.createElement("div");
-    row.className = "run-activity-row";
-    const dot = document.createElement("span");
-    dot.className = `run-activity-dot ${data.state || (event.event_type === "run.failed" ? "failed" : "done")}`;
-    const text = document.createElement("span");
-    text.textContent = `${formatLocalTime(event.created_at)}  ${event.message}`;
-    row.append(dot, text);
-    body.appendChild(row);
-  });
-  $("messages").scrollTop = $("messages").scrollHeight;
 }
 
 function renderRunArtifacts(artifacts) {
@@ -1034,6 +1204,7 @@ async function loadRuns(append = false) {
     btn.innerHTML = `<strong>${escapeHtml(run.task.slice(0, 55))}</strong><small>${escapeHtml(runStatusLabel(run))} · ${escapeHtml(run.brain_provider)}</small>`;
     btn.onclick = async () => {
       await loadRun(run.id);
+      switchEditor("runEditor");
       closeDrawers();
       drawerReturnFocus = btn;
       document.querySelector(".panel-area").classList.add("open");
@@ -1366,6 +1537,9 @@ document.addEventListener("DOMContentLoaded", () => {
   $("openPathBtn").onclick = () => openPath($("filePath").value);
   $("pinFileBtn").onclick = toggleCurrentFilePin;
   $("saveFileBtn").onclick = saveFile;
+  $("newFileBtn").onclick = () => fsCreateFile(currentExplorerDir());
+  $("newFolderBtn").onclick = () => fsCreateFolder(currentExplorerDir());
+  $("pasteHereBtn").onclick = () => fsPasteInto(currentExplorerDir());
 
   // Search
   $("searchBtn").onclick  = () => searchFiles(false);
@@ -1415,19 +1589,31 @@ document.addEventListener("DOMContentLoaded", () => {
     $("planPath").value = currentRunData.target_path || "";
     if (currentRunData.brain_provider) $("planProvider").value = currentRunData.brain_provider;
     hide("planResultArea");
+    hide("planActions");
     hide("runProgress");
+    hide("runActions");
+    hide("currentRunBadge");
+    show("runEmptyHint");
     planEditing = false;
     currentRun = null;
+    currentRunData = null;
     $("planTask").focus();
   };
 
   $("newRunBtn").onclick = () => {
     currentRun = null;
+    currentRunData = null;
     planEditing = false;
     $("planTask").value = "";
     $("planEditorContent").value = "";
+    $("planStatus").textContent = "";
     hide("planResultArea");
+    hide("planActions");
     hide("runProgress");
+    hide("runActions");
+    hide("currentRunBadge");
+    show("runEmptyHint");
+    switchEditor("runEditor");
     document.querySelector(".panel-area").classList.add("open");
     syncDrawerState();
     $("planTask").focus();
@@ -1470,8 +1656,13 @@ document.addEventListener("DOMContentLoaded", () => {
   $("closePlanBtn").onclick = closeDrawers;
 
   // Keyboard shortcuts
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest("#contextMenu") && !e.target.closest(".kebab")) closeContextMenu();
+  });
+
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
+      closeContextMenu();
       closeDrawers();
     }
     if (e.key === "Tab" && window.matchMedia("(max-width: 767px)").matches) {
@@ -1487,7 +1678,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  window.addEventListener("resize", syncDrawerState);
+  window.addEventListener("resize", () => { syncDrawerState(); closeContextMenu(); });
 
   $("prompt").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {

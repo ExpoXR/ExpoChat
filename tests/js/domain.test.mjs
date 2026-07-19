@@ -6,6 +6,17 @@ import { artifactPresentation, explorerActivityState, fileActivity, runStatusLab
 import { BRAIN_MODELS, modelLabel, modelOptions, providerOptions } from "../../public/js/settings.mjs";
 import { readPreferences, writePreferences } from "../../public/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "../../public/js/workspace.mjs";
+import { baseName, duplicateName, joinPath, parentDir, pasteTarget } from "../../public/js/fsops.mjs";
+
+test("fs path helpers resolve names, parents, paste targets, and duplicates", () => {
+  assert.equal(baseName("/work/dir/file.txt"), "file.txt");
+  assert.equal(baseName("/work/dir/"), "dir");
+  assert.equal(parentDir("/work/dir/file.txt"), "/work/dir");
+  assert.equal(joinPath("/work/dir/", "x.py"), "/work/dir/x.py");
+  assert.equal(pasteTarget("/dest", "/work/a/b.txt"), "/dest/b.txt");
+  assert.equal(duplicateName("/work/a/b.txt"), "/work/a/b copy.txt");
+  assert.equal(duplicateName("/work/a/folder"), "/work/a/folder copy");
+});
 
 test("chat payload and phase status remain backward compatible", () => {
   const payload = buildChatPayload("inspect", "model", "/work", ["/work/app.py"]);

@@ -47,6 +47,10 @@ def _run_usage(db: sqlite3.Connection) -> None:
     _add_columns(db, "runs", {"usage_json": "text not null default '{}'"})
 
 
+def _chat_pinned(db: sqlite3.Connection) -> None:
+    _add_columns(db, "chats", {"pinned": "integer not null default 0"})
+
+
 def _unique_active_jobs(db: sqlite3.Connection) -> None:
     db.execute(
         "update jobs set status='cancelled',error='Duplicate active job removed during migration' "
@@ -65,6 +69,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (2, _durable_jobs),
     (3, _run_usage),
     (4, _unique_active_jobs),
+    (5, _chat_pinned),
 ]
 
 
