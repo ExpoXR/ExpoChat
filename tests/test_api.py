@@ -24,6 +24,14 @@ def test_health_and_csrf_protection():
                     json={"provider": "codex", "model": "gpt-test", "enabled": False},
                 )
                 assert response.status_code == 200
+                linked = await client.put(
+                    "/api/brains",
+                    headers={"X-CSRF-Token": csrf},
+                    json={"provider": "codex", "model": "gpt-5.6-terra", "api_key": "test-api-key", "enabled": True},
+                )
+                assert linked.json()["linked"] is True
+                brain_rows = (await client.get("/api/brains")).json()["brains"]
+                assert next(row for row in brain_rows if row["provider"] == "codex")["model"] == "gpt-5.6-terra"
                 for title in ("First", "Second"):
                     created = await client.post(
                         "/api/chats",

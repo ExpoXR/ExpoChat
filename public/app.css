@@ -757,10 +757,17 @@ pre {
   flex: 1;
 }
 
-#claudeIndicator,
-#openaiIndicator {
+.brain-indicator {
   font-size: 11px;
   opacity: 0.85;
+}
+
+.brain-indicator.linked {
+  color: #89e68f;
+}
+
+.brain-indicator:not(.linked) {
+  color: var(--danger);
 }
 
 .workspace-tag {
@@ -1177,6 +1184,12 @@ pre {
   background: #2a1515;
   color: #f48771;
   font-size: 12px;
+}
+
+.field-hint.linked {
+  border-left-color: #76c47c;
+  background: #15351e;
+  color: #89e68f;
 }
 
 .check-label {

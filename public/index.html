@@ -134,14 +134,14 @@
 
           <section id="settingsPane" class="side-pane hidden">
             <div class="section-title">BRAINS</div>
-            <label>Codex model</label>
-            <input id="codexModel" value="gpt-5.6-sol">
+            <label>ChatGPT model</label>
+            <select id="codexModel"></select>
             <label>OpenAI API key</label>
             <input id="codexKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
             <div class="btn-row"><button id="saveCodexBtn">Link / Rotate</button><button id="testCodexBtn">Test</button><button id="disconnectCodexBtn">Disconnect</button></div>
             <p id="codexState" class="field-hint"></p>
             <label>Claude model</label>
-            <input id="claudeModel" value="claude-sonnet-5">
+            <select id="claudeModel"></select>
             <label>Anthropic API key</label>
             <input id="claudeKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
             <div class="btn-row"><button id="saveClaudeBtn">Link / Rotate</button><button id="testClaudeBtn">Test</button><button id="disconnectClaudeBtn">Disconnect</button></div>
@@ -280,8 +280,8 @@
         <button id="workspaceBtn">Plan Panel</button>
         <span id="status">Connecting</span>
         <span class="status-spacer"></span>
-        <span id="claudeIndicator" class="hidden">Claude ✓</span>
-        <span id="openaiIndicator" class="hidden">OpenAI ✓</span>
+        <span id="claudeIndicator" class="brain-indicator hidden"></span>
+        <span id="openaiIndicator" class="brain-indicator hidden"></span>
         <span>Ollama</span>
       </footer>
     </main>

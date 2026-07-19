@@ -2,7 +2,7 @@ import { createApi } from "/js/api.mjs";
 import { buildChatPayload, chatEventStatus } from "/js/chat.mjs";
 import { escapeHtml, formatBytes, renderMarkdown } from "/js/render.mjs";
 import { artifactPresentation, runStatusLabel } from "/js/runs.mjs";
-import { providerOptions } from "/js/settings.mjs";
+import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
 import { consumeSse } from "/js/sse.mjs";
 import { readPreferences, writePreferences } from "/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "/js/workspace.mjs";
@@ -898,12 +898,32 @@ async function loadBrains() {
   brains = data.brains || [];
   brains.forEach((brain) => {
     const prefix = brain.provider === "codex" ? "codex" : "claude";
+    populateModelSelect(brain.provider, brain.model);
     $(`${prefix}Model`).value = brain.model;
-    $(`${prefix}State`).textContent = brain.enabled
+    const linked = Boolean(brain.enabled && brain.linked && !brain.last_error);
+    $(`${prefix}State`).textContent = linked
       ? `Linked via ${brain.source}${brain.validated_at ? " · validated" : ""}${brain.last_error ? " · " + brain.last_error : ""}`
-      : "Not linked";
+      : brain.last_error || "Not linked";
+    $(`${prefix}State`).classList.toggle("linked", linked);
+    const indicator = brain.provider === "codex" ? $("openaiIndicator") : $("claudeIndicator");
+    indicator.textContent = `${modelLabel(brain.provider, brain.model)} ${linked ? "✓" : "!"}`;
+    indicator.classList.toggle("linked", linked);
+    indicator.classList.toggle("hidden", !brain.enabled && !brain.linked);
   });
   syncProviderOptions();
+}
+
+function populateModelSelect(provider, current = "") {
+  const select = $(provider === "codex" ? "codexModel" : "claudeModel");
+  const selected = current || select.value;
+  select.innerHTML = "";
+  modelOptions(provider, selected).forEach((model) => {
+    const option = document.createElement("option");
+    option.value = model.value;
+    option.textContent = model.label;
+    select.appendChild(option);
+  });
+  if (selected) select.value = selected;
 }
 
 function syncProviderOptions() {
@@ -1130,6 +1150,8 @@ async function boot() {
 // ---------------------------------------------------------------------------
 
 document.addEventListener("DOMContentLoaded", () => {
+  populateModelSelect("codex", "gpt-5.6-sol");
+  populateModelSelect("claude", "claude-sonnet-5");
   // Auth
   $("loginForm").onsubmit = login;
   $("logoutBtn").onclick  = async () => {

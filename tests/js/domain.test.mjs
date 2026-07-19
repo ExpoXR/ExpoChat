@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { buildChatPayload, chatEventStatus } from "../../public/js/chat.mjs";
 import { artifactPresentation, runStatusLabel } from "../../public/js/runs.mjs";
-import { providerOptions } from "../../public/js/settings.mjs";
+import { BRAIN_MODELS, modelLabel, modelOptions, providerOptions } from "../../public/js/settings.mjs";
 import { readPreferences, writePreferences } from "../../public/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "../../public/js/workspace.mjs";
 
@@ -37,7 +37,14 @@ test("settings and preferences are pure and bounded", () => {
   };
   writePreferences(storage, { model: "m", context: ["a"] });
   assert.deepEqual(readPreferences(storage).context, ["a"]);
-  assert.deepEqual(providerOptions([{ provider: "codex", enabled: true }, { provider: "claude", enabled: false }]), [
-    { value: "codex", label: "Codex (OpenAI)" },
+  assert.ok(BRAIN_MODELS.codex.length > 2);
+  assert.ok(BRAIN_MODELS.claude.length > 2);
+  assert.equal(modelLabel("codex", "gpt-5.6-terra"), "GPT-5.6 Terra");
+  assert.equal(modelOptions("claude", "custom-model")[0].value, "custom-model");
+  assert.deepEqual(providerOptions([
+    { provider: "codex", model: "gpt-5.6-sol", enabled: true, linked: true },
+    { provider: "claude", model: "claude-sonnet-5", enabled: false, linked: false },
+  ]), [
+    { value: "codex", label: "ChatGPT · GPT-5.6 Sol" },
   ]);
 });

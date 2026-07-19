@@ -337,13 +337,22 @@ def me(request: Request):
     return {"user": session["user"], "csrf": session["csrf"]} if session else {"user": None, "csrf": None}
 
 
+def _public_brain(row: dict[str, Any]) -> dict[str, Any]:
+    environment_key = settings.openai_key if row.get("provider") == "codex" else settings.claude_key
+    has_key = bool(row.get("key_ciphertext")) if row.get("source") == "stored" else bool(environment_key)
+    return {
+        key: row.get(key)
+        for key in ("provider", "model", "source", "enabled", "validated_at", "last_error", "updated_at")
+    } | {"linked": bool(row.get("enabled") and has_key)}
+
+
 @config_router.get("/api/config")
 def config(_: dict = Depends(require_user)):
-    brains = {row["provider"]: row for row in db.all_rows("select provider,model,source,enabled,validated_at,last_error from brain_configs")}
+    brains = {row["provider"]: _public_brain(row) for row in db.all_rows("select * from brain_configs")}
     return {
-        "claude_enabled": bool(brains.get("claude", {}).get("enabled")),
+        "claude_enabled": bool(brains.get("claude", {}).get("linked")),
         "claude_model": brains.get("claude", {}).get("model", settings.claude_model),
-        "openai_enabled": bool(brains.get("codex", {}).get("enabled")),
+        "openai_enabled": bool(brains.get("codex", {}).get("linked")),
         "openai_model": brains.get("codex", {}).get("model", settings.openai_model),
         "ollama_url": settings.ollama_url,
         "allowed_roots": [str(root) for root in settings.allowed_roots],
@@ -353,7 +362,7 @@ def config(_: dict = Depends(require_user)):
 
 @config_router.get("/api/brains")
 def brains(_: dict = Depends(require_user)):
-    return {"brains": db.all_rows("select provider,model,source,enabled,validated_at,last_error,updated_at from brain_configs order by provider")}
+    return {"brains": [_public_brain(row) for row in db.all_rows("select * from brain_configs order by provider")]}
 
 
 @config_router.put("/api/brains")
@@ -372,7 +381,7 @@ def save_brain(body: BrainBody, _: dict = Depends(require_user)):
         "on conflict(provider) do update set model=excluded.model,key_ciphertext=excluded.key_ciphertext,source=excluded.source,enabled=excluded.enabled,validated_at=null,last_error=null,updated_at=excluded.updated_at",
         (body.provider, body.model, ciphertext, source, int(body.enabled), db.utcnow()),
     )
-    return db.one("select provider,model,source,enabled,validated_at,last_error,updated_at from brain_configs where provider=?", (body.provider,))
+    return _public_brain(db.one("select * from brain_configs where provider=?", (body.provider,)) or {})
 
 
 @config_router.post("/api/brains/{provider}/validate")
