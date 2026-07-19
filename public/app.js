@@ -1,6 +1,6 @@
 import { createApi } from "/js/api.mjs";
 import { buildChatPayload, chatEventStatus } from "/js/chat.mjs";
-import { escapeHtml, formatBytes, renderMarkdown } from "/js/render.mjs";
+import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMarkdown } from "/js/render.mjs";
 import { artifactPresentation, runStatusLabel } from "/js/runs.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
 import { consumeSse } from "/js/sse.mjs";
@@ -608,7 +608,7 @@ async function loadSnaps(append = false) {
     row.className = "item snap-item";
     const label = document.createElement("span");
     label.className = "snap-label";
-    label.textContent = `${snap.created_at.slice(0, 19)}  [${snap.kind}]  ${snap.path.split("/").pop()}`;
+    label.textContent = `${formatLocalDateTime(snap.created_at)}  [${snap.kind}]  ${snap.path.split("/").pop()}`;
     if (snap.archive_deleted_at) label.textContent += " · archive expired";
     label.title = `${snap.path} → ${snap.ref}`;
     const del = document.createElement("button");
@@ -618,7 +618,7 @@ async function loadSnaps(append = false) {
     del.disabled = Boolean(snap.archive_deleted_at);
     del.onclick = async (e) => {
       e.stopPropagation();
-      if (!confirm(`Delete snapshot from ${snap.created_at.slice(0, 10)}?`)) return;
+      if (!confirm(`Delete snapshot from ${formatLocalDateTime(snap.created_at).slice(0, 10)}?`)) return;
       try {
         await api(`/api/snapshots/${snap.id}`, { method: "DELETE" });
         await loadSnaps();
@@ -660,7 +660,7 @@ async function loadTimeline(append = false) {
   (data.timeline || []).forEach((event) => {
     const item = document.createElement("button");
     item.className = "item";
-    item.textContent = `${event.created_at.slice(0, 19)}  [${event.event_type}]  ${event.summary.slice(0, 60)}`;
+    item.textContent = `${formatLocalDateTime(event.created_at)}  [${event.event_type}]  ${event.summary.slice(0, 60)}`;
     item.onclick = () => {
       renderDiff(event.diff || event.summary);
       switchEditor("diffEditor");
@@ -791,7 +791,7 @@ function renderRunEvents(events) {
   (events || []).forEach((event) => {
     const row = document.createElement("div");
     row.className = "run-event";
-    row.innerHTML = `<span>${escapeHtml(event.created_at.slice(11, 19))}</span><strong>${escapeHtml(event.event_type)}</strong><p>${escapeHtml(event.message)}</p>`;
+    row.innerHTML = `<span>${escapeHtml(formatLocalTime(event.created_at))}</span><strong>${escapeHtml(event.event_type)}</strong><p>${escapeHtml(event.message)}</p>`;
     list.appendChild(row);
   });
   list.scrollTop = list.scrollHeight;

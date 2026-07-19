@@ -12,3 +12,16 @@ test("byte formatter uses binary units", async () => {
   const { formatBytes } = await import("../../public/js/render.mjs");
   assert.equal(formatBytes(1024), "1.00 KiB");
 });
+
+test("timestamps render in the browser's local timezone", async () => {
+  const previousTimezone = process.env.TZ;
+  process.env.TZ = "Europe/Berlin";
+  try {
+    const { formatLocalDateTime, formatLocalTime } = await import("../../public/js/render.mjs");
+    assert.equal(formatLocalTime("2026-07-19T16:09:00+00:00"), "18:09:00");
+    assert.equal(formatLocalDateTime("2026-07-19T16:09:00+00:00"), "2026-07-19 18:09:00");
+  } finally {
+    if (previousTimezone === undefined) delete process.env.TZ;
+    else process.env.TZ = previousTimezone;
+  }
+});

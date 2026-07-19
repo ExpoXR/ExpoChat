@@ -17,6 +17,30 @@ export function formatBytes(value) {
   return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[unit]}`;
 }
 
+function localDate(value) {
+  const source = String(value || "").trim();
+  const normalized = /(?:Z|[+-]\d{2}:\d{2})$/i.test(source) ? source : `${source}Z`;
+  const date = new Date(normalized);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function padTime(value) {
+  return String(value).padStart(2, "0");
+}
+
+export function formatLocalTime(value) {
+  const date = localDate(value);
+  if (!date) return String(value || "");
+  return `${padTime(date.getHours())}:${padTime(date.getMinutes())}:${padTime(date.getSeconds())}`;
+}
+
+export function formatLocalDateTime(value) {
+  const date = localDate(value);
+  if (!date) return String(value || "");
+  const day = `${date.getFullYear()}-${padTime(date.getMonth() + 1)}-${padTime(date.getDate())}`;
+  return `${day} ${formatLocalTime(value)}`;
+}
+
 export function renderMarkdown(value) {
   let text = String(value);
   const codeBlocks = [];
