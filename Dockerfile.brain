@@ -1,0 +1,20 @@
+FROM python:3.12-slim
+
+ARG PUID=3000
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid ${PUID} --gid 0 --create-home --home-dir /home/ollma ollma
+
+WORKDIR /app
+COPY requirements-brain.txt /app/requirements-brain.txt
+RUN pip install --no-cache-dir -r /app/requirements-brain.txt
+COPY backend /app/backend
+
+USER ${PUID}:0
+EXPOSE 8091
+CMD ["uvicorn", "backend.brain_service:app", "--host", "0.0.0.0", "--port", "8091", "--no-access-log"]

@@ -1,7 +1,7 @@
 import { createApi } from "/js/api.mjs";
 import { buildChatPayload, chatEventStatus } from "/js/chat.mjs";
 import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMarkdown } from "/js/render.mjs";
-import { artifactPresentation, runStatusLabel, tokenCounts } from "/js/runs.mjs";
+import { artifactPresentation, explorerActivityState, fileActivity, runEventData, runStatusLabel, tokenCounts } from "/js/runs.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
 import { consumeSse } from "/js/sse.mjs";
 import { readPreferences, writePreferences } from "/js/state.mjs";
@@ -36,6 +36,8 @@ let runNext = null;
 let snapshotNext = null;
 let timelineNext = null;
 let planEditing = false;
+let snapshotRetentionDays = 30;
+let runFileActivity = new Map();
 
 // ---------------------------------------------------------------------------
 // Core API helper
@@ -243,6 +245,18 @@ async function loadChat(id) {
   currentChat = id;
   $("messages").innerHTML = '<span id="streamCursor" class="stream-cursor hidden">▋</span>';
   const data = await api(`/api/chats/${id}/messages`);
+  const chat = data.chat || chats.find((item) => item.id === id);
+  if (chat) {
+    const previousTarget = $("targetPath").value.trim();
+    $("targetPath").value = chat.target_path || "";
+    $("planPath").value = chat.target_path || "";
+    setWorkspaceTag(chat.target_path || "");
+    if (previousTarget !== (chat.target_path || "")) resetPinnedContext();
+    if (chat.model && [...$("modelSelect").options].some((option) => option.value === chat.model)) {
+      $("modelSelect").value = chat.model;
+      $("ollamaStatus").textContent = chat.model;
+    }
+  }
   (data.messages || []).forEach((m) => addMessage(m.role, m.content));
   renderChats();
   savePrefs();
@@ -254,6 +268,10 @@ async function loadChat(id) {
 async function createChat(withSnapshot) {
   const model = $("modelSelect").value;
   const target = $("targetPath").value.trim();
+  if (!model) {
+    showToast("Select an available Ollama model.", "error");
+    return;
+  }
   if (!target) {
     show("targetHint");
     showToast("Set a Target Folder so Ollama can see your files.", "error");
@@ -291,6 +309,10 @@ async function sendPrompt(event) {
   event.preventDefault();
   const content = $("prompt").value.trim();
   if (!content) return;
+  if (!$("modelSelect").value) {
+    showToast("Select an available Ollama model.", "error");
+    return;
+  }
   if (!$("targetPath").value.trim()) {
     show("targetHint");
     showToast("Set a Target Folder so Ollama can see your files.", "error");
@@ -377,13 +399,19 @@ async function sendPrompt(event) {
 
 async function openPath(path) {
   const data = await api(`/api/files?path=${encodeURIComponent(path || "/")}`);
+  if (data.is_dir === false) {
+    await openFile(data.path);
+    return;
+  }
   $("filePath").value = data.path === "/" ? "" : data.path;
   $("fileList").innerHTML = "";
 
   // Sync the chat target folder and plan path to wherever the Explorer is pointing
   if (data.path && data.path !== "/") {
+    const previousTarget = $("targetPath").value.trim();
     $("targetPath").value = data.path;
     $("planPath").value = data.path;
+    if (previousTarget && previousTarget !== data.path) resetPinnedContext();
     setWorkspaceTag(data.path);
     hide("targetHint");
     savePrefs();
@@ -410,8 +438,24 @@ async function openPath(path) {
     const btn = document.createElement("button");
     btn.className = "item";
     btn.innerHTML = `<span class="file-icon">${item.is_dir ? "📁" : "📄"}</span>${escapeHtml(item.name)}`;
+    btn.dataset.path = item.path;
+    btn.dataset.directory = String(Boolean(item.is_dir));
     btn.onclick = () => (item.is_dir ? openPath(item.path) : openFile(item.path));
     $("fileList").appendChild(btn);
+  });
+  renderExplorerActivity();
+}
+
+function renderExplorerActivity() {
+  document.querySelectorAll("#fileList .item[data-path]").forEach((item) => {
+    item.querySelector(".file-status-dot")?.remove();
+    const state = explorerActivityState(runFileActivity, item.dataset.path, item.dataset.directory === "true");
+    if (!state) return;
+    const dot = document.createElement("span");
+    dot.className = `file-status-dot ${state}`;
+    dot.title = state === "working" ? "Agent editing now" : "Changed by current run";
+    dot.setAttribute("aria-label", dot.title);
+    item.appendChild(dot);
   });
 }
 
@@ -419,7 +463,6 @@ async function openFile(path) {
   const data = await api(`/api/file?path=${encodeURIComponent(path)}`);
   currentFile = data.path;
   pinContextPath(currentFile);
-  $("filePath").value = data.path;
   $("fileTitle").textContent = data.path;
   document.querySelector('.editor-tab[data-editor="fileEditor"]').textContent =
     data.path.split("/").pop() || "file";
@@ -582,6 +625,9 @@ async function runTermCommand() {
 async function loadSnaps(append = false) {
   const cursor = append ? snapshotNext : 0;
   const [data, storage] = await Promise.all([api(`/api/snapshots?cursor=${cursor || 0}&limit=50`), api("/api/maintenance/storage")]);
+  snapshotRetentionDays = Number(storage.limits?.snapshot_retention_days) || 30;
+  $("cleanSnapsBtn").textContent = `Expire Old (>${snapshotRetentionDays}d)`;
+  $("cleanSnapsBtn").title = `Expire snapshot archives older than ${snapshotRetentionDays} days`;
   $("storageSummary").textContent = `Snapshots ${formatBytes(storage.tracked.bytes)} · Orphans ${formatBytes(storage.orphan_bytes)} · Free ${formatBytes(storage.filesystem.free_bytes)}`;
   $("orphanList").innerHTML = "";
   (storage.orphans || []).forEach((orphan) => {
@@ -616,10 +662,10 @@ async function loadSnaps(append = false) {
     del.className = "snap-del-btn";
     del.textContent = "✕";
     del.title = "Delete this snapshot";
-    del.disabled = Boolean(snap.archive_deleted_at);
+    del.disabled = Boolean(snap.archive_deleted_at || snap.protected);
     del.onclick = async (e) => {
       e.stopPropagation();
-      if (!confirm(`Delete snapshot from ${formatLocalDateTime(snap.created_at).slice(0, 10)}?`)) return;
+      if (!confirm(`Permanently delete snapshot from ${formatLocalDateTime(snap.created_at).slice(0, 10)}? Rollback will become unavailable.`)) return;
       try {
         await api(`/api/snapshots/${snap.id}`, { method: "DELETE" });
         await loadSnaps();
@@ -627,7 +673,23 @@ async function loadSnaps(append = false) {
         showToast("Delete failed: " + err.message, "error");
       }
     };
+    const restore = document.createElement("button");
+    restore.textContent = "Restore";
+    restore.disabled = Boolean(snap.archive_deleted_at || snap.protected);
+    restore.title = snap.protected ? "Protected by active run" : "Restore this snapshot";
+    restore.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Restore ${snap.path} from this snapshot? Current files will be replaced.`)) return;
+      try {
+        await api(`/api/snapshots/${snap.id}/restore`, { method: "POST", body: "{}" });
+        showToast("Snapshot restored.", "success");
+        await Promise.all([loadSnaps(), loadTimeline(false)]);
+      } catch (err) {
+        showToast("Restore failed: " + err.message, "error");
+      }
+    };
     row.appendChild(label);
+    row.appendChild(restore);
     row.appendChild(del);
     $("snapList").appendChild(row);
   });
@@ -638,14 +700,14 @@ async function loadSnaps(append = false) {
 async function cleanOldSnaps() {
   setBusy(["cleanSnapsBtn"], true);
   try {
-    const preview = await api("/api/snapshots/cleanup", { method: "POST", body: JSON.stringify({ days: 30, dry_run: true }) });
+    const preview = await api("/api/snapshots/cleanup", { method: "POST", body: JSON.stringify({ days: snapshotRetentionDays, dry_run: true }) });
     if (!preview.tracked) {
       showToast("No tracked snapshot archives eligible for expiry.", "info");
       return;
     }
     if (!confirm(`Permanently expire ${preview.tracked} tracked snapshot archive(s)?`)) return;
-    const data = await api("/api/snapshots/cleanup", { method: "POST", body: JSON.stringify({ days: 30, dry_run: false }) });
-    showToast(`Expired ${data.deleted} snapshot archive(s) older than 30 days.`, data.deleted > 0 ? "success" : "info");
+    const data = await api("/api/snapshots/cleanup", { method: "POST", body: JSON.stringify({ days: snapshotRetentionDays, dry_run: false }) });
+    showToast(`Expired ${data.deleted} snapshot archive(s) older than ${snapshotRetentionDays} days.`, data.deleted > 0 ? "success" : "info");
     await loadSnaps();
   } catch (err) {
     showToast("Cleanup failed: " + err.message, "error");
@@ -687,6 +749,10 @@ async function generatePlan() {
 
   if (!task) {
     showToast("Please enter a task description.", "error");
+    return;
+  }
+  if (!path) {
+    showToast("Select a target workspace folder.", "error");
     return;
   }
   if (!provider) {
@@ -743,6 +809,7 @@ async function implementPlan() {
     subscribeRun(currentRun);
     await loadRuns();
     setStatus("Implementation running");
+    switchEditor("chatEditor");
   } catch (err) {
     showToast(err.message, "error");
     if (err.message.includes("research restarted")) subscribeRun(currentRun);
@@ -853,7 +920,7 @@ function renderCurrentRun(run) {
   $("brainTokenCount").title = `${formatTokens(usage.brain.input)} input · ${formatTokens(usage.brain.output)} output`;
   $("ollamaTokenCount").textContent = formatTokens(usage.ollama.total);
   $("ollamaTokenCount").title = `${formatTokens(usage.ollama.input)} input · ${formatTokens(usage.ollama.output)} output`;
-  $("cancelRunBtn").classList.toggle("hidden", ["completed", "failed", "cancelled", "rolled_back"].includes(run.status));
+  $("cancelRunBtn").classList.toggle("hidden", ["applying", "post_check", "completed", "failed", "cancelled", "rolled_back"].includes(run.status));
   $("resumeRunBtn").classList.toggle("hidden", run.status !== "failed");
   $("rollbackRunBtn").classList.toggle("hidden", !run.snapshot_id || !["completed", "failed"].includes(run.status));
   $("cloneRunBtn").classList.toggle("hidden", !["completed", "failed", "cancelled", "rolled_back"].includes(run.status));
@@ -870,6 +937,44 @@ function renderRunEvents(events) {
     list.appendChild(row);
   });
   list.scrollTop = list.scrollHeight;
+  runFileActivity = fileActivity(events, currentRunData?.target_path || "", currentRunData?.status || "");
+  renderExplorerActivity();
+  renderRunActivity(events);
+}
+
+function renderRunActivity(events) {
+  let card = $("runActivityCard");
+  const visible = (events || []).filter((event) =>
+    event.event_type === "agent.activity" ||
+    ["implementation.started", "verification.completed", "apply.completed", "run.completed", "run.failed", "rollback.completed"].includes(event.event_type)
+  ).slice(-100);
+  if (!visible.length) {
+    card?.remove();
+    return;
+  }
+  if (!card) {
+    card = document.createElement("article");
+    card.id = "runActivityCard";
+    card.className = "msg run-activity";
+    card.innerHTML = '<div class="role"></div><div class="run-activity-body"></div>';
+    const cursor = $("streamCursor");
+    $("messages").insertBefore(card, cursor?.parentElement === $("messages") ? cursor : null);
+  }
+  card.querySelector(".role").textContent = `plan run · ${runStatusLabel(currentRunData || {})}`;
+  const body = card.querySelector(".run-activity-body");
+  body.innerHTML = "";
+  visible.forEach((event) => {
+    const data = runEventData(event);
+    const row = document.createElement("div");
+    row.className = "run-activity-row";
+    const dot = document.createElement("span");
+    dot.className = `run-activity-dot ${data.state || (event.event_type === "run.failed" ? "failed" : "done")}`;
+    const text = document.createElement("span");
+    text.textContent = `${formatLocalTime(event.created_at)}  ${event.message}`;
+    row.append(dot, text);
+    body.appendChild(row);
+  });
+  $("messages").scrollTop = $("messages").scrollHeight;
 }
 
 function renderRunArtifacts(artifacts) {
@@ -944,7 +1049,7 @@ function subscribeRun(id) {
   if (runEventSource) runEventSource.close();
   runEventSource = new EventSource(`/api/runs/${id}/events`);
   runEventSource.onmessage = () => loadRun(id).catch(() => {});
-  ["run.created", "research.started", "research.completed", "plan.ready", "plan.edited", "plan.redo", "plan.approved", "scope.approved", "scope.approval_required", "implementation.started", "verification.completed", "apply.completed", "rollback.completed", "run.completed", "run.failed", "run.cancelled", "plan.stale"].forEach((name) => {
+  ["run.created", "research.started", "research.completed", "plan.ready", "plan.edited", "plan.redo", "plan.approved", "scope.approved", "scope.approval_required", "implementation.started", "agent.activity", "verification.completed", "apply.completed", "rollback.completed", "run.completed", "run.failed", "run.cancelled", "plan.stale"].forEach((name) => {
     runEventSource.addEventListener(name, () => {
       loadRun(id).then((run) => {
         loadRuns().catch(() => {});
@@ -1095,8 +1200,10 @@ async function loadAgents() {
     const toggle = document.createElement("button");
     toggle.textContent = agent.enabled ? "Enabled" : "Disabled";
     toggle.onclick = async () => {
-      await api(`/api/agents/${agent.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !agent.enabled }) });
-      await loadAgents();
+      try {
+        await api(`/api/agents/${agent.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !agent.enabled }) });
+        await loadAgents();
+      } catch (err) { showToast(err.message, "error"); }
     };
     row.append(roles, priority, prompt, save, toggle);
     $("agentList").appendChild(row);
@@ -1203,15 +1310,20 @@ async function boot() {
     setWorkspaceTag(prefs.target);
   }
 
-  await loadModels();
+  try {
+    await loadModels();
+  } catch (err) {
+    $("ollamaStatus").textContent = "offline";
+    showToast("Ollama models unavailable: " + err.message, "error");
+  }
   await loadChats();
-  await Promise.all([loadRuns(), loadBrains(), loadAgents()]);
+  await Promise.allSettled([loadRuns(), loadBrains(), loadAgents()]);
 
   if (prefs.chat && chats.find((c) => c.id === prefs.chat)) {
     await loadChat(prefs.chat);
   }
 
-  await openPath(prefs.target || "");
+  try { await openPath(prefs.target || ""); } catch (err) { showToast(err.message, "error"); }
 
   if (prefs.file) {
     try { await openFile(prefs.file); } catch (_) {}

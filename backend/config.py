@@ -30,6 +30,7 @@ class Settings:
     credential_key: str = field(default_factory=lambda: os.getenv("CREDENTIAL_ENCRYPTION_KEY", ""))
     ollama_url: str = field(default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://192.168.0.78:11434").rstrip("/"))
     worker_url: str = field(default_factory=lambda: os.getenv("WORKER_URL", "http://ollma-worker:8090").rstrip("/"))
+    brain_url: str = field(default_factory=lambda: os.getenv("BRAIN_URL", "http://ollma-brain:8091").rstrip("/"))
     worker_token: str = field(default_factory=lambda: os.getenv("WORKER_TOKEN", "change-worker-token"))
     command_timeout: int = field(default_factory=lambda: _int("COMMAND_TIMEOUT", 120, 1))
     allowed_origins: set[str] = field(

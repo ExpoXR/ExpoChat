@@ -55,7 +55,7 @@ from .workspace import (
     restore_snapshot,
     storage_report,
 )
-from .workspace_tools import TOOL_DEFS, execute_tool, run_check, search_text
+from .workspace_tools import TOOL_DEFS, execute_tool, search_text
 
 configure_logging()
 log = logging.getLogger("ollma.web")
@@ -70,25 +70,25 @@ class LoginBody(BaseModel):
 
 class BrainBody(BaseModel):
     provider: str = Field(pattern="^(codex|claude)$")
-    model: str
-    api_key: str = ""
+    model: str = Field(min_length=1, max_length=200)
+    api_key: str = Field(default="", max_length=20_000)
     enabled: bool = True
 
 
 class AgentBody(BaseModel):
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=200)
     roles: list[str] | None = None
-    system_prompt: str | None = None
+    system_prompt: str | None = Field(default=None, max_length=40_000)
     priority: int | None = Field(default=None, ge=0, le=1000)
     role_scores: dict[str, int] | None = None
     enabled: bool | None = None
 
 
 class AgentCreateBody(BaseModel):
-    name: str
-    model: str
+    name: str = Field(min_length=1, max_length=200)
+    model: str = Field(min_length=1, max_length=200)
     roles: list[str] = Field(default_factory=lambda: ["research", "verification"])
-    system_prompt: str = ""
+    system_prompt: str = Field(default="", max_length=40_000)
     capabilities: list[str] = Field(default_factory=list)
     context_size: int = Field(default=0, ge=0)
     priority: int = Field(default=50, ge=0, le=1000)
@@ -108,21 +108,21 @@ class ApprovalBody(BaseModel):
 
 
 class ChatBody(BaseModel):
-    title: str = "New chat"
-    model: str = ""
-    target_path: str = ""
+    title: str = Field(default="New chat", min_length=1, max_length=200)
+    model: str = Field(default="", max_length=200)
+    target_path: str = Field(default="", max_length=4096)
     snapshot: bool = False
 
 
 class MessageBody(BaseModel):
-    content: str
-    model: str
-    target_path: str = ""
+    content: str = Field(min_length=1, max_length=200_000)
+    model: str = Field(min_length=1, max_length=200)
+    target_path: str = Field(default="", max_length=4096)
     context_paths: list[str] = Field(default_factory=list, max_length=20)
 
 
 class FileBody(BaseModel):
-    path: str
+    path: str = Field(min_length=1, max_length=4096)
     content: str
     chat_id: str | None = None
 
@@ -149,11 +149,13 @@ def parse_json_fields(row: dict[str, Any], fields: list[str]) -> dict[str, Any]:
 
 
 def add_timeline(event_type: str, summary: str, path: str | None = None, chat_id: str | None = None, before: str | None = None, after: str | None = None, diff: str | None = None) -> None:
+    before = before[:200_000] if before else None
+    after = after[:200_000] if after else None
     diff = diff[:200_000] if diff else None
     with db.transaction() as conn:
         conn.execute(
             "insert into timeline(chat_id,event_type,path,summary,before,after,diff,created_at) values(?,?,?,?,?,?,?,?)",
-            (chat_id, event_type, path, summary[:1000], None, None, diff, db.utcnow()),
+            (chat_id, event_type, path, summary[:1000], before, after, diff, db.utcnow()),
         )
         conn.execute(
             "delete from timeline where id not in (select id from timeline order by id desc limit ?)",
@@ -167,6 +169,22 @@ def list_item(path: Path) -> dict[str, Any]:
         "name": path.name, "path": str(path), "is_dir": path.is_dir(), "size": stat.st_size,
         "modified_at": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
     }
+
+
+def _paths_overlap(left: str | Path, right: str | Path) -> bool:
+    left_path = Path(left).resolve(strict=False)
+    right_path = Path(right).resolve(strict=False)
+    return left_path == right_path or left_path in right_path.parents or right_path in left_path.parents
+
+
+def _snapshot_conflicts_with_active_run(snapshot: dict[str, Any], active_runs: list[dict[str, Any]] | None = None) -> bool:
+    active_runs = active_runs if active_runs is not None else db.all_rows(
+        "select snapshot_id,target_path from runs where status not in ('completed','failed','cancelled','rolled_back')"
+    )
+    for run in active_runs:
+        if run.get("snapshot_id") == snapshot.get("id") or _paths_overlap(snapshot["path"], run["target_path"]):
+            return True
+    return False
 
 
 def workspace_summary(path: Path, max_files: int = 100) -> str:
@@ -310,11 +328,18 @@ def readyz() -> JSONResponse:
             for path in (settings.data_dir, settings.snapshot_dir, settings.jobs_dir)
         )
         with httpx.Client(timeout=3) as client:
-            checks["worker"] = bool(client.get(settings.worker_url + "/healthz").json().get("ok"))
-            checks["ollama"] = bool(client.get(settings.ollama_url + "/api/version").json().get("version"))
+            worker_response = client.get(settings.worker_url + "/healthz")
+            worker_response.raise_for_status()
+            checks["worker"] = bool(worker_response.json().get("ok"))
+            brain_response = client.get(settings.brain_url + "/healthz")
+            brain_response.raise_for_status()
+            checks["brain"] = bool(brain_response.json().get("ok"))
+            ollama_response = client.get(settings.ollama_url + "/api/version")
+            ollama_response.raise_for_status()
+            checks["ollama"] = bool(ollama_response.json().get("version"))
     except Exception as exc:
         checks["error"] = str(exc)
-    ready = all(checks.get(name) is True for name in ("database", "storage", "worker", "ollama"))
+    ready = all(checks.get(name) is True for name in ("database", "storage", "worker", "brain", "ollama"))
     return JSONResponse({"ok": ready, "checks": checks}, 200 if ready else 503)
 
 
@@ -379,10 +404,16 @@ def save_brain(body: BrainBody, _: dict = Depends(require_user)):
     if not body.enabled:
         ciphertext = None
         source = "environment"
+    environment_key = settings.openai_key if body.provider == "codex" else settings.claude_key
+    if body.enabled and not (ciphertext if source == "stored" else environment_key):
+        raise HTTPException(400, "API key required before linking provider")
+    model = body.model.strip()
+    if not model:
+        raise HTTPException(400, "Model is required")
     db.execute(
         "insert into brain_configs(provider,model,key_ciphertext,source,enabled,updated_at) values(?,?,?,?,?,?) "
         "on conflict(provider) do update set model=excluded.model,key_ciphertext=excluded.key_ciphertext,source=excluded.source,enabled=excluded.enabled,validated_at=null,last_error=null,updated_at=excluded.updated_at",
-        (body.provider, body.model, ciphertext, source, int(body.enabled), db.utcnow()),
+        (body.provider, model, ciphertext, source, int(body.enabled), db.utcnow()),
     )
     return _public_brain(db.one("select * from brain_configs where provider=?", (body.provider,)) or {})
 
@@ -413,6 +444,10 @@ def agent_create(body: AgentCreateBody, _: dict = Depends(require_user)):
         raise HTTPException(400, "Invalid agent role")
     if "implementation" in body.roles and "tools" not in body.capabilities:
         raise HTTPException(400, "Implementation agents require tools capability")
+    if not set(body.role_scores).issubset(valid_roles) or any(not 0 <= score <= 1000 for score in body.role_scores.values()):
+        raise HTTPException(400, "Invalid agent role score")
+    if not body.name.strip() or not body.model.strip():
+        raise HTTPException(400, "Agent name and model are required")
     agent_id = "agent-" + secrets.token_hex(8)
     now = db.utcnow()
     try:
@@ -444,8 +479,15 @@ def agent_update(agent_id: str, body: AgentBody, _: dict = Depends(require_user)
         raise HTTPException(400, "Invalid agent role")
     if "implementation" in roles and "tools" not in json.loads(row["capabilities_json"] or "[]"):
         raise HTTPException(400, "Implementation agents require tools capability")
+    if body.role_scores is not None and (
+        not set(body.role_scores).issubset({"research", "implementation", "verification"})
+        or any(not 0 <= score <= 1000 for score in body.role_scores.values())
+    ):
+        raise HTTPException(400, "Invalid agent role score")
+    if body.name is not None and not body.name.strip():
+        raise HTTPException(400, "Agent name is required")
     values = {
-        "name": body.name if body.name is not None else row["name"],
+        "name": body.name.strip() if body.name is not None else row["name"],
         "roles_json": json.dumps(roles),
         "system_prompt": body.system_prompt if body.system_prompt is not None else row["system_prompt"],
         "priority": body.priority if body.priority is not None else row["priority"],
@@ -607,28 +649,49 @@ def run_console(run_id: str, payload: ConsoleBody, _: dict = Depends(require_use
     args = payload.args
     if not command:
         raise HTTPException(400, "command required")
-    stage = settings.jobs_dir / run_id / "workspace"
-    if not stage.is_dir():
-        raise HTTPException(404, "Staged workspace not found")
     started = time.monotonic()
-    output = run_check(stage, command, args, payload.timeout or settings.command_timeout)
-    return {"ok": not output.startswith("Rejected"), "content": output, "duration_ms": int((time.monotonic() - started) * 1000)}
+    try:
+        with httpx.Client(timeout=(payload.timeout or settings.command_timeout) + 10) as client:
+            response = client.post(
+                settings.worker_url + "/check",
+                headers={"X-Worker-Token": settings.worker_token},
+                json={
+                    "run_id": run_id,
+                    "workspace": "workspace",
+                    "command": command,
+                    "args": args,
+                    "timeout": payload.timeout or settings.command_timeout,
+                },
+            )
+            response.raise_for_status()
+            result = response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"Worker console failed: {exc}") from exc
+    result["duration_ms"] = int((time.monotonic() - started) * 1000)
+    return result
 
 
 @config_router.get("/api/models")
 def models(_: dict = Depends(require_user)):
     try:
         with httpx.Client(timeout=10) as client:
-            return client.get(settings.ollama_url + "/api/tags").json()
+            response = client.get(settings.ollama_url + "/api/tags")
+            response.raise_for_status()
+            return response.json()
     except Exception as exc:
         raise HTTPException(502, f"Ollama error: {exc}") from exc
 
 
 @config_router.get("/api/status")
 def status_api(_: dict = Depends(require_user)):
-    with httpx.Client(timeout=5) as client:
-        version = client.get(settings.ollama_url + "/api/version").json()
-    return {"ollama": version, "allowed_roots": [str(root) for root in settings.allowed_roots]}
+    try:
+        with httpx.Client(timeout=5) as client:
+            response = client.get(settings.ollama_url + "/api/version")
+            response.raise_for_status()
+            version = response.json()
+        return {"ollama": version, "allowed_roots": [str(root) for root in settings.allowed_roots]}
+    except Exception as exc:
+        raise HTTPException(502, f"Ollama error: {exc}") from exc
 
 
 @workspace_router.get("/api/chats")
@@ -640,7 +703,10 @@ def chats(cursor: int = Query(default=0, ge=0), limit: int = Query(default=50, g
 
 @workspace_router.post("/api/chats")
 def chat_create(body: ChatBody, _: dict = Depends(require_user)):
-    target = str(allowed_path(body.target_path)) if body.target_path else ""
+    target_path = allowed_path(body.target_path) if body.target_path else None
+    if target_path and not target_path.is_dir():
+        raise HTTPException(400, "Chat target must be a directory")
+    target = str(target_path) if target_path else ""
     chat_id = secrets.token_hex(12)
     now = db.utcnow()
     db.execute("insert into chats(id,title,model,target_path,created_at,updated_at) values(?,?,?,?,?,?)", (chat_id, body.title, body.model, target, now, now))
@@ -651,7 +717,10 @@ def chat_create(body: ChatBody, _: dict = Depends(require_user)):
 
 @workspace_router.get("/api/chats/{chat_id}/messages")
 def chat_messages(chat_id: str, _: dict = Depends(require_user)):
-    return {"messages": db.all_rows("select * from messages where chat_id=? order by id", (chat_id,))}
+    chat = db.one("select * from chats where id=?", (chat_id,))
+    if not chat:
+        raise HTTPException(404, "Chat not found")
+    return {"chat": chat, "messages": db.all_rows("select * from messages where chat_id=? order by id", (chat_id,))}
 
 
 @workspace_router.post("/api/chats/{chat_id}/message")
@@ -660,6 +729,8 @@ def chat_message(chat_id: str, body: MessageBody, _: dict = Depends(require_user
     if not chat:
         raise HTTPException(404, "Chat not found")
     target = allowed_path(body.target_path or chat["target_path"]) if (body.target_path or chat["target_path"]) else None
+    if target and not target.is_dir():
+        raise HTTPException(400, "Chat target must be a directory")
     db.execute("insert into messages(chat_id,role,content,created_at) values(?,?,?,?)", (chat_id, "user", body.content, db.utcnow()))
     history = db.all_rows("select role,content from messages where chat_id=? order by id", (chat_id,))
     system = (
@@ -739,7 +810,7 @@ def chat_message(chat_id: str, body: MessageBody, _: dict = Depends(require_user
 def files(path: str = Query(default="/"), _: dict = Depends(require_user)):
     if path == "/" or not path:
         items = [list_item(root) for root in settings.allowed_roots if root.exists()]
-        return {"path": "/", "roots": [str(root) for root in settings.allowed_roots], "items": items}
+        return {"path": "/", "is_dir": True, "roots": [str(root) for root in settings.allowed_roots], "items": items}
     target = allowed_path(path)
     items = []
     if target.is_dir():
@@ -748,7 +819,7 @@ def files(path: str = Query(default="/"), _: dict = Depends(require_user)):
                 continue
             with contextlib.suppress(OSError):
                 items.append(list_item(child))
-    return {"path": str(target), "roots": [str(root) for root in settings.allowed_roots], "items": items}
+    return {"path": str(target), "is_dir": target.is_dir(), "roots": [str(root) for root in settings.allowed_roots], "items": items}
 
 
 @workspace_router.get("/api/file")
@@ -763,6 +834,8 @@ def file_get(path: str, _: dict = Depends(require_user)):
 
 @workspace_router.put("/api/file")
 def file_put(body: FileBody, _: dict = Depends(require_user)):
+    if len(body.content.encode()) > 5_000_000:
+        raise HTTPException(413, "File exceeds editor limit")
     target = allowed_path(body.path, must_exist=False)
     before = target.read_text(errors="replace") if target.exists() else ""
     snapshot = create_snapshot(target if target.exists() else target.parent, body.chat_id)
@@ -785,7 +858,13 @@ def search(root: str, q: str, cursor: int = Query(default=0, ge=0), limit: int =
 def snapshots(cursor: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100), _: dict = Depends(require_user)):
     rows = db.all_rows("select * from snapshots order by created_at desc limit ? offset ?", (limit + 1, cursor))
     has_more = len(rows) > limit
-    return {"snapshots": rows[:limit], "next_cursor": cursor + limit if has_more else None}
+    visible = rows[:limit]
+    active_runs = db.all_rows(
+        "select snapshot_id,target_path from runs where status not in ('completed','failed','cancelled','rolled_back')"
+    )
+    for row in visible:
+        row["protected"] = _snapshot_conflicts_with_active_run(row, active_runs)
+    return {"snapshots": visible, "next_cursor": cursor + limit if has_more else None}
 
 
 @workspace_router.post("/api/snapshots")
@@ -797,7 +876,14 @@ def snapshot_create(payload: dict[str, Any] = Body(...), _: dict = Depends(requi
 
 @workspace_router.post("/api/snapshots/{snapshot_id}/restore")
 def snapshot_restore(snapshot_id: str, _: dict = Depends(require_user)):
-    return {"snapshot": restore_snapshot(snapshot_id), "ok": True}
+    row = db.one("select * from snapshots where id=?", (snapshot_id,))
+    if not row:
+        raise HTTPException(404, "Snapshot not found")
+    if _snapshot_conflicts_with_active_run(row):
+        raise HTTPException(409, "Snapshot is protected by an active run")
+    restored = restore_snapshot(snapshot_id)
+    add_timeline("snapshot_restore", "Snapshot restored", restored["path"], diff=restored["ref"])
+    return {"snapshot": restored, "ok": True}
 
 
 @workspace_router.delete("/api/snapshots/{snapshot_id}")
@@ -805,6 +891,12 @@ def snapshot_delete(snapshot_id: str, _: dict = Depends(require_user)):
     row = db.one("select * from snapshots where id=?", (snapshot_id,))
     if not row:
         raise HTTPException(404, "Snapshot not found")
+    active = db.one(
+        "select id from runs where snapshot_id=? and status not in ('completed','failed','cancelled','rolled_back') limit 1",
+        (snapshot_id,),
+    )
+    if active:
+        raise HTTPException(409, "Snapshot is protected by an active run")
     (settings.snapshot_dir / Path(row["ref"]).name).unlink(missing_ok=True)
     db.execute(
         "update snapshots set status='deleted',archive_deleted_at=? where id=?",

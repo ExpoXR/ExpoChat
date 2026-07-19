@@ -6,6 +6,9 @@ test("markdown escapes raw HTML and preserves escaped code", async () => {
   const rendered = renderMarkdown("<img src=x onerror=alert(1)>\n\n```js\n<a>\n```");
   assert.ok(!rendered.includes("<img"));
   assert.ok(rendered.includes("&lt;a&gt;"));
+  const collision = renderMarkdown("\x00OLLMA_CODE_0\x00\n\n```txt\nsafe\n```");
+  assert.ok(collision.includes("OLLMA_CODE_0"));
+  assert.ok(collision.includes("<code>safe</code>"));
 });
 
 test("byte formatter uses binary units", async () => {

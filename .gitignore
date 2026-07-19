@@ -21,3 +21,4 @@ backups/
 *.sqlite3-wal
 *.part
 test_edit.txt
+.claude/

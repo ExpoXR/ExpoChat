@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { buildChatPayload, chatEventStatus } from "../../public/js/chat.mjs";
-import { artifactPresentation, runStatusLabel, tokenCounts } from "../../public/js/runs.mjs";
+import { artifactPresentation, explorerActivityState, fileActivity, runStatusLabel, tokenCounts } from "../../public/js/runs.mjs";
 import { BRAIN_MODELS, modelLabel, modelOptions, providerOptions } from "../../public/js/settings.mjs";
 import { readPreferences, writePreferences } from "../../public/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "../../public/js/workspace.mjs";
@@ -43,6 +43,20 @@ test("token counters split Brain and Ollama usage", () => {
   });
   assert.equal(tokenCounts({ prompt_eval_count: 7, eval_count: 3 }).ollama.total, 10);
   assert.equal(tokenCounts('{"brain":{"total_tokens":12}}').brain.total, 12);
+});
+
+test("run activity tracks working and changed files for Explorer", () => {
+  const events = [
+    { event_type: "agent.activity", data_json: JSON.stringify({ phase: "implementation", state: "working", tool: "replace_text", path: "src/app.js" }) },
+    { event_type: "agent.activity", data_json: JSON.stringify({ phase: "implementation", state: "changed", tool: "replace_text", path: "src/app.js" }) },
+    { event_type: "agent.activity", data_json: JSON.stringify({ phase: "implementation", state: "working", tool: "write_file", path: "tests/app.test.js" }) },
+  ];
+  const activity = fileActivity(events, "/project", "implementing");
+  assert.equal(activity.get("/project/src/app.js"), "changed");
+  assert.equal(activity.get("/project/tests/app.test.js"), "working");
+  assert.equal(explorerActivityState(activity, "/project/src", true), "changed");
+  assert.equal(explorerActivityState(activity, "/project/tests", true), "working");
+  assert.equal(fileActivity(events, "/project", "failed").has("/project/tests/app.test.js"), false);
 });
 
 test("settings and preferences are pure and bounded", () => {

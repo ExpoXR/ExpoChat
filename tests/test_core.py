@@ -26,7 +26,7 @@ from backend.workspace import (  # noqa: E402
     restore_snapshot,
     stage_workspace,
 )
-from backend.workspace_tools import run_check, search_text  # noqa: E402
+from backend.workspace_tools import TOOL_DEFS, execute_tool, run_check, search_text  # noqa: E402
 
 
 def setup_module():
@@ -93,14 +93,14 @@ def test_codex_runner_applies_api_key_before_starting_thread(monkeypatch):
         def login_api_key(self, api_key):
             calls.append(("login", api_key))
 
-        def thread_start(self, *, model, sandbox):
-            calls.append(("start", model, sandbox))
+        def thread_start(self, *, model, sandbox, cwd, ephemeral, config):
+            calls.append(("start", model, sandbox, cwd, ephemeral, config))
             return FakeThread()
 
     fake_module = SimpleNamespace(Codex=FakeCodex, Sandbox=SimpleNamespace(read_only="read-only"))
     monkeypatch.setitem(sys.modules, "openai_codex", fake_module)
 
-    result = brain_runner.run_codex({"api_key": "secret", "model": "gpt-test", "prompt": "ping"})
+    result = brain_runner.run_codex({"api_key": "secret", "model": "gpt-test", "prompt": "ping", "allow_web": True})
 
     assert result == {
         "content": "OK",
@@ -114,7 +114,7 @@ def test_codex_runner_applies_api_key_before_starting_thread(monkeypatch):
     }
     assert calls == [
         ("login", "secret"),
-        ("start", "gpt-test", "read-only"),
+        ("start", "gpt-test", "read-only", os.environ.get("HOME"), True, {"web_search": "live"}),
         ("run", "ping"),
     ]
 
@@ -123,11 +123,27 @@ def test_caveman_prompt_applies_to_brain_and_ollama(monkeypatch):
     captured = {}
     monkeypatch.setattr(orchestrator, "provider_config", lambda _: ("key", "model"))
 
-    def fake_run(*_args, **kwargs):
-        captured.update(json.loads(kwargs["input"]))
-        return SimpleNamespace(returncode=0, stdout='{"ok":true,"content":"OK","usage":{}}\n', stderr="")
+    class FakeResponse:
+        status_code = 200
 
-    monkeypatch.setattr(orchestrator.subprocess, "run", fake_run)
+        def json(self):
+            return {"content": "OK", "usage": {}}
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def post(self, _url, **kwargs):
+            captured.update(kwargs["json"])
+            return FakeResponse()
+
+    monkeypatch.setattr(orchestrator.httpx, "Client", FakeClient)
     assert orchestrator.call_brain("codex", "Do work") == "OK"
     assert CAVEMAN_OUTPUT_INSTRUCTIONS in captured["prompt"]
     assert CAVEMAN_OUTPUT_INSTRUCTIONS in worker.agent_system_prompt("research")
@@ -195,6 +211,31 @@ def test_snapshot_restore_preserves_excluded_directories():
     assert not (target / "new.txt").exists()
     assert (git_dir / "HEAD").read_text() == "new history"
     assert (dependency_dir / "package.js").read_text() == "installed dependency"
+
+
+def test_snapshot_restore_recovers_path_type_changes():
+    clear_workflow_tables()
+    file_target = WORKSPACES / "restore-file-type.txt"
+    file_target.write_text("file snapshot")
+    file_snapshot = create_snapshot(file_target)
+    file_target.unlink()
+    file_target.mkdir()
+    (file_target / "wrong.txt").write_text("wrong type")
+    restore_snapshot(file_snapshot["id"])
+    assert file_target.is_file()
+    assert file_target.read_text() == "file snapshot"
+
+    directory_target = WORKSPACES / "restore-directory-type"
+    directory_target.mkdir()
+    (directory_target / "value.txt").write_text("directory snapshot")
+    directory_snapshot = create_snapshot(directory_target)
+    for child in directory_target.iterdir():
+        child.unlink()
+    directory_target.rmdir()
+    directory_target.write_text("wrong type")
+    restore_snapshot(directory_snapshot["id"])
+    assert directory_target.is_dir()
+    assert (directory_target / "value.txt").read_text() == "directory snapshot"
 
 
 def test_snapshot_records_sizes_and_cleans_failure_artifacts(monkeypatch):
@@ -359,6 +400,29 @@ def test_run_events_and_artifacts_are_bounded(monkeypatch):
     assert [row["name"] for row in db.all_rows("select name from run_artifacts order by id")] == ["artifact 1", "artifact 2"]
 
 
+def test_worker_activity_records_safe_live_file_states():
+    clear_workflow_tables()
+    run_id = "f" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "Live activity", "codex", str(WORKSPACES), "implementing", now, now),
+    )
+    orchestrator.record_worker_activity(
+        run_id,
+        "implementation",
+        {"type": "tool.started", "turn": 2, "name": "replace_text", "args": {"path": "src/app.py", "old": "secret"}},
+    )
+    orchestrator.record_worker_activity(
+        run_id,
+        "implementation",
+        {"type": "tool.completed", "turn": 2, "name": "replace_text", "args": {"path": "src/app.py"}, "result": "Updated src/app.py"},
+    )
+    rows = db.all_rows("select event_type,message,data_json from run_events where run_id=? order by id", (run_id,))
+    assert [json.loads(row["data_json"])["state"] for row in rows] == ["working", "changed"]
+    assert all("secret" not in row["data_json"] for row in rows)
+
+
 def test_run_state_rejects_invalid_transition():
     validate_transition("researching", "awaiting_approval")
     with pytest.raises(RuntimeError, match="Invalid run transition"):
@@ -374,12 +438,34 @@ def test_shared_search_console_and_pinned_context():
     assert len(result["results"]) == 1
     assert result["next_cursor"] == 1
     assert run_check(target, "python", ["-c", "print('unsafe')"]) == "Rejected inline program"
+    assert run_check(target, "grep", ["needle", "../outside-context.txt"]) == "Rejected path traversal"
+    assert run_check(target, "grep", ["needle", "--include=/etc/passwd"]) == "Rejected path outside staged workspace"
     assert "PINNED FILE" in pinned_context(target, [str(source)])
     outside = WORKSPACES / "outside-context.txt"
     outside.write_text("outside")
     with pytest.raises(HTTPException) as exc:
         pinned_context(target, [str(outside)])
     assert exc.value.status_code == 400
+
+
+def test_all_worker_tools_are_registered_and_enforce_write_mode():
+    target = WORKSPACES / "worker-tools"
+    target.mkdir(exist_ok=True)
+    names = {tool["function"]["name"] for tool in TOOL_DEFS}
+    assert names == {"list_files", "read_file", "search_files", "write_file", "replace_text", "delete_file", "run_check"}
+    assert execute_tool(target, "write_file", {"path": "notes.txt", "content": "alpha\nbeta\n"}, False) == "Rejected: worker is read-only"
+    assert execute_tool(target, "write_file", {"path": "notes.txt", "content": "alpha\nbeta\n"}, True) == "Wrote notes.txt"
+    assert "notes.txt" in execute_tool(target, "list_files", {}, False)
+    assert "1: alpha" in execute_tool(target, "read_file", {"path": "notes.txt"}, False)
+    assert "notes.txt:2:beta" in execute_tool(target, "search_files", {"pattern": "beta"}, False)
+    assert execute_tool(
+        target,
+        "replace_text",
+        {"path": "notes.txt", "old": "beta", "new": "gamma"},
+        True,
+    ) == "Updated notes.txt (1 replacement(s))"
+    assert execute_tool(target, "delete_file", {"path": "notes.txt"}, True) == "Deleted notes.txt"
+    assert not (target / "notes.txt").exists()
 
 
 def test_approval_creates_history_snapshot_and_approval_atomically(monkeypatch):
@@ -426,4 +512,33 @@ def test_plan_can_be_edited_and_redone(monkeypatch):
     redone = orchestrator.redo_plan(run_id)
     assert redone["status"] == "researching"
     assert redone["draft_plan"] is None
+    assert db.one("select id from jobs where run_id=? and job_type='research' and status='pending'", (run_id,))
+
+
+def test_resume_researches_again_when_workspace_changed(monkeypatch):
+    clear_workflow_tables()
+    target = WORKSPACES / "resume-stale-target"
+    target.mkdir(exist_ok=True)
+    source = target / "main.py"
+    source.write_text("print('before')\n")
+    baseline = manifest_hash(target)
+    snapshot = create_snapshot(target)
+    run_id = "9" * 24
+    stage_workspace(run_id, target)
+    source.write_text("print('external change')\n")
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,baseline_hash,approved_plan,snapshot_id,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+        (run_id, "Resume stale run", "codex", str(target), "failed", baseline, "Old plan", snapshot["id"], now, now),
+    )
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+
+    orchestrator.resume_run(run_id)
+
+    resumed = db.one("select * from runs where id=?", (run_id,))
+    assert resumed["status"] == "researching"
+    assert resumed["approved_plan"] is None
+    assert resumed["snapshot_id"] is None
+    assert resumed["baseline_hash"] == manifest_hash(target)
+    assert (orchestrator.settings.jobs_dir / run_id / "workspace" / "main.py").read_text() == "print('external change')\n"
     assert db.one("select id from jobs where run_id=? and job_type='research' and status='pending'", (run_id,))

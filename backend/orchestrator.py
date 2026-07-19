@@ -1,10 +1,7 @@
 import contextlib
 import json
 import logging
-import os
 import secrets
-import subprocess
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -159,27 +156,26 @@ def call_brain_result(provider: str, prompt: str, allow_web: bool = False, timeo
         "prompt": with_caveman(prompt),
         "allow_web": allow_web,
     }
-    env = {
-        "PATH": os.getenv("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
-        "HOME": str(settings.data_dir / "provider-home" / provider),
-        "LANG": "C.UTF-8",
-    }
-    Path(env["HOME"]).mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        [sys.executable, "-m", "backend.brain_runner"],
-        input=json.dumps(payload), text=True, capture_output=True, timeout=timeout, env=env,
-    )
+    payload["timeout"] = timeout
     try:
-        data = json.loads(result.stdout.strip().splitlines()[-1])
-    except Exception as exc:
-        raise RuntimeError((result.stderr or result.stdout or "Brain returned invalid output")[-4000:]) from exc
-    if result.returncode != 0 or not data.get("ok"):
-        raise RuntimeError(data.get("error") or "Brain failed")
-    return {
-        "content": str(data.get("content", "")),
-        "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
-    }
+        with httpx.Client(timeout=timeout + 10) as client:
+            response = client.post(
+                settings.brain_url + "/execute",
+                headers={"X-Worker-Token": settings.worker_token},
+                json=payload,
+            )
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Brain service unavailable: {exc}") from exc
+    if response.status_code != 200:
+        try:
+            detail = response.json().get("detail")
+        except Exception:
+            detail = None
+        if detail:
+            raise RuntimeError(str(detail))
+        raise RuntimeError(f"Brain service failed with HTTP {response.status_code}")
+    data = response.json()
+    return {"content": str(data["content"]), "usage": data.get("usage") or {}}
 
 
 def call_brain(provider: str, prompt: str, allow_web: bool = False, timeout: int = 900) -> str:
@@ -191,13 +187,22 @@ def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = 
     for attempt in range(attempts):
         try:
             with httpx.Client(timeout=1200) as client:
-                response = client.post(
-                    settings.worker_url + "/execute",
+                with client.stream(
+                    "POST",
+                    settings.worker_url + "/execute/stream",
                     headers={"X-Worker-Token": settings.worker_token},
                     json={"run_id": run_id, "workspace": workspace, "model": model, "mode": mode, "task": task, "max_turns": max_turns},
-                )
-                response.raise_for_status()
-                return response.json()
+                ) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
+                        item = json.loads(line)
+                        if item.get("type") == "result":
+                            return item["result"]
+                        if item.get("type") == "error":
+                            raise RuntimeError(item.get("error") or "Worker failed")
+                        record_worker_activity(run_id, mode, item)
         except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.HTTPStatusError):
             if attempt + 1 >= attempts:
                 raise
@@ -205,16 +210,49 @@ def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = 
     raise RuntimeError("Worker unavailable")
 
 
+def record_worker_activity(run_id: str, mode: str, item: dict[str, Any]) -> None:
+    kind = str(item.get("type") or "")
+    if kind == "message":
+        content = " ".join(str(item.get("content") or "").split())[:1000]
+        if content:
+            db.add_event(run_id, "agent.activity", content, {"phase": mode, "state": "message"})
+        return
+    if kind not in {"tool.started", "tool.completed"}:
+        return
+    tool = str(item.get("name") or "tool")
+    args = item.get("args") if isinstance(item.get("args"), dict) else {}
+    path = str(args.get("path") or "")[:2000]
+    target = path or str(args.get("command") or "")[:200]
+    state = "working" if kind == "tool.started" else "done"
+    result = str(item.get("result") or "")
+    mutation = tool in {"write_file", "replace_text", "delete_file"}
+    failed = result.startswith(("Tool error:", "Rejected", "File not found", "Text not found", "Unknown tool"))
+    if kind == "tool.completed" and mutation and not failed:
+        state = "changed"
+    verb = "Working" if kind == "tool.started" else "Finished"
+    message = f"{verb}: {tool}{f' · {target}' if target else ''}"
+    db.add_event(
+        run_id,
+        "agent.activity",
+        message,
+        {"phase": mode, "state": state, "tool": tool, "path": path, "turn": item.get("turn")},
+    )
+
+
 def discover_agents() -> list[dict[str, Any]]:
     now = db.utcnow()
     with httpx.Client(timeout=30) as client:
-        tags = client.get(settings.ollama_url + "/api/tags").json().get("models", [])
+        tags_response = client.get(settings.ollama_url + "/api/tags")
+        tags_response.raise_for_status()
+        tags = tags_response.json().get("models", [])
         discovered: list[dict[str, Any]] = []
         for item in tags:
             model = item.get("name") or item.get("model")
             if not model:
                 continue
-            show = client.post(settings.ollama_url + "/api/show", json={"model": model}).json()
+            show_response = client.post(settings.ollama_url + "/api/show", json={"model": model})
+            show_response.raise_for_status()
+            show = show_response.json()
             capabilities = show.get("capabilities") or []
             context = max(
                 [int(v) for k, v in (show.get("model_info") or {}).items() if k.endswith(".context_length") and isinstance(v, (int, float))]
@@ -414,8 +452,8 @@ def approve_run(run_id: str, approved_plan: str) -> dict[str, Any]:
             db.add_event(run_id, "plan.stale", "Workspace changed; research restarted")
             enqueue_job(run_id, "research")
             raise RuntimeError("Workspace changed; research restarted")
-        implementation = db.one("select * from agent_profiles where id=? and enabled=1", (run.get("implementation_agent_id"),))
-        if not implementation or "implementation" not in json.loads(implementation["roles_json"] or "[]"):
+        implementation = db.one("select * from agent_profiles where id=?", (run.get("implementation_agent_id"),))
+        if not _agent_is_eligible(implementation, "implementation"):
             implementation = choose_agent("implementation")
         if run.get("snapshot_id") and db.one("select id from history_snippets where run_id=?", (run_id,)):
             now = db.utcnow()
@@ -445,7 +483,10 @@ def approve_run(run_id: str, approved_plan: str) -> dict[str, Any]:
                     (approved_plan, snapshot["id"], implementation["id"], now, now, run_id),
                 )
                 conn.execute(
-                    "insert into history_snippets(id,run_id,request,approved_plan,brain_provider,workers_json,target_path,snapshot_id,created_at) values(?,?,?,?,?,?,?,?,?)",
+                    "insert into history_snippets(id,run_id,request,approved_plan,brain_provider,workers_json,target_path,snapshot_id,created_at) "
+                    "values(?,?,?,?,?,?,?,?,?) on conflict(run_id) do update set approved_plan=excluded.approved_plan,"
+                    "workers_json=excluded.workers_json,target_path=excluded.target_path,snapshot_id=excluded.snapshot_id,"
+                    "created_at=excluded.created_at,completed_at=null,final_verdict=null",
                     ("history-" + secrets.token_hex(10), run_id, run["task"], approved_plan, run["brain_provider"], json.dumps(workers), run["target_path"], snapshot["id"], now),
                 )
                 conn.execute(
@@ -557,10 +598,13 @@ def implement_run(run_id: str) -> None:
                 reports.append(result.get("content", ""))
                 verifier_ids.append(verifier["id"])
                 save_artifact(run_id, "verification", verifier["name"], result)
+                verifier_passed = bool(result.get("ok")) and result.get("content", "").lstrip().upper().startswith("PASS")
                 db.execute(
                     "insert into verification_results(run_id,agent_id,cycle,report,passed,created_at) values(?,?,?,?,?,?)",
-                    (run_id, verifier["id"], repair, result.get("content", ""), int(bool(result.get("ok"))), db.utcnow()),
+                    (run_id, verifier["id"], repair, result.get("content", ""), int(verifier_passed), db.utcnow()),
                 )
+                if not result.get("ok"):
+                    raise RuntimeError(result.get("error") or f"Verifier {verifier['name']} failed")
             if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
                 return
             update_run(run_id, verification_agent_ids_json=json.dumps(verifier_ids))
@@ -593,8 +637,10 @@ def implement_run(run_id: str) -> None:
             update_run(run_id, status="verifying")
         if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
             return
-        update_run(run_id, status="applying")
         target = Path(run["target_path"])
+        if manifest_hash(target) != run["baseline_hash"]:
+            raise RuntimeError("Workspace changed during run; verified stage was not applied")
+        update_run(run_id, status="applying")
         stage = settings.jobs_dir / run_id / "workspace"
         changes = apply_stage(target, stage)
         save_artifact(run_id, "changes", "Applied file manifest", changes)
@@ -641,7 +687,7 @@ def cancel_run(run_id: str) -> None:
     if not run:
         raise RuntimeError("Run not found")
     if run["status"] in {"completed", "rolled_back", "applying", "post_check"}:
-        raise RuntimeError("Finished run cannot be cancelled")
+        raise RuntimeError("Run cannot be cancelled while applying or after completion")
     update_run(run_id, status="cancelled", completed_at=db.utcnow())
     now = db.utcnow()
     db.execute(
@@ -662,11 +708,29 @@ def resume_run(run_id: str) -> None:
     run = db.one("select * from runs where id=?", (run_id,))
     if not run or run["status"] != "failed":
         raise RuntimeError("Only failed runs can resume")
+    target = Path(run["target_path"])
+    current_hash = manifest_hash(target)
+    if current_hash != run.get("baseline_hash"):
+        stage_workspace(run_id, target)
+        update_run(
+            run_id,
+            status="researching",
+            baseline_hash=current_hash,
+            dossier=None,
+            draft_plan=None,
+            approved_plan=None,
+            snapshot_id=None,
+            error="Workspace changed; plan refresh required",
+        )
+        db.add_event(run_id, "plan.stale", "Workspace changed; research restarted")
+        enqueue_job(run_id, "research")
+        return
     if run["approved_plan"]:
         update_run(run_id, status="implementing", error=None)
         enqueue_job(run_id, "implementation")
     else:
-        update_run(run_id, status="researching", error=None)
+        stage_workspace(run_id, target)
+        update_run(run_id, status="researching", baseline_hash=current_hash, error=None)
         enqueue_job(run_id, "research")
 
 

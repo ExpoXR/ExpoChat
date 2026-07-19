@@ -11,7 +11,13 @@ def run_codex(payload: dict[str, Any]) -> dict[str, Any]:
 
     with Codex() as codex:
         codex.login_api_key(payload["api_key"])
-        thread = codex.thread_start(model=payload["model"], sandbox=Sandbox.read_only)
+        thread = codex.thread_start(
+            model=payload["model"],
+            sandbox=Sandbox.read_only,
+            cwd=os.environ.get("HOME"),
+            ephemeral=True,
+            config={"web_search": "live" if payload.get("allow_web") else "disabled"},
+        )
         result = thread.run(payload["prompt"])
         total = getattr(getattr(result, "usage", None), "total", None)
         usage = {
@@ -38,6 +44,9 @@ async def run_claude(payload: dict[str, Any]) -> dict[str, Any]:
             allowed_tools=allowed,
             disallowed_tools=blocked,
             max_turns=8,
+            cwd=os.environ.get("HOME"),
+            setting_sources=[],
+            skills=[],
         ),
     ):
         if isinstance(message, ResultMessage):

@@ -1,12 +1,16 @@
 import asyncio
+import contextlib
+import hmac
 import json
 import threading
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import settings
@@ -37,12 +41,20 @@ class WorkRequest(BaseModel):
     max_turns: int = Field(default=24, ge=1, le=40)
 
 
+class CheckRequest(BaseModel):
+    run_id: str = Field(pattern=r"^[a-f0-9-]{8,64}$")
+    workspace: str = "workspace"
+    command: str = Field(min_length=1, max_length=100)
+    args: list[str] = Field(default_factory=list, max_length=40)
+    timeout: int = Field(default=120, ge=1)
+
+
 def authorize(x_worker_token: str = Header(default="")) -> None:
-    if not settings.worker_token or x_worker_token != settings.worker_token:
+    if not settings.worker_token or not hmac.compare_digest(x_worker_token, settings.worker_token):
         raise HTTPException(401, "Invalid worker token")
 
 
-def workspace_for(request: WorkRequest) -> Path:
+def workspace_for(request: WorkRequest | CheckRequest) -> Path:
     path = (JOBS_ROOT / request.run_id / request.workspace).resolve()
     if JOBS_ROOT not in path.parents or not path.exists() or not path.is_dir():
         raise HTTPException(404, "Staged workspace not found")
@@ -53,7 +65,12 @@ def agent_system_prompt(mode: str) -> str:
     return MODE_PROMPTS[mode] + " Workspace root is current staged directory.\n\n" + CAVEMAN_OUTPUT_INSTRUCTIONS
 
 
-async def agent_loop(request: WorkRequest, root: Path, cancelled: asyncio.Event | None = None) -> dict[str, Any]:
+async def agent_loop(
+    request: WorkRequest,
+    root: Path,
+    cancelled: asyncio.Event | None = None,
+    emit: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+) -> dict[str, Any]:
     writable = request.mode == "implementation"
     tools = TOOL_DEFS if writable else [tool for tool in TOOL_DEFS if tool["function"]["name"] not in {"write_file", "replace_text", "delete_file"}]
     messages: list[dict[str, Any]] = [
@@ -95,8 +112,20 @@ async def agent_loop(request: WorkRequest, root: Path, cancelled: asyncio.Event 
             content = message.get("content", "")
             if content:
                 final = content
-                events.append({"type": "message", "turn": turn + 1, "content": content[:8000]})
+                item = {"type": "message", "turn": turn + 1, "content": content[:8000]}
+                events.append(item)
+                if emit:
+                    await emit(item)
             if not calls:
+                if not final.strip():
+                    return {
+                        "ok": False,
+                        "content": "",
+                        "events": events,
+                        "turns": turn + 1,
+                        "usage": usage,
+                        "error": "Agent returned an empty response",
+                    }
                 return {"ok": True, "content": final[:200_000], "events": events, "turns": turn + 1, "usage": usage}
             for call in calls:
                 fn = call.get("function", {})
@@ -107,11 +136,17 @@ async def agent_loop(request: WorkRequest, root: Path, cancelled: asyncio.Event 
                         args = json.loads(args)
                     except json.JSONDecodeError:
                         args = {}
+                started = {"type": "tool.started", "turn": turn + 1, "name": name, "args": args}
+                if emit:
+                    await emit(started)
                 try:
                     result = await asyncio.to_thread(execute_tool, root, name, args, writable)
                 except Exception as exc:
                     result = f"Tool error: {type(exc).__name__}: {exc}"
-                events.append({"type": "tool", "turn": turn + 1, "name": name, "args": args, "result": result[:8000]})
+                item = {"type": "tool", "turn": turn + 1, "name": name, "args": args, "result": result[:8000]}
+                events.append(item)
+                if emit:
+                    await emit({**item, "type": "tool.completed"})
                 messages.append({"role": "tool", "tool_name": name, "content": result})
     return {"ok": False, "content": final[:200_000], "events": events, "turns": request.max_turns, "usage": usage, "error": "Agent turn limit reached"}
 
@@ -140,6 +175,57 @@ async def execute(request: WorkRequest) -> dict[str, Any]:
         with _cancel_lock:
             _cancel_events.pop(request.run_id, None)
             _active_tasks.pop(request.run_id, None)
+
+
+@app.post("/execute/stream", dependencies=[Depends(authorize)])
+async def execute_stream(request: WorkRequest) -> StreamingResponse:
+    root = workspace_for(request)
+
+    async def generate() -> AsyncIterator[str]:
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        cancelled = asyncio.Event()
+
+        async def emit(item: dict[str, Any]) -> None:
+            await queue.put(item)
+
+        task = asyncio.create_task(agent_loop(request, root, cancelled, emit))
+        with _cancel_lock:
+            _cancel_events[request.run_id] = cancelled
+            _active_tasks[request.run_id] = task
+        try:
+            while not task.done() or not queue.empty():
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=0.25)
+                except TimeoutError:
+                    continue
+                yield json.dumps(item, ensure_ascii=False) + "\n"
+            result = await task
+            yield json.dumps({"type": "result", "result": result}, ensure_ascii=False) + "\n"
+        except asyncio.CancelledError:
+            cancelled.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            raise
+        except httpx.HTTPError as exc:
+            yield json.dumps({"type": "error", "error": f"Ollama request failed: {exc}"}) + "\n"
+        finally:
+            with _cancel_lock:
+                _cancel_events.pop(request.run_id, None)
+                _active_tasks.pop(request.run_id, None)
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+@app.post("/check", dependencies=[Depends(authorize)])
+def check(request: CheckRequest) -> dict[str, Any]:
+    output = execute_tool(
+        workspace_for(request),
+        "run_check",
+        {"command": request.command, "args": request.args, "timeout": request.timeout},
+        False,
+    )
+    return {"ok": output.startswith("exit=0\n"), "content": output}
 
 
 @app.post("/cancel/{run_id}", dependencies=[Depends(authorize)])

@@ -450,6 +450,51 @@ label {
   border-left-color: var(--danger);
 }
 
+.msg.run-activity {
+  border-left-color: #d7ba7d;
+}
+
+.run-activity-body {
+  display: grid;
+  gap: 4px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.run-activity-row {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 7px;
+  align-items: start;
+  color: #bdbdbd;
+  font-family: Consolas, ui-monospace, monospace;
+  font-size: 12px;
+  white-space: normal;
+}
+
+.run-activity-dot,
+.file-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #777;
+}
+
+.run-activity-dot.working,
+.file-status-dot.working {
+  background: #d7ba7d;
+  box-shadow: 0 0 5px #d7ba7d99;
+}
+
+.run-activity-dot.changed,
+.file-status-dot.changed {
+  background: #73c991;
+}
+
+.run-activity-dot.failed {
+  background: var(--danger);
+}
+
 .msg .role {
   margin-bottom: 5px;
   color: var(--muted);
@@ -1222,6 +1267,16 @@ pre {
   margin-right: 5px;
   font-size: 12px;
   line-height: 1;
+}
+
+#fileList .item[data-path] {
+  display: flex;
+  align-items: center;
+}
+
+.file-status-dot {
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .empty-hint {

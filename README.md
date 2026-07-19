@@ -6,7 +6,7 @@ TrueNAS-hosted supervisor for local Ollama workers plus Codex or Claude planning
 
 ```text
 Browser -> FastAPI web -> SQLite / snapshots / staged jobs
-                    |-> isolated provider subprocess (planning)
+                    |-> mount-free Brain service -> Codex / Claude (planning)
                     |-> worker API -> Ollama (research, edits, verification)
 ```
 
@@ -76,7 +76,7 @@ Keep concurrency at `1` until Ollama host has capacity for parallel model reques
 
 ```bash
 docker compose ps
-docker compose logs --tail=200 ollma-ui ollma-worker
+docker compose logs --tail=200 ollma-ui ollma-brain ollma-worker
 curl -fsS http://127.0.0.1:31001/livez
 curl -fsS http://127.0.0.1:31001/readyz
 ```

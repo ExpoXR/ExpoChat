@@ -44,10 +44,12 @@ export function formatLocalDateTime(value) {
 export function renderMarkdown(value) {
   let text = String(value);
   const codeBlocks = [];
+  let codeMarker = "\x00OLLMA_CODE_";
+  while (text.includes(codeMarker)) codeMarker += "_";
   text = text.replace(/```([\w.-]*)\r?\n?([\s\S]*?)```/g, (_, lang, code) => {
     const idx = codeBlocks.length;
     codeBlocks.push({ lang: lang.trim() || "text", code: escapeHtml(code.replace(/\r\n/g, "\n").trimEnd()) });
-    return `\x00CODE${idx}\x00`;
+    return `${codeMarker}${idx}\x00`;
   });
   text = escapeHtml(text);
   text = text.replace(/`([^`\n]+)`/g, "<code>$1</code>");
@@ -66,7 +68,7 @@ export function renderMarkdown(value) {
     if (/^<(h[1-6]|ul|ol|hr|pre|div)/.test(trimmed)) return trimmed;
     return `<p>${trimmed.replace(/\n/g, "<br>")}</p>`;
   }).join("\n");
-  return text.replace(/\x00CODE(\d+)\x00/g, (_, index) => {
+  return text.replace(new RegExp(`${codeMarker}(\\d+)\\x00`, "g"), (_, index) => {
     const { lang, code } = codeBlocks[Number(index)];
     return `<div class="code-block"><div class="code-lang">${lang}</div><pre><code>${code}</code></pre></div>`;
   });

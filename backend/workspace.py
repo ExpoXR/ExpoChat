@@ -188,6 +188,7 @@ def restore_snapshot(snapshot_id: str) -> dict[str, Any]:
     if not archive.exists():
         raise HTTPException(410, "Snapshot archive expired")
     target = allowed_path(snap["path"], must_exist=False)
+    target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ollma-restore-", dir=str(target.parent)) as temp:
         temp_path = Path(temp)
         with tarfile.open(archive, "r:gz") as tar:
@@ -199,10 +200,15 @@ def restore_snapshot(snapshot_id: str) -> dict[str, Any]:
         restored = temp_path / target.name
         if not restored.exists():
             raise RuntimeError("Snapshot root missing")
-        if target.is_file() or restored.is_file():
-            target.parent.mkdir(parents=True, exist_ok=True)
+        if restored.is_file():
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                target.unlink(missing_ok=True)
             shutil.copy2(restored, target)
         else:
+            if target.is_file() or target.is_symlink():
+                target.unlink(missing_ok=True)
             target.mkdir(parents=True, exist_ok=True)
             for child in list(target.iterdir()):
                 if child.name in EXCLUDED_DIRS or _runtime_path(child):
@@ -315,6 +321,7 @@ def storage_report() -> dict[str, Any]:
         "orphan_bytes": sum(item["bytes"] for item in orphans),
         "partials": partials,
         "limits": {
+            "snapshot_retention_days": settings.snapshot_retention_days,
             "snapshot_max_bytes": settings.snapshot_max_bytes,
             "snapshot_reserve_bytes": settings.snapshot_reserve_bytes,
             "orphan_grace_hours": settings.orphan_grace_hours,

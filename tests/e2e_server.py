@@ -27,6 +27,7 @@ os.environ.update(
         "SECURE_COOKIE": "false",
         "OLLAMA_BASE_URL": f"http://127.0.0.1:{PORT}/fake-ollama",
         "WORKER_URL": f"http://127.0.0.1:{PORT}/fake-worker",
+        "BRAIN_URL": f"http://127.0.0.1:{PORT}/fake-brain",
     }
 )
 
@@ -62,6 +63,11 @@ async def fake_chat(_: Request):
 
 @app.get("/fake-worker/healthz")
 def fake_worker():
+    return {"ok": True}
+
+
+@app.get("/fake-brain/healthz")
+def fake_brain():
     return {"ok": True}
 
 

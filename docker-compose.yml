@@ -8,7 +8,7 @@ services:
       - /bin/sh
       - -c
       - >-
-        mkdir -p /data/provider-home /jobs /snapshots &&
+        mkdir -p /data /jobs /snapshots &&
         chown -R ${PUID:-3000}:0 /data /jobs /snapshots &&
         chmod -R g+rwX /data /jobs /snapshots
     volumes:
@@ -46,6 +46,7 @@ services:
       JOBS_DIR: /jobs
       SNAPSHOT_DIR: /snapshots
       WORKER_URL: http://ollma-worker:8090
+      BRAIN_URL: http://ollma-brain:8091
       WORKER_TOKEN: ${WORKER_TOKEN:-change-this-worker-token}
       COMMAND_TIMEOUT: ${COMMAND_TIMEOUT:-120}
       SNAPSHOT_RETENTION_DAYS: ${SNAPSHOT_RETENTION_DAYS:-30}
@@ -75,12 +76,42 @@ services:
         condition: service_completed_successfully
       ollma-worker:
         condition: service_healthy
+      ollma-brain:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/readyz"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+    networks:
+      - ollma-private
+      - ollma-egress
+
+  ollma-brain:
+    build:
+      context: .
+      dockerfile: Dockerfile.brain
+      args:
+        PUID: ${PUID:-3000}
+    container_name: ollma-brain
+    restart: unless-stopped
+    user: "${PUID:-3000}:0"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    environment:
+      WORKER_TOKEN: ${WORKER_TOKEN:-change-this-worker-token}
+    depends_on:
+      ollma-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/healthz', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
     networks:
       - ollma-private
       - ollma-egress

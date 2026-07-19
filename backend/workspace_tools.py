@@ -170,9 +170,12 @@ def run_check(root: Path, command: str, args: list[str] | None = None, timeout: 
     for arg in args:
         if "\x00" in arg or len(arg) > 1000:
             return "Rejected argument"
-        if os.path.isabs(arg):
+        path_value = arg.split("=", 1)[1] if "=" in arg else arg
+        if ".." in Path(path_value).parts:
+            return "Rejected path traversal"
+        if os.path.isabs(path_value):
             try:
-                safe_path(root, arg)
+                safe_path(root, path_value)
             except ValueError:
                 return "Rejected path outside staged workspace"
     if executable in {"python", "python3", "node"} and any(arg in {"-c", "-e", "--eval"} for arg in args):
