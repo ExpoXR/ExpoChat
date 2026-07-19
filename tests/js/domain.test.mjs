@@ -27,6 +27,10 @@ test("run and artifact helpers select explicit render types", () => {
   assert.equal(artifactPresentation({ kind: "changes" }, '{"changed":["a.py"]}').type, "json");
   assert.equal(artifactPresentation({ kind: "command" }, "exit=0").type, "command");
   assert.equal(artifactPresentation({ kind: "plan" }, "# Plan").type, "markdown");
+  assert.deepEqual(
+    artifactPresentation({ kind: "research" }, JSON.stringify({ summary: "# Human summary", events: [{ tool: "read" }] })),
+    { type: "markdown", content: "# Human summary" },
+  );
 });
 
 test("settings and preferences are pure and bounded", () => {

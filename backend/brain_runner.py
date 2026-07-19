@@ -9,8 +9,8 @@ from typing import Any
 def run_codex(payload: dict[str, Any]) -> str:
     from openai_codex import Codex, Sandbox
 
-    os.environ["CODEX_API_KEY"] = payload["api_key"]
     with Codex() as codex:
+        codex.login_api_key(payload["api_key"])
         thread = codex.thread_start(model=payload["model"], sandbox=Sandbox.read_only)
         result = thread.run(payload["prompt"])
         return result.final_response

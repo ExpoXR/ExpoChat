@@ -1,9 +1,11 @@
 import json
 import os
 import sqlite3
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,7 +14,7 @@ WORKSPACES = TEST_ROOT / "workspaces"
 
 from fastapi import HTTPException  # noqa: E402
 
-from backend import db, orchestrator, workspace  # noqa: E402
+from backend import brain_runner, db, orchestrator, workspace  # noqa: E402
 from backend.main import pinned_context  # noqa: E402
 from backend.run_state import validate_transition  # noqa: E402
 from backend.security import decrypt_secret, encrypt_secret  # noqa: E402
@@ -63,6 +65,41 @@ def test_credential_round_trip():
     encrypted = encrypt_secret("secret-value")
     assert "secret-value" not in encrypted
     assert decrypt_secret(encrypted) == "secret-value"
+
+
+def test_codex_runner_applies_api_key_before_starting_thread(monkeypatch):
+    calls = []
+
+    class FakeThread:
+        def run(self, prompt):
+            calls.append(("run", prompt))
+            return SimpleNamespace(final_response="OK")
+
+    class FakeCodex:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def login_api_key(self, api_key):
+            calls.append(("login", api_key))
+
+        def thread_start(self, *, model, sandbox):
+            calls.append(("start", model, sandbox))
+            return FakeThread()
+
+    fake_module = SimpleNamespace(Codex=FakeCodex, Sandbox=SimpleNamespace(read_only="read-only"))
+    monkeypatch.setitem(sys.modules, "openai_codex", fake_module)
+
+    result = brain_runner.run_codex({"api_key": "secret", "model": "gpt-test", "prompt": "ping"})
+
+    assert result == "OK"
+    assert calls == [
+        ("login", "secret"),
+        ("start", "gpt-test", "read-only"),
+        ("run", "ping"),
+    ]
 
 
 def test_allowed_path_rejects_symlink_escape():
