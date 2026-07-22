@@ -36,7 +36,7 @@ to keep token savings positive. The full skill and its intensity levels live in
 
 ## Caveman Skills (Claude Code, this repo)
 
-Ultra-compressed communication mode. Cuts ~75% output tokens, full technical accuracy.
+Ultra-compressed communication mode with full technical accuracy.
 
 | Command | What |
 |---------|------|
@@ -45,11 +45,11 @@ Ultra-compressed communication mode. Cuts ~75% output tokens, full technical acc
 | `/caveman-commit` | Terse Conventional Commits message |
 | `/caveman-review` | One-line PR comments: `L42: 🔴 bug: user null. Add guard.` |
 | `/caveman-help` | Quick-reference card |
-| `/caveman-compress <file>` | Compress .md file → ~46% fewer input tokens |
+| `/caveman-compress <file>` | Compress .md file and preserve original backup |
 
 Stop: "stop caveman" or "normal mode".
-Skills live in `.claude/skills/` (canonical: `caveman/SKILL.md`) and commands in
-`.claude/commands/`. **`.claude/` is git-ignored** (see `.gitignore`), so these are a
+Skills live in `.claude/skills/` (canonical: `caveman/SKILL.md`) and expose matching slash
+commands. **`.claude/` is git-ignored** (see `.gitignore`), so these are a
 local, per-developer Claude Code setup — not checked into the repo and possibly absent in
 a fresh clone. The app's own terseness comes from `CAVEMAN_OUTPUT_INSTRUCTIONS`
 ([`backend/prompts.py`](backend/prompts.py)), independent of these files.
