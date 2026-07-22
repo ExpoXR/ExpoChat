@@ -4,7 +4,7 @@ import logging
 import secrets
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,17 +13,27 @@ import httpx
 
 from . import db
 from .config import settings
+from .plan_graph import GraphError, independent_pairs_sharing_globs, parse_task_graph, validate_graph
 from .prompts import with_caveman
 from .run_state import validate_transition
 from .security import decrypt_secret
-from .workspace import apply_stage, create_snapshot, discard_snapshot, manifest_hash, restore_snapshot, stage_workspace
+from .workspace import (
+    MergeConflict,
+    apply_stage,
+    create_snapshot,
+    discard_snapshot,
+    manifest_hash,
+    merge_worktrees,
+    restore_snapshot,
+    stage_subtask,
+    stage_workspace,
+)
 
 log = logging.getLogger("ollma.orchestrator")
 executor = ThreadPoolExecutor(max_workers=settings.runner_concurrency, thread_name_prefix="ollma-runner")
 _run_lock = threading.Lock()
 _queue_lock = threading.Lock()
 _active_drainers = 0
-MAX_RUN_ARTIFACTS = 200
 
 
 def _lease_heartbeat(job_id: int, lease_owner: str, stopped: threading.Event) -> None:
@@ -94,6 +104,8 @@ def _drain_jobs() -> None:
             )
             heartbeat.start()
             try:
+                # implementation jobs also drive the subtask DAG + merge inside implement_run;
+                # subtask/merge job_types are reserved for a future fully-durable per-node queue.
                 if job["job_type"] == "research":
                     research_run(job["run_id"])
                 else:
@@ -347,7 +359,7 @@ def save_artifact(run_id: str, kind: str, name: str, content: Any) -> None:
         conn.execute(
             "delete from run_artifacts where run_id=? and id not in "
             "(select id from run_artifacts where run_id=? order by id desc limit ?)",
-            (run_id, run_id, MAX_RUN_ARTIFACTS),
+            (run_id, run_id, db.retention_cap("run_artifacts_cap", db.MAX_RUN_ARTIFACTS)),
         )
 
 
@@ -435,6 +447,44 @@ def create_run(task: str, provider: str, target: Path, web_research: bool) -> di
     return db.one("select * from runs where id=?", (run_id,)) or {}
 
 
+DECOMPOSE_PROMPT = (
+    "You are the supervisor brain. Decompose the implementation plan below into a DAG of "
+    "independent subtasks a pool of coding agents can execute. Return JSON ONLY:\n"
+    '{"subtasks":[{"node_id":"kebab-id","title":"...","spec":"decision-complete instructions",'
+    '"depends_on":["other-node-id"],"file_globs":["path/glob/**"],"acceptance_criteria":"...",'
+    '"role":"implementation"}]}\n'
+    "Rules: keep each subtask independently verifiable; give every subtask a disjoint file_globs "
+    "scope; if two subtasks must touch the same files, serialize them with depends_on instead of "
+    "running them in parallel; use a single subtask if the plan is not decomposable. No prose.\n\nPLAN:\n"
+)
+
+
+def decompose_plan(run_id: str, plan: str, provider: str) -> list[dict[str, Any]]:
+    """Ask the brain to turn a plan into a validated task graph and persist it.
+
+    Best-effort and backward-compatible: any failure logs an event and leaves the run on
+    the existing single-implementer path (no subtasks persisted). Returns the node list.
+    """
+    try:
+        result = call_brain_result(provider, DECOMPOSE_PROMPT + plan, False, run_id=run_id)
+        record_usage(run_id, result, "brain")
+        nodes = validate_graph(parse_task_graph(result["content"]))
+        db.insert_subtasks(run_id, nodes)
+        save_artifact(run_id, "task_graph", "Task graph", {"subtasks": nodes})
+        conflicts = independent_pairs_sharing_globs(nodes)
+        db.add_event(
+            run_id,
+            "plan.decomposed",
+            f"Plan decomposed into {len(nodes)} subtask(s)",
+            {"count": len(nodes), "overlap_warnings": conflicts},
+        )
+        return nodes
+    except (GraphError, KeyError, RuntimeError) as exc:
+        log.warning("decompose_failed", extra={"run_id": run_id, "error": str(exc)})
+        db.add_event(run_id, "plan.decompose_skipped", "Plan kept as a single unit", {"reason": str(exc)[:400]})
+        return []
+
+
 def research_run(run_id: str) -> None:
     try:
         run = db.one("select * from runs where id=?", (run_id,))
@@ -473,6 +523,8 @@ def research_run(run_id: str) -> None:
             status="awaiting_approval",
         )
         save_artifact(run_id, "plan", "Supervisor plan", plan)
+        db.add_plan_version(run_id, "draft", plan, run["brain_provider"])
+        decompose_plan(run_id, plan, run["brain_provider"])
         db.add_event(run_id, "plan.ready", "Plan ready for approval")
     except Exception as exc:
         log.exception("research_failed", extra={"run_id": run_id})
@@ -513,6 +565,7 @@ def approve_run(run_id: str, approved_plan: str) -> dict[str, Any]:
                     "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,'implementation','pending',?,?)",
                     (run_id, now, now),
                 )
+            db.add_plan_version(run_id, "approved", approved_plan, run["brain_provider"])
             db.add_event(run_id, "scope.approved", "Expanded scope approved and implementation queued")
             start_job_queue()
             return db.one("select * from runs where id=?", (run_id,)) or {}
@@ -543,6 +596,7 @@ def approve_run(run_id: str, approved_plan: str) -> dict[str, Any]:
         except Exception:
             discard_snapshot(snapshot["id"])
             raise
+        db.add_plan_version(run_id, "approved", approved_plan, run["brain_provider"])
         db.add_event(run_id, "plan.approved", "History and snapshot created", {"snapshot_id": snapshot["id"]})
         start_job_queue()
         return db.one("select * from runs where id=?", (run_id,)) or {}
@@ -554,6 +608,7 @@ def edit_plan(run_id: str, plan: str) -> dict[str, Any]:
         raise RuntimeError("Run is not awaiting plan edits")
     update_run(run_id, draft_plan=plan, error=None)
     save_artifact(run_id, "plan_edit", "User-edited plan", plan)
+    db.add_plan_version(run_id, "edit", plan, run["brain_provider"])
     db.add_event(run_id, "plan.edited", "Plan changes saved")
     return db.one("select * from runs where id=?", (run_id,)) or {}
 
@@ -607,30 +662,120 @@ def brain_verdict(run: dict[str, Any], reports: list[str]) -> tuple[bool, str]:
         return passed, raw
 
 
+def _run_subtask(run_id: str, node: dict[str, Any], base_stage: Path) -> dict[str, Any]:
+    """Execute one subtask in its own isolated worktree. Runs on a pool thread."""
+    subtask_id = node["id"]
+    if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
+        raise RuntimeError("Run cancelled")
+    agent = choose_agent("implementation")
+    worktree = stage_subtask(run_id, node["node_id"], base_stage)
+    db.update_subtask(subtask_id, status="running", agent_id=agent["id"], worktree_ref=str(worktree), attempts=int(node.get("attempts") or 0) + 1)
+    db.add_event(run_id, "subtask.started", f"{node['title']} started with {agent['name']}", {"node_id": node["node_id"]})
+    globs = json.loads(node.get("file_globs_json") or "[]")
+    task = (
+        "Implement ONLY this subtask, completely, editing only files in its scope.\n\n"
+        f"SUBTASK: {node['title']}\n\nSPEC:\n{node['spec']}\n\n"
+        + (f"FILE SCOPE: {', '.join(globs)}\n\n" if globs else "")
+        + (f"ACCEPTANCE CRITERIA:\n{node['acceptance_criteria']}\n" if node.get("acceptance_criteria") else "")
+    )
+    result = worker_call(
+        run_id, agent["model"], "implementation", agent_task(agent, task),
+        workspace=f"subtasks/{node['node_id']}/workspace", max_turns=32,
+    )
+    record_usage(run_id, result)
+    db.add_subtask_result(subtask_id, run_id, "implementation", result.get("content", ""))
+    if not result.get("ok"):
+        db.update_subtask(subtask_id, status="failed", result_summary=(result.get("error") or "failed")[:2000])
+        raise RuntimeError(f"Subtask {node['node_id']} failed: {result.get('error') or 'worker error'}")
+    db.update_subtask(subtask_id, status="done", result_summary=result.get("content", "")[:4000])
+    db.add_event(run_id, "subtask.completed", f"{node['title']} complete", {"node_id": node["node_id"]})
+    return node
+
+
+def execute_dag(run_id: str, base_stage: Path) -> tuple[str, set[str]]:
+    """Run a run's subtask DAG with a bounded worker pool, then merge into base_stage.
+
+    Dependency-gated: a subtask starts only when all its depends_on are done. Concurrency
+    is capped at settings.worker_pool_size (default 1 = serialized on a single GPU). Already
+    'done' subtasks are skipped so a restarted run resumes rather than repeats. Returns a
+    combined summary and the set of implementer agent ids (to exclude from verification).
+    """
+    nodes = db.subtasks(run_id)
+    status = {n["node_id"]: n["status"] for n in nodes}
+    remaining = [n for n in nodes if status.get(n["node_id"]) != "done"]
+
+    def deps_done(node: dict[str, Any]) -> bool:
+        return all(status.get(dep) == "done" for dep in json.loads(node.get("depends_on_json") or "[]"))
+
+    pool = ThreadPoolExecutor(max_workers=max(1, settings.worker_pool_size), thread_name_prefix=f"dag-{run_id[:8]}")
+    futures: dict[Any, dict[str, Any]] = {}
+    try:
+        while remaining or futures:
+            if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
+                raise RuntimeError("Run cancelled")
+            ready = [n for n in remaining if deps_done(n) and n["node_id"] not in {v["node_id"] for v in futures.values()}]
+            for node in ready:
+                remaining.remove(node)
+                futures[pool.submit(_run_subtask, run_id, node, base_stage)] = node
+            if not futures:
+                raise RuntimeError("Subtask DAG deadlocked (unsatisfiable dependencies)")
+            done, _ = wait(list(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                node = futures.pop(future)
+                future.result()  # re-raise subtask failure
+                status[node["node_id"]] = "done"
+    except Exception:
+        for future in futures:
+            future.cancel()
+        raise
+    finally:
+        pool.shutdown(wait=True)
+
+    worktrees = [(n["node_id"], settings.jobs_dir / run_id / "subtasks" / n["node_id"] / "workspace") for n in nodes]
+    merged = merge_worktrees(base_stage, worktrees)
+    save_artifact(run_id, "merge", "Merged subtask manifest", merged)
+    db.add_event(run_id, "subtasks.merged", f"Merged {merged['subtasks']} subtask worktree(s)", merged)
+    completed = db.subtasks(run_id)
+    implementer_ids = {n["agent_id"] for n in completed if n.get("agent_id")}
+    summary = "\n\n".join(f"### {n['title']}\n{n.get('result_summary') or ''}" for n in completed)
+    return summary, implementer_ids
+
+
 def implement_run(run_id: str) -> None:
     try:
         run = db.one("select * from runs where id=?", (run_id,))
         if not run or run["status"] == "cancelled":
             return
-        agent = db.one("select * from agent_profiles where id=?", (run["implementation_agent_id"],))
-        if not agent:
-            raise RuntimeError("Implementation agent missing")
-        db.add_event(run_id, "implementation.started", f"Implementation started with {agent['name']}")
-        task = "Implement this approved plan completely.\n\n" + (run["approved_plan"] or "")
-        implementation = worker_call(run_id, agent["model"], "implementation", agent_task(agent, task), max_turns=32)
-        record_usage(run_id, implementation)
+        base_stage = settings.jobs_dir / run_id / "workspace"
+        subtask_nodes = db.subtasks(run_id)
+        if subtask_nodes:
+            # Multi-agent path: execute the approved task DAG, then merge into base_stage.
+            db.add_event(run_id, "implementation.started", f"Executing {len(subtask_nodes)} subtask(s) (pool {settings.worker_pool_size})")
+            summary, implementer_ids = execute_dag(run_id, base_stage)
+            repair_agent = choose_agent("implementation")
+        else:
+            # Single-agent path (backward compatible): one implementer runs the whole plan.
+            agent = db.one("select * from agent_profiles where id=?", (run["implementation_agent_id"],))
+            if not agent:
+                raise RuntimeError("Implementation agent missing")
+            db.add_event(run_id, "implementation.started", f"Implementation started with {agent['name']}")
+            task = "Implement this approved plan completely.\n\n" + (run["approved_plan"] or "")
+            implementation = worker_call(run_id, agent["model"], "implementation", agent_task(agent, task), max_turns=32)
+            record_usage(run_id, implementation)
+            summary = implementation.get("content", "")
+            save_artifact(run_id, "implementation", "Implementation transcript", implementation)
+            if not implementation.get("ok"):
+                raise RuntimeError(implementation.get("error") or "Implementation agent failed")
+            implementer_ids = {agent["id"]}
+            repair_agent = agent
         if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
             return
-        summary = implementation.get("content", "")
-        save_artifact(run_id, "implementation", "Implementation transcript", implementation)
-        if not implementation.get("ok"):
-            raise RuntimeError(implementation.get("error") or "Implementation agent failed")
         update_run(run_id, status="verifying")
         for repair in range(3):
             run = db.one("select * from runs where id=?", (run_id,)) or run
-            first = choose_agent("verification", {agent["id"]})
+            first = choose_agent("verification", set(implementer_ids))
             try:
-                second = choose_agent("verification", {agent["id"], first["id"]})
+                second = choose_agent("verification", implementer_ids | {first["id"]})
             except RuntimeError:
                 second = first
             reports = []
@@ -671,7 +816,7 @@ def implement_run(run_id: str) -> None:
                 return
             repair_task = parsed.get("repair_task") or "Fix every defect in these verifier reports:\n" + "\n\n".join(reports)
             update_run(run_id, status="implementing", repair_count=repair + 1)
-            repair_result = worker_call(run_id, agent["model"], "implementation", agent_task(agent, repair_task), max_turns=24)
+            repair_result = worker_call(run_id, repair_agent["model"], "implementation", agent_task(repair_agent, repair_task), max_turns=24)
             record_usage(run_id, repair_result)
             if not repair_result.get("ok"):
                 raise RuntimeError(repair_result.get("error") or "Repair agent failed")
@@ -690,7 +835,7 @@ def implement_run(run_id: str) -> None:
         db.add_event(run_id, "apply.completed", "Verified changes applied", changes)
         update_run(run_id, status="post_check")
         stage_workspace(run_id, target, "postcheck")
-        verifier = choose_agent("verification", {agent["id"]})
+        verifier = choose_agent("verification", set(implementer_ids))
         post = worker_call(
             run_id, verifier["model"], "verification",
             agent_task(verifier, "Post-apply check. Verify copied final server state still satisfies approved plan. Start with PASS or FAIL.\n\n" + (run["approved_plan"] or "")),
@@ -709,6 +854,10 @@ def implement_run(run_id: str) -> None:
         final_run = db.one("select verdict from runs where id=?", (run_id,)) or {}
         db.execute("update history_snippets set final_verdict=?,completed_at=? where run_id=?", (final_run.get("verdict"), completed, run_id))
         db.add_event(run_id, "run.completed", "Run completed successfully")
+    except MergeConflict as exc:
+        log.warning("merge_conflict", extra={"run_id": run_id})
+        update_run(run_id, status="failed", error=str(exc)[:4000])
+        db.add_event(run_id, "subtasks.conflict", "Subtask worktrees conflict; re-plan with disjoint scopes", {"conflicts": exc.conflicts})
     except Exception as exc:
         log.exception("implementation_failed", extra={"run_id": run_id})
         run = db.one("select * from runs where id=?", (run_id,))

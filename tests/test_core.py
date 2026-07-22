@@ -15,7 +15,7 @@ WORKSPACES = TEST_ROOT / "workspaces"
 
 from fastapi import HTTPException  # noqa: E402
 
-from backend import brain_runner, db, orchestrator, worker, workspace  # noqa: E402
+from backend import brain_runner, db, orchestrator, plan_graph, worker, workspace  # noqa: E402
 from backend.main import pinned_context  # noqa: E402
 from backend.migrations import MIGRATIONS  # noqa: E402
 from backend.prompts import CAVEMAN_OUTPUT_INSTRUCTIONS  # noqa: E402
@@ -37,8 +37,9 @@ def setup_module():
 
 def clear_workflow_tables():
     for table in (
-        "jobs", "verification_results", "run_approvals", "history_snippets",
-        "run_artifacts", "run_events", "runs", "agent_profiles", "snapshots",
+        "jobs", "subtask_results", "subtasks", "verification_results", "run_approvals",
+        "history_snippets", "plan_versions", "run_artifacts", "run_events", "runs",
+        "agent_profiles", "snapshots",
     ):
         db.execute(f"delete from {table}")
 
@@ -563,7 +564,7 @@ def test_active_job_uniqueness():
         )
 
 
-def test_run_events_and_artifacts_are_bounded(monkeypatch):
+def test_run_events_and_artifacts_are_bounded():
     clear_workflow_tables()
     run_id = "e" * 24
     now = db.utcnow()
@@ -571,13 +572,222 @@ def test_run_events_and_artifacts_are_bounded(monkeypatch):
         "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
         (run_id, "Bound history", "codex", str(WORKSPACES), "researching", now, now),
     )
-    monkeypatch.setattr(db, "MAX_RUN_EVENTS", 2)
-    monkeypatch.setattr(orchestrator, "MAX_RUN_ARTIFACTS", 2)
-    for index in range(3):
-        db.add_event(run_id, "test", f"event {index}")
-        orchestrator.save_artifact(run_id, "test", f"artifact {index}", str(index))
-    assert [row["message"] for row in db.all_rows("select message from run_events order by id")] == ["event 1", "event 2"]
-    assert [row["name"] for row in db.all_rows("select name from run_artifacts order by id")] == ["artifact 1", "artifact 2"]
+    try:
+        db.set_setting("run_events_cap", 2)
+        db.set_setting("run_artifacts_cap", 2)
+        for index in range(3):
+            db.add_event(run_id, "test", f"event {index}")
+            orchestrator.save_artifact(run_id, "test", f"artifact {index}", str(index))
+        assert [row["message"] for row in db.all_rows("select message from run_events order by id")] == ["event 1", "event 2"]
+        assert [row["name"] for row in db.all_rows("select name from run_artifacts order by id")] == ["artifact 1", "artifact 2"]
+    finally:
+        db.set_setting("run_events_cap", 500)
+        db.set_setting("run_artifacts_cap", 200)
+
+
+def test_retention_cap_ignores_nonpositive_override():
+    # A zero/invalid override must never wipe a table; it falls back to the default floor.
+    try:
+        db.set_setting("run_events_cap", 0)
+        assert db.retention_cap("run_events_cap", db.MAX_RUN_EVENTS) == db.MAX_RUN_EVENTS
+        db.set_setting("run_events_cap", 1200)
+        assert db.retention_cap("run_events_cap", db.MAX_RUN_EVENTS) == 1200
+    finally:
+        db.set_setting("run_events_cap", 500)
+
+
+def test_plan_versions_are_append_only_history():
+    clear_workflow_tables()
+    run_id = "p" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "Plan history", "codex", str(WORKSPACES), "awaiting_approval", now, now),
+    )
+    db.add_plan_version(run_id, "draft", "plan v1", "codex")
+    db.add_plan_version(run_id, "edit", "plan v2 edited", "codex")
+    db.add_plan_version(run_id, "approved", "plan v2 edited", "codex")
+    versions = db.plan_versions(run_id)
+    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert [row["kind"] for row in versions] == ["draft", "edit", "approved"]
+    assert versions[0]["content"] == "plan v1"
+
+
+def test_parse_task_graph_tolerates_fences_and_prose():
+    fenced = "here is the graph\n```json\n{\"subtasks\": [{\"node_id\": \"a\", \"spec\": \"do a\"}]}\n```\nthanks"
+    graph = plan_graph.parse_task_graph(fenced)
+    assert graph["subtasks"][0]["node_id"] == "a"
+    with pytest.raises(plan_graph.GraphError):
+        plan_graph.parse_task_graph("no json here")
+
+
+def test_validate_graph_orders_topologically_and_normalizes():
+    graph = {
+        "subtasks": [
+            {"node_id": "b", "spec": "depends on a", "depends_on": ["a"], "file_globs": ["src/b/**"]},
+            {"node_id": "a", "title": "First", "spec": "root", "file_globs": ["src/a/**"], "role": "implementation"},
+        ]
+    }
+    nodes = plan_graph.validate_graph(graph)
+    assert [n["node_id"] for n in nodes] == ["a", "b"]  # dependency before dependant
+    assert nodes[0]["title"] == "First"
+
+
+def test_validate_graph_rejects_cycles_and_bad_refs():
+    with pytest.raises(plan_graph.GraphError):
+        plan_graph.validate_graph({"subtasks": [
+            {"node_id": "a", "spec": "x", "depends_on": ["b"]},
+            {"node_id": "b", "spec": "y", "depends_on": ["a"]},
+        ]})
+    with pytest.raises(plan_graph.GraphError):
+        plan_graph.validate_graph({"subtasks": [{"node_id": "a", "spec": "x", "depends_on": ["ghost"]}]})
+    with pytest.raises(plan_graph.GraphError):
+        plan_graph.validate_graph({"subtasks": []})
+
+
+def test_independent_pairs_sharing_globs_flags_parallel_overlap():
+    nodes = plan_graph.validate_graph({"subtasks": [
+        {"node_id": "a", "spec": "x", "file_globs": ["src/shared.py"]},
+        {"node_id": "b", "spec": "y", "file_globs": ["src/shared.py"]},
+        {"node_id": "c", "spec": "z", "depends_on": ["a"], "file_globs": ["src/shared.py"]},
+    ]})
+    conflicts = plan_graph.independent_pairs_sharing_globs(nodes)
+    # a and b are independent and share a glob → conflict; c depends on a so a-c is serialized.
+    assert ("a", "b") in conflicts
+    assert ("a", "c") not in conflicts
+
+
+def test_insert_subtasks_persists_and_replaces_graph():
+    clear_workflow_tables()
+    run_id = "d" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "DAG run", "codex", str(WORKSPACES), "awaiting_approval", now, now),
+    )
+    nodes = plan_graph.validate_graph({"subtasks": [
+        {"node_id": "a", "spec": "build a", "file_globs": ["a/**"]},
+        {"node_id": "b", "spec": "build b", "depends_on": ["a"]},
+    ]})
+    db.insert_subtasks(run_id, nodes)
+    persisted = db.subtasks(run_id)
+    assert [row["node_id"] for row in persisted] == ["a", "b"]
+    assert json.loads(persisted[1]["depends_on_json"]) == ["a"]
+
+    db.update_subtask(persisted[0]["id"], status="done", result_summary="done a")
+    db.add_subtask_result(persisted[0]["id"], run_id, "implementation", "transcript a")
+    assert db.subtasks(run_id)[0]["status"] == "done"
+    assert db.all_rows("select * from subtask_results where run_id=?", (run_id,))[0]["content"] == "transcript a"
+
+    # Re-decomposition replaces the prior graph rather than duplicating node_ids.
+    db.insert_subtasks(run_id, plan_graph.validate_graph({"subtasks": [{"node_id": "a", "spec": "only a"}]}))
+    assert [row["node_id"] for row in db.subtasks(run_id)] == ["a"]
+
+
+def test_two_subtask_jobs_can_be_active_but_types_stay_singleton():
+    clear_workflow_tables()
+    run_id = "g" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "Concurrent subtasks", "codex", str(WORKSPACES), "implementing", now, now),
+    )
+    # Two active subtask jobs (distinct node_id) are allowed simultaneously.
+    db.execute(
+        "insert into jobs(run_id,job_type,node_id,status,created_at,updated_at) values(?,?,?,?,?,?)",
+        (run_id, "subtask", "a", "running", now, now),
+    )
+    db.execute(
+        "insert into jobs(run_id,job_type,node_id,status,created_at,updated_at) values(?,?,?,?,?,?)",
+        (run_id, "subtask", "b", "pending", now, now),
+    )
+    assert len(db.all_rows("select id from jobs where run_id=? and job_type='subtask'", (run_id,))) == 2
+    # A second active job of the same non-subtask type is rejected by the partial unique index.
+    db.execute(
+        "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,?,?,?,?)",
+        (run_id, "merge", "pending", now, now),
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,?,?,?,?)",
+            (run_id, "merge", "pending", now, now),
+        )
+
+
+def _make_base_stage(run_id: str, name: str) -> Path:
+    target = WORKSPACES / name
+    target.mkdir(exist_ok=True)
+    (target / "base.txt").write_text("base\n")
+    return stage_workspace(run_id, target)
+
+
+def test_stage_subtask_isolates_worktrees():
+    run_id = "h" * 24
+    base = _make_base_stage(run_id, "dag-iso-target")
+    wt_a = workspace.stage_subtask(run_id, "a", base)
+    wt_b = workspace.stage_subtask(run_id, "b", base)
+    (wt_a / "only_a.txt").write_text("a\n")
+    assert (wt_a / "base.txt").read_text() == "base\n"
+    assert not (wt_b / "only_a.txt").exists()  # b's worktree is unaffected
+    assert not (base / "only_a.txt").exists()  # base stage is unaffected
+
+
+def test_merge_worktrees_applies_disjoint_changes():
+    run_id = "i" * 24
+    base = _make_base_stage(run_id, "dag-merge-target")
+    wt_a = workspace.stage_subtask(run_id, "a", base)
+    wt_b = workspace.stage_subtask(run_id, "b", base)
+    (wt_a / "a.txt").write_text("from a\n")
+    (wt_b / "b.txt").write_text("from b\n")
+    merged = workspace.merge_worktrees(base, [("a", wt_a), ("b", wt_b)])
+    assert sorted(merged["changed"]) == ["a.txt", "b.txt"]
+    assert (base / "a.txt").read_text() == "from a\n"
+    assert (base / "b.txt").read_text() == "from b\n"
+
+
+def test_merge_worktrees_raises_on_conflict_without_writing():
+    run_id = "j" * 24
+    base = _make_base_stage(run_id, "dag-conflict-target")
+    wt_a = workspace.stage_subtask(run_id, "a", base)
+    wt_b = workspace.stage_subtask(run_id, "b", base)
+    (wt_a / "shared.txt").write_text("a wins\n")
+    (wt_b / "shared.txt").write_text("b wins\n")
+    with pytest.raises(workspace.MergeConflict) as info:
+        workspace.merge_worktrees(base, [("a", wt_a), ("b", wt_b)])
+    assert info.value.conflicts[0]["path"] == "shared.txt"
+    assert not (base / "shared.txt").exists()  # nothing written on conflict
+
+
+def test_execute_dag_runs_subtasks_and_merges(monkeypatch):
+    clear_workflow_tables()
+    run_id = "k" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "DAG execute", "codex", str(WORKSPACES), "implementing", now, now),
+    )
+    base = _make_base_stage(run_id, "dag-exec-target")
+    nodes = plan_graph.validate_graph({"subtasks": [
+        {"node_id": "a", "spec": "make a", "file_globs": ["a.txt"]},
+        {"node_id": "b", "spec": "make b", "depends_on": ["a"], "file_globs": ["b.txt"]},
+    ]})
+    db.insert_subtasks(run_id, nodes)
+
+    def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24):
+        node = Path(workspace).parts[1] if workspace.startswith("subtasks/") else "main"
+        (orchestrator.settings.jobs_dir / rid / workspace / f"{node}.txt").write_text(f"from {node}\n")
+        return {"ok": True, "content": f"did {node}", "usage": {}}
+
+    monkeypatch.setattr(orchestrator, "worker_call", fake_worker_call)
+    monkeypatch.setattr(orchestrator, "choose_agent", lambda *a, **k: {"id": "impl", "model": "m", "name": "Impl"})
+    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
+
+    summary, implementer_ids = orchestrator.execute_dag(run_id, base)
+    assert (base / "a.txt").read_text() == "from a\n"
+    assert (base / "b.txt").read_text() == "from b\n"
+    assert implementer_ids == {"impl"}
+    assert "did a" in summary and "did b" in summary
+    assert all(row["status"] == "done" for row in db.subtasks(run_id))
 
 
 def test_worker_activity_records_safe_live_file_states():

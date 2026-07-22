@@ -67,7 +67,8 @@ make backup     # SQLite online backup
 | `SNAPSHOT_MAX_BYTES` | `21474836480` | Maximum uncompressed source bytes |
 | `SNAPSHOT_RESERVE_BYTES` | `2147483648` | Free-space reserve before snapshot |
 | `ORPHAN_GRACE_HOURS` | `24` | Minimum orphan age before manual cleanup |
-| `RUNNER_CONCURRENCY` | `1` | Concurrent durable job drainers |
+| `RUNNER_CONCURRENCY` | `1` | Concurrent durable job drainers (separate runs) |
+| `WORKER_POOL_SIZE` | `1` | Subtasks a single run runs in parallel (1 = serialized; raise only when Ollama serves models concurrently) |
 | `CHAT_CONTEXT_BYTES` | `120000` | Pinned chat context budget |
 
 Keep concurrency at `1` until Ollama host has capacity for parallel model requests.

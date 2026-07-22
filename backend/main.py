@@ -66,7 +66,6 @@ from .workspace_tools import TOOL_DEFS, execute_tool, search_text
 configure_logging()
 log = logging.getLogger("ollma.web")
 TERMINAL_STATES = {"completed", "failed", "cancelled", "rolled_back"}
-MAX_TIMELINE_ENTRIES = 5000
 
 
 class LoginBody(BaseModel):
@@ -196,7 +195,7 @@ def add_timeline(event_type: str, summary: str, path: str | None = None, chat_id
         )
         conn.execute(
             "delete from timeline where id not in (select id from timeline order by id desc limit ?)",
-            (MAX_TIMELINE_ENTRIES,),
+            (db.retention_cap("timeline_cap", db.MAX_TIMELINE_ENTRIES),),
         )
 
 
@@ -618,6 +617,10 @@ def run_get(run_id: str, _: dict = Depends(require_user)):
     row["artifacts"] = db.all_rows("select id,kind,name,created_at from run_artifacts where run_id=? order by id", (run_id,))
     row["history"] = db.one("select * from history_snippets where run_id=?", (run_id,))
     row["approvals"] = db.all_rows("select * from run_approvals where run_id=? order by id", (run_id,))
+    row["plan_versions"] = db.plan_versions(run_id)
+    row["subtasks"] = db.subtasks(run_id)
+    for subtask in row["subtasks"]:
+        parse_json_fields(subtask, ["depends_on_json", "file_globs_json"])
     row["verification_results"] = db.all_rows("select * from verification_results where run_id=? order by id", (run_id,))
     row["jobs"] = db.all_rows(
         "select id,job_type,status,attempts,error,started_at,completed_at,cancel_requested_at,created_at,updated_at "
@@ -972,6 +975,7 @@ def chat_message(chat_id: str, body: MessageBody, _: dict = Depends(require_user
 
     def stream():
         answer: list[str] = []
+        agent_plan: str | None = None
         try:
             # Agent Mode — a supervisor Brain plans before the worker answers.
             if brain_provider:
@@ -986,6 +990,7 @@ def chat_message(chat_id: str, body: MessageBody, _: dict = Depends(require_user
                     plan_prompt += "\n\nWORKSPACE SUMMARY:\n" + workspace_summary(target)
                 brain_result = call_brain_result(brain_provider, plan_prompt, False, timeout=300)
                 plan = brain_result["content"]
+                agent_plan = plan
                 record_chat_usage("chat", brain_provider, brain_result.get("usage"))
                 yield _agent_sse("brain", "done", provider=brain_provider, text=plan)
                 messages[0]["content"] += "\n\nSUPERVISOR PLAN (follow it):\n" + plan
@@ -1002,7 +1007,7 @@ def chat_message(chat_id: str, body: MessageBody, _: dict = Depends(require_user
             yield _sse({"error": str(exc)})
         full = "".join(answer)
         if full:
-            db.execute("insert into messages(chat_id,role,content,created_at) values(?,?,?,?)", (chat_id, "assistant", full, db.utcnow()))
+            db.execute("insert into messages(chat_id,role,content,plan,created_at) values(?,?,?,?,?)", (chat_id, "assistant", full, agent_plan, db.utcnow()))
             db.execute("update chats set model=?,target_path=?,updated_at=?,title=case when title='New chat' then ? else title end where id=?", (body.model, str(target or ""), db.utcnow(), body.content[:70], chat_id))
         yield _sse({"done": True, "workspace": str(target or "")})
 
