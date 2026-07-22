@@ -603,6 +603,11 @@ async def run_events(run_id: str, request: Request, after: int = Query(default=0
                     yield ": keepalive\n\n"
             run = db.one("select status from runs where id=?", (run_id,))
             if run and run["status"] in TERMINAL_STATES and not rows:
+                # Final drain: an event may have landed after the last query and
+                # before this terminal-status read; deliver it before closing.
+                for row in db.all_rows("select * from run_events where run_id=? and id>? order by id", (run_id, cursor)):
+                    cursor = row["id"]
+                    yield f"id: {cursor}\nevent: {row['event_type']}\ndata: {json.dumps(row, ensure_ascii=False)}\n\n"
                 break
             await asyncio.sleep(1)
 
@@ -822,12 +827,12 @@ def chat_message(chat_id: str, body: MessageBody, _: dict = Depends(require_user
                         response.raise_for_status()
                         message = response.json().get("message", {})
                         messages.append(message)
+                        content = message.get("content", "")
+                        if content:
+                            answer.append(content)
+                            yield f"data: {json.dumps({'token': content}, ensure_ascii=False)}\n\n"
                         calls = message.get("tool_calls") or []
                         if not calls:
-                            content = message.get("content", "")
-                            if content:
-                                answer.append(content)
-                                yield f"data: {json.dumps({'token': content}, ensure_ascii=False)}\n\n"
                             break
                         for call in calls:
                             function = call.get("function", {})

@@ -26,10 +26,13 @@ When adding a new model call, route it through `with_caveman()` /
 
 ## Caveman skills & commands (Claude Code)
 
-Canonical skill: [`.claude/skills/caveman/SKILL.md`](.claude/skills/caveman/SKILL.md)
-(levels: lite / full / ultra / wenyan-*). Slash commands in
-[`.claude/commands/`](.claude/commands/): `/caveman`, `/caveman-commit`,
-`/caveman-review`, `/caveman-help`, `/caveman-compress`. Stop with "normal mode".
+These live under `.claude/` (skill `caveman/SKILL.md` with levels lite / full / ultra,
+plus slash commands `/caveman`, `/caveman-commit`, `/caveman-review`, `/caveman-help`,
+`/caveman-compress`; stop with "normal mode"). **`.claude/` is git-ignored** (see
+`.gitignore`), so these files are a local, per-developer Claude Code setup — they are
+**not** checked into the repo and may be absent in a fresh clone. The app's own terseness
+does not depend on them; it comes from `CAVEMAN_OUTPUT_INSTRUCTIONS` in
+[`backend/prompts.py`](backend/prompts.py).
 
 ## Working rules
 

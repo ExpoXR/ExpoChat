@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
@@ -38,24 +38,24 @@ def transaction() -> Iterator[sqlite3.Connection]:
 
 
 def execute(sql: str, args: tuple[Any, ...] = ()) -> None:
-    with connect() as db:
+    with closing(connect()) as db:
         db.execute(sql, args)
         db.commit()
 
 
 def one(sql: str, args: tuple[Any, ...] = ()) -> dict[str, Any] | None:
-    with connect() as db:
+    with closing(connect()) as db:
         row = db.execute(sql, args).fetchone()
         return dict(row) if row else None
 
 
 def all_rows(sql: str, args: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-    with connect() as db:
+    with closing(connect()) as db:
         return [dict(row) for row in db.execute(sql, args).fetchall()]
 
 
 def add_event(run_id: str, event_type: str, message: str, data: Any = None) -> int:
-    with connect() as db:
+    with closing(connect()) as db:
         cursor = db.execute(
             "insert into run_events(run_id,event_type,message,data_json,created_at) values(?,?,?,?,?)",
             (run_id, event_type, message, json.dumps(data, ensure_ascii=False) if data is not None else None, utcnow()),
@@ -73,7 +73,7 @@ def init_db() -> None:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.snapshot_dir.mkdir(parents=True, exist_ok=True)
     settings.jobs_dir.mkdir(parents=True, exist_ok=True)
-    with connect() as db:
+    with closing(connect()) as db:
         db.execute("pragma journal_mode=wal")
         db.executescript(
             """

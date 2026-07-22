@@ -11,7 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SNAPSHOT_DIR=/snapshots
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git patch ripgrep \
+    && apt-get install -y --no-install-recommends ca-certificates curl git ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid ${PUID} --gid 0 --create-home --home-dir /home/ollma ollma
 

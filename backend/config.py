@@ -36,7 +36,9 @@ class Settings:
     allowed_origins: set[str] = field(
         default_factory=lambda: {x.strip() for x in os.getenv("ALLOWED_ORIGINS", "").split(",") if x.strip()}
     )
-    secure_cookie: bool = field(default_factory=lambda: os.getenv("SECURE_COOKIE", "auto").lower() == "true")
+    # Force-secure override. Default off; when unset, security.py still auto-detects HTTPS
+    # from the request scheme / X-Forwarded-Proto, so cookies stay Secure behind a TLS proxy.
+    secure_cookie: bool = field(default_factory=lambda: os.getenv("SECURE_COOKIE", "false").lower() == "true")
     snapshot_retention_days: int = field(default_factory=lambda: _int("SNAPSHOT_RETENTION_DAYS", 30, 1))
     snapshot_max_bytes: int = field(default_factory=lambda: _int("SNAPSHOT_MAX_BYTES", 20 * 1024**3, 1))
     snapshot_reserve_bytes: int = field(default_factory=lambda: _int("SNAPSHOT_RESERVE_BYTES", 2 * 1024**3, 0))

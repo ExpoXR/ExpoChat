@@ -426,11 +426,10 @@ def research_run(run_id: str) -> None:
             dossier=dossier,
             draft_plan=plan,
             implementation_agent_id=implementation["id"],
-            status="plan_ready",
+            status="awaiting_approval",
         )
         save_artifact(run_id, "plan", "Supervisor plan", plan)
         db.add_event(run_id, "plan.ready", "Plan ready for approval")
-        update_run(run_id, dossier=dossier, draft_plan=plan, status="awaiting_approval")
     except Exception as exc:
         log.exception("research_failed", extra={"run_id": run_id})
         if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":

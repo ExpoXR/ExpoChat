@@ -8,7 +8,9 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
-ignore = ["E501", "B008"]
+# UP038 (isinstance with `X | Y`) is deprecated by ruff — the union form is slower at
+# runtime than the tuple form, so we keep `isinstance(x, (int, float))` and skip the rule.
+ignore = ["E501", "B008", "UP038"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B011"]
