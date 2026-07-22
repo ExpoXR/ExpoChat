@@ -193,9 +193,54 @@ def test_migration_widens_brain_check_to_gemini():
     assert {r[0] for r in conn.execute("select provider from brain_configs")} == {"codex", "gemini"}
 
 
+def test_stream_gemini_emits_incremental_tokens(monkeypatch, capsys):
+    class FakeChunk:
+        def __init__(self, text, meta=None):
+            self.text = text
+            self.usage_metadata = meta
+
+    class FakeModels:
+        def generate_content_stream(self, *, model, contents, config):
+            yield FakeChunk("Hel")
+            yield FakeChunk("lo", SimpleNamespace(prompt_token_count=2, candidates_token_count=1, total_token_count=3))
+
+    class FakeClient:
+        def __init__(self, api_key):
+            self.models = FakeModels()
+
+    fake_types = SimpleNamespace(GenerateContentConfig=lambda **kw: ("cfg", kw))
+    fake_genai = SimpleNamespace(Client=FakeClient, types=fake_types)
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=fake_genai))
+    monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
+    monkeypatch.setitem(sys.modules, "google.genai.types", fake_types)
+
+    brain_runner.stream_gemini({"api_key": "k", "model": "m", "prompt": "hi"})
+    lines = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+    assert lines[0] == {"token": "Hel"}
+    assert lines[1] == {"token": "lo"}
+    assert lines[-1]["done"] is True
+    assert lines[-1]["usage"]["total_tokens"] == 3
+
+
+def test_run_streaming_buffered_fallback_emits_token_then_done(monkeypatch, capsys):
+    monkeypatch.setattr(brain_runner, "run_codex", lambda payload: {"content": "hello", "usage": {"total_tokens": 4}})
+    brain_runner.run_streaming({"provider": "codex", "api_key": "k", "model": "m", "prompt": "p"})
+    lines = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+    assert lines[0] == {"token": "hello"}
+    assert lines[-1] == {"done": True, "usage": {"total_tokens": 4}}
+
+
+def test_record_chat_usage_writes_paid_ledger():
+    db.init_db()
+    db.execute("delete from usage_ledger")
+    orchestrator.record_chat_usage("chat", "gemini", {"input_tokens": 3, "output_tokens": 2})
+    assert db.ledger_totals_today(paid_only=True)["total"] == 5
+
+
 def test_settings_round_trip_and_defaults():
     db.init_db()
-    assert db.get_setting_int("token_budget_daily") == 0  # default
+    db.execute("delete from app_settings where key='token_budget_daily'")
+    assert db.get_setting_int("token_budget_daily") == 0  # falls back to default
     db.set_setting("token_budget_daily", 5000)
     db.set_setting("theme", "light")
     assert db.get_setting_int("token_budget_daily") == 5000

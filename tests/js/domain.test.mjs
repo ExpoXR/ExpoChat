@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildChatPayload, chatEventStatus } from "../../public/js/chat.mjs";
+import { buildChatPayload, chatAgentStep, chatEventStatus, cloudEngineValue, isCloudEngine } from "../../public/js/chat.mjs";
 import { artifactPresentation, explorerActivityState, fileActivity, runStatusLabel, tokenCounts } from "../../public/js/runs.mjs";
 import { BRAIN_MODELS, modelLabel, modelOptions, providerOptions } from "../../public/js/settings.mjs";
 import { buildSettingsPayload, usageMeter } from "../../public/js/settings_api.mjs";
@@ -22,7 +22,32 @@ test("fs path helpers resolve names, parents, paste targets, and duplicates", ()
 test("chat payload and phase status remain backward compatible", () => {
   const payload = buildChatPayload("inspect", "model", "/work", ["/work/app.py"]);
   assert.deepEqual(payload.context_paths, ["/work/app.py"]);
+  assert.equal(payload.provider, "ollama");
+  assert.equal(payload.agent_mode, false);
   assert.equal(chatEventStatus({ tool: "read_file" }), "Reading workspace: read_file");
+});
+
+test("chat payload routes cloud engines and agent mode", () => {
+  assert.equal(isCloudEngine(cloudEngineValue("gemini")), true);
+  const cloud = buildChatPayload("hi", cloudEngineValue("gemini"), "/w", [], { agentMode: true, brainProvider: "claude" });
+  assert.equal(cloud.provider, "gemini");
+  assert.equal(cloud.model, "gemini");
+  assert.equal(cloud.agent_mode, true);
+  assert.equal(cloud.brain_provider, "claude");
+  // agent mode off drops the brain provider
+  const local = buildChatPayload("hi", "llama3", "/w", [], { agentMode: false, brainProvider: "claude" });
+  assert.equal(local.provider, "ollama");
+  assert.equal(local.brain_provider, "");
+});
+
+test("chatAgentStep maps brain and worker frames", () => {
+  const brain = chatAgentStep({ actor: "brain", state: "planning", provider: "gemini" });
+  assert.equal(brain.title, "Brain · gemini");
+  assert.equal(brain.label, "planning…");
+  const worker = chatAgentStep({ actor: "worker", state: "working", engine: "ollama", model: "llama3" });
+  assert.equal(worker.title, "Worker · llama3");
+  assert.equal(worker.label, "executing…");
+  assert.equal(chatAgentStep({}), null);
 });
 
 test("workspace helpers bound pins and preserve quoted command arguments", () => {

@@ -27,10 +27,14 @@ from .logging_utils import configure_logging
 from .orchestrator import (
     approve_run,
     call_brain,
+    call_brain_result,
     cancel_run,
+    check_budget,
     create_run,
     discover_agents,
     edit_plan,
+    provider_config,
+    record_chat_usage,
     redo_plan,
     resume_run,
     rollback_run,
@@ -149,6 +153,9 @@ class MessageBody(BaseModel):
     model: str = Field(min_length=1, max_length=200)
     target_path: str = Field(default="", max_length=4096)
     context_paths: list[str] = Field(default_factory=list, max_length=20)
+    provider: str = Field(default="ollama", pattern="^(ollama|codex|claude|gemini)$")
+    agent_mode: bool = False
+    brain_provider: str = Field(default="", pattern="^(codex|claude|gemini)?$")
 
 
 class FileBody(BaseModel):
@@ -844,6 +851,23 @@ def chat_messages(chat_id: str, _: dict = Depends(require_user)):
     return {"chat": chat, "messages": db.all_rows("select * from messages where chat_id=? order by id", (chat_id,))}
 
 
+def _sse(data: dict[str, Any]) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _agent_sse(actor: str, state: str, **extra: Any) -> str:
+    return f"event: agent\ndata: {json.dumps({'actor': actor, 'state': state, **extra}, ensure_ascii=False)}\n\n"
+
+
+def _flatten_messages(messages: list[dict[str, Any]]) -> str:
+    parts = []
+    for message in messages:
+        content = str(message.get("content") or "").strip()
+        if content:
+            parts.append(f"{str(message.get('role', 'user')).upper()}: {content}")
+    return "\n\n".join(parts)
+
+
 @workspace_router.post("/api/chats/{chat_id}/message")
 def chat_message(chat_id: str, body: MessageBody, _: dict = Depends(require_user)):
     chat = db.one("select * from chats where id=?", (chat_id,))
@@ -861,68 +885,126 @@ def chat_message(chat_id: str, body: MessageBody, _: dict = Depends(require_user
     if target:
         system += "\n\n" + workspace_summary(target) + pinned_context(target, body.context_paths)
     messages = [{"role": "system", "content": system}, *history]
+    provider = body.provider
+    brain_provider = body.brain_provider if body.agent_mode else ""
+
+    def run_ollama(client: httpx.Client, answer: list[str]):
+        yield f"event: phase\ndata: {json.dumps({'phase': 'context', 'message': 'Inspecting workspace'})}\n\n"
+        supports_tools = False
+        if target:
+            with contextlib.suppress(Exception):
+                info = client.post(settings.ollama_url + "/api/show", json={"model": body.model}).json()
+                supports_tools = "tools" in (info.get("capabilities") or [])
+        if target and supports_tools:
+            read_tools = [tool for tool in TOOL_DEFS if tool["function"]["name"] in {"list_files", "read_file", "search_files"}]
+            for _turn in range(8):
+                response = client.post(
+                    settings.ollama_url + "/api/chat",
+                    json={"model": body.model, "messages": messages, "tools": read_tools, "stream": False},
+                )
+                response.raise_for_status()
+                message = response.json().get("message", {})
+                messages.append(message)
+                content = message.get("content", "")
+                if content:
+                    answer.append(content)
+                    yield _sse({"token": content})
+                calls = message.get("tool_calls") or []
+                if not calls:
+                    break
+                for call in calls:
+                    function = call.get("function", {})
+                    name = function.get("name", "")
+                    arguments = function.get("arguments") or {}
+                    if isinstance(arguments, str):
+                        with contextlib.suppress(json.JSONDecodeError):
+                            arguments = json.loads(arguments)
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    result = execute_tool(target, name, arguments, False)
+                    yield f"event: tool\ndata: {json.dumps({'tool': name, 'phase': 'tool'}, ensure_ascii=False)}\n\n"
+                    messages.append({"role": "tool", "tool_name": name, "content": result})
+            else:
+                raise RuntimeError("Chat tool turn limit reached")
+        else:
+            with client.stream("POST", settings.ollama_url + "/api/chat", json={"model": body.model, "messages": messages, "stream": True}) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    chunk = json.loads(line)
+                    token = chunk.get("message", {}).get("content", "")
+                    if token:
+                        answer.append(token)
+                        yield _sse({"token": token})
+                    if chunk.get("done"):
+                        break
+
+    def run_cloud(answer: list[str]):
+        check_budget()
+        key, model = provider_config(provider)
+        payload = {
+            "provider": provider,
+            "api_key": key,
+            "model": model,
+            "prompt": _flatten_messages(messages),
+            "max_output_tokens": db.get_setting_int("max_output_tokens"),
+        }
+        usage: dict[str, Any] = {}
+        with httpx.Client(timeout=300) as client:
+            with client.stream(
+                "POST", settings.brain_url + "/chat/stream",
+                headers={"X-Worker-Token": settings.worker_token}, json=payload,
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data = json.loads(line[6:])
+                    if data.get("token"):
+                        answer.append(data["token"])
+                        yield _sse({"token": data["token"]})
+                    if data.get("error"):
+                        raise RuntimeError(data["error"])
+                    if data.get("done"):
+                        usage = data.get("usage") or {}
+        record_chat_usage("chat", provider, usage)
 
     def stream():
         answer: list[str] = []
         try:
-            with httpx.Client(timeout=300) as client:
-                yield f"event: phase\ndata: {json.dumps({'phase': 'context', 'message': 'Inspecting workspace'})}\n\n"
-                supports_tools = False
+            # Agent Mode — a supervisor Brain plans before the worker answers.
+            if brain_provider:
+                yield _agent_sse("brain", "planning", provider=brain_provider)
+                check_budget()
+                plan_prompt = (
+                    "You are the supervisor brain. Produce a short, concrete plan for the worker to "
+                    "follow: a few numbered steps naming the files/tools that matter. Do not write the "
+                    "final answer.\n\nREQUEST:\n" + body.content
+                )
                 if target:
-                    with contextlib.suppress(Exception):
-                        info = client.post(settings.ollama_url + "/api/show", json={"model": body.model}).json()
-                        supports_tools = "tools" in (info.get("capabilities") or [])
-                if target and supports_tools:
-                    read_tools = [tool for tool in TOOL_DEFS if tool["function"]["name"] in {"list_files", "read_file", "search_files"}]
-                    for _turn in range(8):
-                        response = client.post(
-                            settings.ollama_url + "/api/chat",
-                            json={"model": body.model, "messages": messages, "tools": read_tools, "stream": False},
-                        )
-                        response.raise_for_status()
-                        message = response.json().get("message", {})
-                        messages.append(message)
-                        content = message.get("content", "")
-                        if content:
-                            answer.append(content)
-                            yield f"data: {json.dumps({'token': content}, ensure_ascii=False)}\n\n"
-                        calls = message.get("tool_calls") or []
-                        if not calls:
-                            break
-                        for call in calls:
-                            function = call.get("function", {})
-                            name = function.get("name", "")
-                            arguments = function.get("arguments") or {}
-                            if isinstance(arguments, str):
-                                with contextlib.suppress(json.JSONDecodeError):
-                                    arguments = json.loads(arguments)
-                            if not isinstance(arguments, dict):
-                                arguments = {}
-                            result = execute_tool(target, name, arguments, False)
-                            yield f"event: tool\ndata: {json.dumps({'tool': name, 'phase': 'tool'}, ensure_ascii=False)}\n\n"
-                            messages.append({"role": "tool", "tool_name": name, "content": result})
-                    else:
-                        raise RuntimeError("Chat tool turn limit reached")
-                else:
-                    with client.stream("POST", settings.ollama_url + "/api/chat", json={"model": body.model, "messages": messages, "stream": True}) as response:
-                        response.raise_for_status()
-                        for line in response.iter_lines():
-                            if not line:
-                                continue
-                            chunk = json.loads(line)
-                            token = chunk.get("message", {}).get("content", "")
-                            if token:
-                                answer.append(token)
-                                yield f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n"
-                            if chunk.get("done"):
-                                break
+                    plan_prompt += "\n\nWORKSPACE SUMMARY:\n" + workspace_summary(target)
+                brain_result = call_brain_result(brain_provider, plan_prompt, False, timeout=300)
+                plan = brain_result["content"]
+                record_chat_usage("chat", brain_provider, brain_result.get("usage"))
+                yield _agent_sse("brain", "done", provider=brain_provider, text=plan)
+                messages[0]["content"] += "\n\nSUPERVISOR PLAN (follow it):\n" + plan
+
+            if provider != "ollama":
+                yield _agent_sse("worker", "working", provider=provider, engine="cloud")
+                yield from run_cloud(answer)
+            else:
+                if brain_provider:
+                    yield _agent_sse("worker", "working", provider="ollama", engine="ollama", model=body.model)
+                with httpx.Client(timeout=300) as client:
+                    yield from run_ollama(client, answer)
         except Exception as exc:
-            yield f"data: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
+            yield _sse({"error": str(exc)})
         full = "".join(answer)
         if full:
             db.execute("insert into messages(chat_id,role,content,created_at) values(?,?,?,?)", (chat_id, "assistant", full, db.utcnow()))
             db.execute("update chats set model=?,target_path=?,updated_at=?,title=case when title='New chat' then ? else title end where id=?", (body.model, str(target or ""), db.utcnow(), body.content[:70], chat_id))
-        yield f"data: {json.dumps({'done': True, 'workspace': str(target or '')})}\n\n"
+        yield _sse({"done": True, "workspace": str(target or "")})
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
 

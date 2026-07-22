@@ -377,6 +377,17 @@ def record_usage(run_id: str, result: dict[str, Any], source: str = "ollama") ->
     db.record_ledger(source, provider, inp, out, total)
 
 
+def record_chat_usage(source: str, provider: str, usage: dict[str, Any] | None) -> None:
+    """Ledger-only usage recording for interactive chat (no run row)."""
+    usage = usage or {}
+    if not usage:
+        return
+    inp = int(usage.get("input_tokens", usage.get("prompt_eval_count", 0)) or 0)
+    out = int(usage.get("output_tokens", usage.get("eval_count", 0)) or 0)
+    total = int(usage.get("total_tokens") or (inp + out))
+    db.record_ledger(source, provider, inp, out, total)
+
+
 def agent_task(agent: dict[str, Any], task: str) -> str:
     prompt = str(agent.get("system_prompt") or "").strip()
     return ("AGENT PROFILE INSTRUCTIONS:\n" + prompt + "\n\nTASK:\n" + task) if prompt else task

@@ -219,8 +219,14 @@
               <span id="streamCursor" class="stream-cursor hidden">▋</span>
             </div>
             <form id="chatForm" class="composer">
-              <textarea id="prompt" rows="3" placeholder="Ask Ollama… (Ctrl+Enter to send)"></textarea>
-              <button type="submit" id="sendBtn">Send</button>
+              <div class="composer-controls">
+                <label class="check-label agent-toggle"><input id="agentModeToggle" type="checkbox"> Agent Mode</label>
+                <select id="chatBrainSelect" class="hidden" title="Supervisor brain used to plan in Agent Mode"></select>
+              </div>
+              <div class="composer-input">
+                <textarea id="prompt" rows="3" placeholder="Ask Ollama… (Ctrl+Enter to send)"></textarea>
+                <button type="submit" id="sendBtn">Send</button>
+              </div>
             </form>
             <!-- Sandboxed console — runs only inside active staged workspace -->
             <div class="term-section">

@@ -1,5 +1,5 @@
 import { createApi } from "/js/api.mjs";
-import { buildChatPayload, chatEventStatus } from "/js/chat.mjs";
+import { buildChatPayload, chatAgentStep, chatEventStatus, cloudEngineValue } from "/js/chat.mjs";
 import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMarkdown } from "/js/render.mjs";
 import { artifactPresentation, explorerActivityState, fileActivity, runStatusLabel, tokenCounts } from "/js/runs.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
@@ -234,6 +234,33 @@ function addMessage(role, content) {
   return node;
 }
 
+// Render/update an inline agent choreography card inside an assistant message.
+function renderAgentStep(node, step) {
+  if (!step) return;
+  let strip = node.querySelector(".agent-strip");
+  if (!strip) {
+    strip = document.createElement("div");
+    strip.className = "agent-strip";
+    node.querySelector(".msg-body").before(strip);
+  }
+  let card = strip.querySelector(`[data-actor="${step.actor}"]`);
+  if (!card) {
+    card = document.createElement("div");
+    card.className = "agent-card";
+    card.dataset.actor = step.actor;
+    strip.appendChild(card);
+  }
+  const active = step.state === "planning" || step.state === "working";
+  card.classList.toggle("active", active);
+  card.classList.toggle("done", step.state === "done");
+  const planHtml = step.text ? `<details class="agent-plan"><summary>Plan</summary><div>${renderMarkdown(step.text)}</div></details>` : "";
+  card.innerHTML =
+    `<div class="agent-head"><span class="agent-dot"></span>` +
+    `<span class="agent-name">${escapeHtml(step.title)}</span>` +
+    `<span class="agent-state">${escapeHtml(step.label)}</span></div>${planHtml}`;
+  $("messages").scrollTop = $("messages").scrollHeight;
+}
+
 // ---------------------------------------------------------------------------
 // Chat — model list + history
 // ---------------------------------------------------------------------------
@@ -306,17 +333,38 @@ async function deleteChat(chat) {
 async function loadModels() {
   const data = await api("/api/models");
   models = data.models || [];
+  renderChatEngines();
+}
+
+// Rebuild the chat engine picker: local Ollama models + linked cloud brains.
+function renderChatEngines() {
   const sel = $("modelSelect");
   const prev = sel.value || loadPrefs().model;
   sel.innerHTML = "";
+  const localGroup = document.createElement("optgroup");
+  localGroup.label = "Local (Ollama)";
   models.forEach((m) => {
     const opt = document.createElement("option");
     opt.value = m.name || m.model;
     opt.textContent = m.name || m.model;
-    sel.appendChild(opt);
+    localGroup.appendChild(opt);
   });
-  if (prev && models.find((m) => (m.name || m.model) === prev)) sel.value = prev;
-  $("ollamaStatus").textContent = sel.value || "no model";
+  sel.appendChild(localGroup);
+
+  const cloud = providerOptions(brains || []);
+  if (cloud.length) {
+    const cloudGroup = document.createElement("optgroup");
+    cloudGroup.label = "Cloud (API)";
+    cloud.forEach((provider) => {
+      const opt = document.createElement("option");
+      opt.value = cloudEngineValue(provider.value);
+      opt.textContent = provider.label;
+      cloudGroup.appendChild(opt);
+    });
+    sel.appendChild(cloudGroup);
+  }
+  if (prev && [...sel.options].some((opt) => opt.value === prev)) sel.value = prev;
+  $("ollamaStatus").textContent = (sel.value || "no model").replace(/^cloud:/, "");
 }
 
 async function loadChats(append = false) {
@@ -434,6 +482,7 @@ async function sendPrompt(event) {
         $("modelSelect").value,
         $("targetPath").value.trim(),
         pinnedContextPaths,
+        { agentMode: $("agentModeToggle").checked, brainProvider: $("chatBrainSelect").value },
       )),
     });
 
@@ -453,6 +502,14 @@ async function sendPrompt(event) {
       buf = parsedFrames.remainder;
       for (const frame of parsedFrames.events) {
         const parsed = frame.data;
+        if (frame.event === "agent") {
+          const step = chatAgentStep(parsed);
+          if (step) {
+            renderAgentStep(node, step);
+            setStatus(`${step.title} — ${step.label}`);
+          }
+          continue;
+        }
         if (parsed.done) {
           if (parsed.workspace) setWorkspaceTag(parsed.workspace);
           continue;
@@ -1300,6 +1357,21 @@ function syncProviderOptions() {
   } else if (enabled.some((provider) => provider.value === selected)) {
     select.value = selected;
   }
+
+  // Reflect linked providers into the chat engine picker + Agent Mode brain select.
+  renderChatEngines();
+  const brainSelect = $("chatBrainSelect");
+  if (brainSelect) {
+    const prev = brainSelect.value;
+    brainSelect.innerHTML = "";
+    enabled.forEach((provider) => {
+      const option = document.createElement("option");
+      option.value = provider.value;
+      option.textContent = provider.label;
+      brainSelect.appendChild(option);
+    });
+    if (enabled.some((provider) => provider.value === prev)) brainSelect.value = prev;
+  }
 }
 
 async function saveBrain(provider) {
@@ -1336,6 +1408,7 @@ async function testBrain(provider) {
 }
 
 let appSettings = { theme: "dark", agent_mode_default: false };
+let agentModeTouched = false;
 
 function applyTheme(theme) {
   const resolved = theme === "auto"
@@ -1353,6 +1426,10 @@ async function loadSettings() {
     $("themeSelect").value = appSettings.theme || "dark";
     $("agentModeDefault").checked = Boolean(appSettings.agent_mode_default);
     applyTheme(appSettings.theme || "dark");
+    if (!agentModeTouched) {
+      $("agentModeToggle").checked = Boolean(appSettings.agent_mode_default);
+      $("chatBrainSelect").classList.toggle("hidden", !$("agentModeToggle").checked);
+    }
   } catch (_) {}
   await loadUsage();
 }
@@ -1568,6 +1645,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Chat
   $("chatForm").onsubmit = sendPrompt;
+  $("agentModeToggle").onchange = () => {
+    agentModeTouched = true;
+    $("chatBrainSelect").classList.toggle("hidden", !$("agentModeToggle").checked);
+  };
   $("newChatBtn").onclick      = newChat;
   $("saveNewChatBtn").onclick  = saveAndNewChat;
   $("applyCodeBtn").onclick = applyLastCodeBlock;

@@ -143,6 +143,47 @@ def test_fs_operations_and_chat_management():
     asyncio.run(run())
 
 
+def test_settings_usage_and_cloud_chat_wiring():
+    async def run():
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                login = await client.post("/api/auth/login", json={"username": "tester", "password": "correct-horse-battery-staple"})
+                csrf = login.json()["csrf"]
+                h = {"X-CSRF-Token": csrf}
+
+                # settings round-trip
+                saved = await client.put("/api/settings", headers=h, json={"token_budget_daily": 1234, "theme": "light"})
+                assert saved.status_code == 200
+                assert saved.json()["token_budget_daily"] == 1234
+                assert saved.json()["theme"] == "light"
+                assert (await client.get("/api/settings")).json()["token_budget_daily"] == 1234
+
+                usage = await client.get("/api/usage")
+                assert usage.status_code == 200
+                assert usage.json()["budgets"]["daily"] == 1234
+                assert "paid_today" in usage.json()
+
+                # Gemini can be linked through the widened provider validation
+                linked = await client.put(
+                    "/api/brains", headers=h,
+                    json={"provider": "gemini", "model": "gemini-2.5-pro", "api_key": "g-key", "enabled": True},
+                )
+                assert linked.status_code == 200 and linked.json()["linked"] is True
+
+                # A chat with an unlinked/failed cloud provider surfaces an error frame, never a crash
+                await client.put("/api/brains", headers=h, json={"provider": "gemini", "model": "gemini-2.5-pro", "enabled": False})
+                chat = (await client.post("/api/chats", headers=h, json={"title": "Cloud", "model": "m"})).json()["chat"]
+                reply = await client.post(
+                    f"/api/chats/{chat['id']}/message", headers=h,
+                    json={"content": "hi", "model": "gemini", "provider": "gemini"},
+                )
+                assert reply.status_code == 200
+                assert '"error"' in reply.text
+
+    asyncio.run(run())
+
+
 def test_worker_cancellation_interrupts_active_task(monkeypatch):
     async def run():
         run_id = "d" * 24

@@ -474,18 +474,78 @@ label {
 }
 
 .composer {
-  display: grid;
-  grid-template-columns: 1fr 82px;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
   padding: 8px;
   border-top: 1px solid var(--line);
   background: var(--panel);
 }
 
+.composer-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.composer-controls .agent-toggle { font-size: 12px; }
+.composer-controls #chatBrainSelect { max-width: 220px; }
+
+.composer-input {
+  display: grid;
+  grid-template-columns: 1fr 82px;
+  gap: 8px;
+}
+
 .composer textarea {
   min-height: 58px;
   max-height: 160px;
   background: #1e1e1e;
+}
+
+/* Agent choreography — inline cards inside an assistant message */
+.agent-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 2px 0 8px;
+}
+.agent-card {
+  flex: 1 1 180px;
+  min-width: 160px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 10px;
+  background: #1b1b1b;
+}
+.agent-card[data-actor="brain"] { border-left-color: var(--accent); }
+.agent-card[data-actor="worker"] { border-left-color: #b58900; }
+.agent-card.done { opacity: 0.85; }
+.agent-head { display: flex; align-items: center; gap: 7px; }
+.agent-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--muted); flex: none;
+}
+.agent-card.active .agent-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 0 rgba(0, 122, 204, 0.6);
+  animation: agentPulse 1.3s infinite;
+}
+.agent-card[data-actor="worker"].active .agent-dot {
+  background: #d9a520;
+  box-shadow: 0 0 0 0 rgba(217, 165, 32, 0.6);
+}
+.agent-card.done .agent-dot { background: #76c47c; animation: none; }
+.agent-name { font-size: 12px; font-weight: 600; color: var(--text); }
+.agent-state { font-size: 11px; color: var(--muted); margin-left: auto; }
+.agent-plan { margin-top: 6px; font-size: 12px; }
+.agent-plan summary { cursor: pointer; color: var(--muted); }
+.agent-plan > div { margin-top: 5px; }
+@keyframes agentPulse {
+  70% { box-shadow: 0 0 0 7px rgba(0, 122, 204, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(0, 122, 204, 0); }
 }
 
 /* -----------------------------------------------------------------------
@@ -1047,10 +1107,12 @@ pre {
   }
 
   .composer {
-    grid-template-columns: 1fr;
     position: sticky;
     bottom: 0;
     z-index: 5;
+  }
+  .composer-input {
+    grid-template-columns: 1fr;
   }
 
   input,
