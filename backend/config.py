@@ -44,6 +44,9 @@ class Settings:
     snapshot_reserve_bytes: int = field(default_factory=lambda: _int("SNAPSHOT_RESERVE_BYTES", 2 * 1024**3, 0))
     orphan_grace_hours: int = field(default_factory=lambda: _int("ORPHAN_GRACE_HOURS", 24, 1))
     runner_concurrency: int = field(default_factory=lambda: _int("RUNNER_CONCURRENCY", 1, 1))
+    # Max subtasks a single run executes in parallel. Default 1 = serialized on one GPU
+    # (parallel Ollama calls would just queue). Raise once the host serves models concurrently.
+    worker_pool_size: int = field(default_factory=lambda: _int("WORKER_POOL_SIZE", 1, 1))
     chat_context_bytes: int = field(default_factory=lambda: _int("CHAT_CONTEXT_BYTES", 120_000, 10_000))
     openai_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     openai_model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-5.6-sol"))

@@ -714,6 +714,82 @@ def test_two_subtask_jobs_can_be_active_but_types_stay_singleton():
         )
 
 
+def _make_base_stage(run_id: str, name: str) -> Path:
+    target = WORKSPACES / name
+    target.mkdir(exist_ok=True)
+    (target / "base.txt").write_text("base\n")
+    return stage_workspace(run_id, target)
+
+
+def test_stage_subtask_isolates_worktrees():
+    run_id = "h" * 24
+    base = _make_base_stage(run_id, "dag-iso-target")
+    wt_a = workspace.stage_subtask(run_id, "a", base)
+    wt_b = workspace.stage_subtask(run_id, "b", base)
+    (wt_a / "only_a.txt").write_text("a\n")
+    assert (wt_a / "base.txt").read_text() == "base\n"
+    assert not (wt_b / "only_a.txt").exists()  # b's worktree is unaffected
+    assert not (base / "only_a.txt").exists()  # base stage is unaffected
+
+
+def test_merge_worktrees_applies_disjoint_changes():
+    run_id = "i" * 24
+    base = _make_base_stage(run_id, "dag-merge-target")
+    wt_a = workspace.stage_subtask(run_id, "a", base)
+    wt_b = workspace.stage_subtask(run_id, "b", base)
+    (wt_a / "a.txt").write_text("from a\n")
+    (wt_b / "b.txt").write_text("from b\n")
+    merged = workspace.merge_worktrees(base, [("a", wt_a), ("b", wt_b)])
+    assert sorted(merged["changed"]) == ["a.txt", "b.txt"]
+    assert (base / "a.txt").read_text() == "from a\n"
+    assert (base / "b.txt").read_text() == "from b\n"
+
+
+def test_merge_worktrees_raises_on_conflict_without_writing():
+    run_id = "j" * 24
+    base = _make_base_stage(run_id, "dag-conflict-target")
+    wt_a = workspace.stage_subtask(run_id, "a", base)
+    wt_b = workspace.stage_subtask(run_id, "b", base)
+    (wt_a / "shared.txt").write_text("a wins\n")
+    (wt_b / "shared.txt").write_text("b wins\n")
+    with pytest.raises(workspace.MergeConflict) as info:
+        workspace.merge_worktrees(base, [("a", wt_a), ("b", wt_b)])
+    assert info.value.conflicts[0]["path"] == "shared.txt"
+    assert not (base / "shared.txt").exists()  # nothing written on conflict
+
+
+def test_execute_dag_runs_subtasks_and_merges(monkeypatch):
+    clear_workflow_tables()
+    run_id = "k" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "DAG execute", "codex", str(WORKSPACES), "implementing", now, now),
+    )
+    base = _make_base_stage(run_id, "dag-exec-target")
+    nodes = plan_graph.validate_graph({"subtasks": [
+        {"node_id": "a", "spec": "make a", "file_globs": ["a.txt"]},
+        {"node_id": "b", "spec": "make b", "depends_on": ["a"], "file_globs": ["b.txt"]},
+    ]})
+    db.insert_subtasks(run_id, nodes)
+
+    def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24):
+        node = Path(workspace).parts[1] if workspace.startswith("subtasks/") else "main"
+        (orchestrator.settings.jobs_dir / rid / workspace / f"{node}.txt").write_text(f"from {node}\n")
+        return {"ok": True, "content": f"did {node}", "usage": {}}
+
+    monkeypatch.setattr(orchestrator, "worker_call", fake_worker_call)
+    monkeypatch.setattr(orchestrator, "choose_agent", lambda *a, **k: {"id": "impl", "model": "m", "name": "Impl"})
+    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
+
+    summary, implementer_ids = orchestrator.execute_dag(run_id, base)
+    assert (base / "a.txt").read_text() == "from a\n"
+    assert (base / "b.txt").read_text() == "from b\n"
+    assert implementer_ids == {"impl"}
+    assert "did a" in summary and "did b" in summary
+    assert all(row["status"] == "done" for row in db.subtasks(run_id))
+
+
 def test_worker_activity_records_safe_live_file_states():
     clear_workflow_tables()
     run_id = "f" * 24

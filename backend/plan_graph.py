@@ -13,10 +13,14 @@ Graph shape (what the brain is asked to emit):
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 VALID_ROLES = {"research", "implementation", "verification"}
 MAX_SUBTASKS = 40
+# node_id becomes an on-disk worktree directory name, so it must be a safe slug
+# (no slashes, no '..', no spaces) to prevent path traversal.
+NODE_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 
 
 class GraphError(ValueError):
@@ -77,6 +81,8 @@ def validate_graph(graph: dict[str, Any]) -> list[dict[str, Any]]:
         node_id = str(item.get("node_id") or item.get("id") or "").strip()
         if not node_id:
             raise GraphError(f"Subtask #{index} is missing node_id")
+        if not NODE_ID_RE.match(node_id):
+            raise GraphError(f"Unsafe node_id (must be a slug): {node_id!r}")
         if node_id in nodes:
             raise GraphError(f"Duplicate node_id: {node_id}")
         title = str(item.get("title") or "").strip() or node_id
