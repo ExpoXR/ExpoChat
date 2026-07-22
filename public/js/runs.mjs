@@ -65,6 +65,37 @@ export function tokenCounts(usage = {}) {
   };
 }
 
+// Derive a Brain → Worker → Verifier choreography lane from a run's status and
+// its emitted events. Pure so it can be unit-tested; the UI renders each entry
+// as an .agent-card. state ∈ idle | working | done | error.
+export function runChoreography(run = {}, events = []) {
+  const types = new Set((events || []).map((event) => event.event_type));
+  const status = run.status || "";
+  const agents = run.selected_agents || [];
+  const worker = agents.find((agent) => (agent.roles || []).includes("implementation")) || agents[0] || {};
+  const bad = status === "failed";
+
+  const step = (active, done, failed, activeLabel, doneLabel) => ({
+    state: failed ? "error" : done ? "done" : active ? "working" : "idle",
+    label: failed ? "failed" : done ? doneLabel : active ? activeLabel : "idle",
+  });
+
+  const brainDone = types.has("plan.ready") ||
+    ["awaiting_approval", "implementing", "verifying", "applying", "post_check", "completed"].includes(status);
+  const implDone = types.has("apply.completed") || types.has("verification.completed") ||
+    ["applying", "post_check", "completed"].includes(status);
+  const verifyDone = status === "completed";
+
+  return [
+    { role: "brain", title: `Brain · ${run.brain_provider || "supervisor"}`,
+      ...step(status === "researching", brainDone, bad && !brainDone, "planning…", "planned") },
+    { role: "worker", title: `Worker · ${worker.name || "Ollama"}`,
+      ...step(status === "implementing", implDone, false, "implementing…", "implemented") },
+    { role: "verifier", title: "Verifier",
+      ...step(["verifying", "post_check"].includes(status), verifyDone, status === "rolled_back", "verifying…", "passed") },
+  ];
+}
+
 export function artifactPresentation(artifact, content) {
   if (artifact.kind === "diff" || content.startsWith("diff --git ") || content.startsWith("--- ")) {
     return { type: "diff", content };

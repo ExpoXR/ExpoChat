@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
@@ -38,24 +38,24 @@ def transaction() -> Iterator[sqlite3.Connection]:
 
 
 def execute(sql: str, args: tuple[Any, ...] = ()) -> None:
-    with connect() as db:
+    with closing(connect()) as db:
         db.execute(sql, args)
         db.commit()
 
 
 def one(sql: str, args: tuple[Any, ...] = ()) -> dict[str, Any] | None:
-    with connect() as db:
+    with closing(connect()) as db:
         row = db.execute(sql, args).fetchone()
         return dict(row) if row else None
 
 
 def all_rows(sql: str, args: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-    with connect() as db:
+    with closing(connect()) as db:
         return [dict(row) for row in db.execute(sql, args).fetchall()]
 
 
 def add_event(run_id: str, event_type: str, message: str, data: Any = None) -> int:
-    with connect() as db:
+    with closing(connect()) as db:
         cursor = db.execute(
             "insert into run_events(run_id,event_type,message,data_json,created_at) values(?,?,?,?,?)",
             (run_id, event_type, message, json.dumps(data, ensure_ascii=False) if data is not None else None, utcnow()),
@@ -69,11 +69,74 @@ def add_event(run_id: str, event_type: str, message: str, data: Any = None) -> i
         return int(cursor.lastrowid)
 
 
+DEFAULT_SETTINGS: dict[str, str] = {
+    "token_budget_run": "0",      # per-run paid-token cap (0 = unlimited)
+    "token_budget_daily": "0",    # per-day paid-token cap (0 = unlimited)
+    "max_output_tokens": "0",     # cap on brain/API response length (0 = provider default)
+    "theme": "dark",              # dark | light | auto
+    "agent_mode_default": "0",    # chat Agent Mode default (0/1)
+}
+
+
+def get_setting(key: str, default: str = "") -> str:
+    row = one("select value from app_settings where key=?", (key,))
+    if row:
+        return str(row["value"])
+    return DEFAULT_SETTINGS.get(key, default)
+
+
+def get_setting_int(key: str) -> int:
+    try:
+        return int(get_setting(key, "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def all_settings() -> dict[str, str]:
+    stored = {row["key"]: row["value"] for row in all_rows("select key,value from app_settings")}
+    return {**DEFAULT_SETTINGS, **stored}
+
+
+def set_setting(key: str, value: Any) -> None:
+    execute(
+        "insert into app_settings(key,value,updated_at) values(?,?,?) "
+        "on conflict(key) do update set value=excluded.value,updated_at=excluded.updated_at",
+        (key, str(value), utcnow()),
+    )
+
+
+def record_ledger(source: str, provider: str, input_tokens: int, output_tokens: int, total: int) -> None:
+    execute(
+        "insert into usage_ledger(day,source,provider,input,output,total,created_at) values(?,?,?,?,?,?,?)",
+        (datetime.now(UTC).date().isoformat(), source, provider, int(input_tokens), int(output_tokens), int(total), utcnow()),
+    )
+
+
+def ledger_totals_today(paid_only: bool = True) -> dict[str, int]:
+    day = datetime.now(UTC).date().isoformat()
+    clause = " and source!='ollama'" if paid_only else ""
+    row = one(
+        "select coalesce(sum(input),0) as i, coalesce(sum(output),0) as o, coalesce(sum(total),0) as t "
+        f"from usage_ledger where day=?{clause}",
+        (day,),
+    ) or {"i": 0, "o": 0, "t": 0}
+    return {"input": int(row["i"]), "output": int(row["o"]), "total": int(row["t"])}
+
+
+def ledger_by_provider_today() -> list[dict[str, Any]]:
+    day = datetime.now(UTC).date().isoformat()
+    return all_rows(
+        "select provider, source, coalesce(sum(total),0) as total from usage_ledger "
+        "where day=? group by provider, source order by total desc",
+        (day,),
+    )
+
+
 def init_db() -> None:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.snapshot_dir.mkdir(parents=True, exist_ok=True)
     settings.jobs_dir.mkdir(parents=True, exist_ok=True)
-    with connect() as db:
+    with closing(connect()) as db:
         db.execute("pragma journal_mode=wal")
         db.executescript(
             """
@@ -100,7 +163,7 @@ def init_db() -> None:
               created_at real not null, last_seen real not null, expires_at real not null
             );
             create table if not exists brain_configs (
-              provider text primary key check(provider in ('codex','claude')),
+              provider text primary key check(provider in ('codex','claude','gemini')),
               model text not null, key_ciphertext text, source text not null default 'environment',
               enabled integer not null default 0, validated_at text, last_error text,
               updated_at text not null
@@ -169,6 +232,10 @@ def init_db() -> None:
         db.execute(
             "insert or ignore into brain_configs(provider,model,source,enabled,updated_at) values(?,?,?,?,?)",
             ("claude", settings.claude_model, "environment", int(bool(settings.claude_key)), utcnow()),
+        )
+        db.execute(
+            "insert or ignore into brain_configs(provider,model,source,enabled,updated_at) values(?,?,?,?,?)",
+            ("gemini", settings.gemini_model, "environment", int(bool(settings.gemini_key)), utcnow()),
         )
         db.execute(
             "update jobs set status='pending',error='Interrupted; queued for recovery',lease_owner=null,"

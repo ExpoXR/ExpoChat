@@ -47,7 +47,7 @@ Rotate any value previously committed or copied from an unsafe example. Use HTTP
 ```bash
 make lint       # Ruff
 make test       # Python unit/integration tests
-make test-js    # Markdown/SSE frontend unit tests
+make test-js    # Frontend unit tests (node --test)
 make e2e        # isolated fake services + containerized Playwright
 make check      # fast local gate
 make logs       # follow Compose logs

@@ -138,16 +138,38 @@ def provider_config(provider: str) -> tuple[str, str]:
         raise RuntimeError(f"{provider} brain is not linked")
     if row["source"] == "stored":
         key = decrypt_secret(row["key_ciphertext"])
-    elif provider == "codex":
-        key = settings.openai_key
     else:
-        key = settings.claude_key
+        key = settings.environment_key(provider)
     if not key:
         raise RuntimeError(f"{provider} API key is missing")
     return key, row["model"]
 
 
-def call_brain_result(provider: str, prompt: str, allow_web: bool = False, timeout: int = 900) -> dict[str, Any]:
+class BudgetExceeded(RuntimeError):
+    """Raised when a configured token budget blocks a paid provider call."""
+
+
+def check_budget(run_id: str | None = None) -> None:
+    daily_cap = db.get_setting_int("token_budget_daily")
+    if daily_cap > 0 and db.ledger_totals_today(paid_only=True)["total"] >= daily_cap:
+        raise BudgetExceeded(
+            f"Daily API token budget reached ({daily_cap:,}). Raise it in Settings to continue."
+        )
+    run_cap = db.get_setting_int("token_budget_run")
+    if run_cap > 0 and run_id:
+        used = json.loads((db.one("select usage_json from runs where id=?", (run_id,)) or {}).get("usage_json") or "{}")
+        brain = used.get("brain", {})
+        total = int(brain.get("total_tokens") or (int(brain.get("input_tokens", 0) or 0) + int(brain.get("output_tokens", 0) or 0)))
+        if total >= run_cap:
+            raise BudgetExceeded(
+                f"This run reached its token budget ({run_cap:,}). Raise it in Settings to continue."
+            )
+
+
+def call_brain_result(
+    provider: str, prompt: str, allow_web: bool = False, timeout: int = 900, run_id: str | None = None
+) -> dict[str, Any]:
+    check_budget(run_id)
     key, model = provider_config(provider)
     payload = {
         "provider": provider,
@@ -156,6 +178,9 @@ def call_brain_result(provider: str, prompt: str, allow_web: bool = False, timeo
         "prompt": with_caveman(prompt),
         "allow_web": allow_web,
     }
+    max_output = db.get_setting_int("max_output_tokens")
+    if max_output > 0:
+        payload["max_output_tokens"] = max_output
     payload["timeout"] = timeout
     try:
         with httpx.Client(timeout=timeout + 10) as client:
@@ -343,6 +368,25 @@ def record_usage(run_id: str, result: dict[str, Any], source: str = "ollama") ->
             bucket[key] = bucket.get(key, 0) + value
     update_run(run_id, usage_json=json.dumps(current, ensure_ascii=False))
 
+    provider = "ollama"
+    if source == "brain":
+        provider = (db.one("select brain_provider from runs where id=?", (run_id,)) or {}).get("brain_provider") or "brain"
+    inp = int(usage.get("input_tokens", usage.get("prompt_eval_count", 0)) or 0)
+    out = int(usage.get("output_tokens", usage.get("eval_count", 0)) or 0)
+    total = int(usage.get("total_tokens") or (inp + out))
+    db.record_ledger(source, provider, inp, out, total)
+
+
+def record_chat_usage(source: str, provider: str, usage: dict[str, Any] | None) -> None:
+    """Ledger-only usage recording for interactive chat (no run row)."""
+    usage = usage or {}
+    if not usage:
+        return
+    inp = int(usage.get("input_tokens", usage.get("prompt_eval_count", 0)) or 0)
+    out = int(usage.get("output_tokens", usage.get("eval_count", 0)) or 0)
+    total = int(usage.get("total_tokens") or (inp + out))
+    db.record_ledger(source, provider, inp, out, total)
+
 
 def agent_task(agent: dict[str, Any], task: str) -> str:
     prompt = str(agent.get("system_prompt") or "").strip()
@@ -415,7 +459,7 @@ def research_run(run_id: str) -> None:
             "Include architecture, exact behavior, interfaces, failure handling, tests, and acceptance criteria. "
             "Do not implement or edit files.\n\nUSER TASK:\n" + run["task"] + "\n\nWORKER DOSSIER:\n" + dossier
         )
-        brain_result = call_brain_result(run["brain_provider"], prompt, bool(run["web_research"]))
+        brain_result = call_brain_result(run["brain_provider"], prompt, bool(run["web_research"]), run_id=run_id)
         record_usage(run_id, brain_result, "brain")
         plan = brain_result["content"]
         if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
@@ -426,11 +470,10 @@ def research_run(run_id: str) -> None:
             dossier=dossier,
             draft_plan=plan,
             implementation_agent_id=implementation["id"],
-            status="plan_ready",
+            status="awaiting_approval",
         )
         save_artifact(run_id, "plan", "Supervisor plan", plan)
         db.add_event(run_id, "plan.ready", "Plan ready for approval")
-        update_run(run_id, dossier=dossier, draft_plan=plan, status="awaiting_approval")
     except Exception as exc:
         log.exception("research_failed", extra={"run_id": run_id})
         if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
@@ -552,7 +595,7 @@ def brain_verdict(run: dict[str, Any], reports: list[str]) -> tuple[bool, str]:
         "Set scope_expansion true when a required repair exceeds approved scope; otherwise repair_task must remain inside scope.\n\nPLAN:\n" + (run["approved_plan"] or "")
         + "\n\nREPORTS:\n" + "\n\n---\n\n".join(reports)
     )
-    brain_result = call_brain_result(run["brain_provider"], prompt, False)
+    brain_result = call_brain_result(run["brain_provider"], prompt, False, run_id=run["id"])
     record_usage(run["id"], brain_result, "brain")
     raw = brain_result["content"]
     cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()

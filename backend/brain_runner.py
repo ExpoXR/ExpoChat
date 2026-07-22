@@ -59,19 +59,93 @@ async def run_claude(payload: dict[str, Any]) -> dict[str, Any]:
     return {"content": result, "usage": usage}
 
 
+def run_gemini(payload: dict[str, Any]) -> dict[str, Any]:
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=payload["api_key"])
+    config_kwargs: dict[str, Any] = {}
+    if payload.get("allow_web"):
+        config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+    if payload.get("max_output_tokens"):
+        config_kwargs["max_output_tokens"] = int(payload["max_output_tokens"])
+    config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
+    response = client.models.generate_content(
+        model=payload["model"],
+        contents=payload["prompt"],
+        config=config,
+    )
+    meta = getattr(response, "usage_metadata", None)
+    usage = {
+        "input_tokens": int(getattr(meta, "prompt_token_count", 0) or 0),
+        "output_tokens": int(getattr(meta, "candidates_token_count", 0) or 0),
+        "total_tokens": int(getattr(meta, "total_token_count", 0) or 0),
+    }
+    return {"content": response.text or "", "usage": usage}
+
+
+def _emit(obj: dict[str, Any]) -> None:
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+def stream_gemini(payload: dict[str, Any]) -> None:
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=payload["api_key"])
+    config_kwargs: dict[str, Any] = {}
+    if payload.get("max_output_tokens"):
+        config_kwargs["max_output_tokens"] = int(payload["max_output_tokens"])
+    config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
+    usage: dict[str, int] = {}
+    for chunk in client.models.generate_content_stream(
+        model=payload["model"], contents=payload["prompt"], config=config
+    ):
+        text = getattr(chunk, "text", None)
+        if text:
+            _emit({"token": text})
+        meta = getattr(chunk, "usage_metadata", None)
+        if meta:
+            usage = {
+                "input_tokens": int(getattr(meta, "prompt_token_count", 0) or 0),
+                "output_tokens": int(getattr(meta, "candidates_token_count", 0) or 0),
+                "total_tokens": int(getattr(meta, "total_token_count", 0) or 0),
+            }
+    _emit({"done": True, "usage": usage})
+
+
+def run_streaming(payload: dict[str, Any]) -> None:
+    """Streaming chat mode. Real token streaming for Gemini; buffered single-chunk
+    fallback for Codex/Claude so all linked brains work as cloud chat models."""
+    provider = payload["provider"]
+    if provider == "gemini":
+        stream_gemini(payload)
+        return
+    result = run_codex(payload) if provider == "codex" else asyncio.run(run_claude(payload))
+    _emit({"token": result.get("content", "")})
+    _emit({"done": True, "usage": result.get("usage") or {}})
+
+
 def main() -> None:
     payload = json.loads(sys.stdin.read())
+    streaming = bool(payload.get("stream"))
     try:
         provider = payload["provider"]
+        if provider not in {"codex", "claude", "gemini"}:
+            raise ValueError("Unsupported brain provider")
+        if streaming:
+            run_streaming(payload)
+            return
         if provider == "codex":
             result = run_codex(payload)
         elif provider == "claude":
             result = asyncio.run(run_claude(payload))
         else:
-            raise ValueError("Unsupported brain provider")
-        print(json.dumps({"ok": True, **result}, ensure_ascii=False))
+            result = run_gemini(payload)
+        _emit({"ok": True, **result})
     except Exception as exc:
-        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
+        error = {"error": f"{type(exc).__name__}: {exc}"}
+        _emit({**error, "done": True} if streaming else {"ok": False, **error})
         raise SystemExit(1) from exc
 
 

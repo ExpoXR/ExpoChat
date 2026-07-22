@@ -1,5 +1,6 @@
 import json
 import os
+import secrets
 import sqlite3
 import sys
 import time
@@ -118,6 +119,184 @@ def test_codex_runner_applies_api_key_before_starting_thread(monkeypatch):
         ("start", "gpt-test", "read-only", os.environ.get("HOME"), True, {"web_search": "live"}),
         ("run", "ping"),
     ]
+
+
+def test_gemini_runner_maps_usage_and_wires_web_search(monkeypatch):
+    calls = {}
+
+    class FakeModels:
+        def generate_content(self, *, model, contents, config):
+            calls.update(model=model, contents=contents, config=config)
+            meta = SimpleNamespace(prompt_token_count=5, candidates_token_count=7, total_token_count=12)
+            return SimpleNamespace(text="OK", usage_metadata=meta)
+
+    class FakeClient:
+        def __init__(self, api_key):
+            calls["api_key"] = api_key
+            self.models = FakeModels()
+
+    fake_types = SimpleNamespace(
+        GenerateContentConfig=lambda **kw: ("config", kw),
+        Tool=lambda **kw: ("tool", kw),
+        GoogleSearch=lambda: "search",
+    )
+    fake_genai = SimpleNamespace(Client=FakeClient, types=fake_types)
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=fake_genai))
+    monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
+    monkeypatch.setitem(sys.modules, "google.genai.types", fake_types)
+
+    result = brain_runner.run_gemini(
+        {"api_key": "gk", "model": "gemini-x", "prompt": "ping", "allow_web": True}
+    )
+
+    assert result == {"content": "OK", "usage": {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}}
+    assert calls["api_key"] == "gk"
+    assert calls["model"] == "gemini-x"
+    # allow_web wires a google_search tool into the generate config
+    assert calls["config"][0] == "config"
+    assert "tools" in calls["config"][1]
+
+
+def test_gemini_provider_config_uses_stored_key():
+    db.init_db()
+    db.execute(
+        "insert into brain_configs(provider,model,key_ciphertext,source,enabled,updated_at) "
+        "values(?,?,?,?,?,?) on conflict(provider) do update set "
+        "model=excluded.model,key_ciphertext=excluded.key_ciphertext,source=excluded.source,enabled=excluded.enabled",
+        ("gemini", "gemini-2.5-pro", encrypt_secret("gk-123"), "stored", 1, db.utcnow()),
+    )
+    key, model = orchestrator.provider_config("gemini")
+    assert key == "gk-123"
+    assert model == "gemini-2.5-pro"
+
+
+def test_migration_widens_brain_check_to_gemini():
+    from backend.migrations import _brain_gemini
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        "create table brain_configs ("
+        " provider text primary key check(provider in ('codex','claude')),"
+        " model text not null, key_ciphertext text, source text not null default 'environment',"
+        " enabled integer not null default 0, validated_at text, last_error text, updated_at text not null);"
+        "insert into brain_configs(provider,model,source,enabled,updated_at)"
+        " values('codex','gpt-x','environment',1,'t0');"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("insert into brain_configs(provider,model,source,enabled,updated_at) values('gemini','g','e',1,'t')")
+
+    _brain_gemini(conn)  # upgrade path
+    _brain_gemini(conn)  # idempotent
+
+    assert conn.execute("select model from brain_configs where provider='codex'").fetchone()[0] == "gpt-x"
+    conn.execute("insert into brain_configs(provider,model,source,enabled,updated_at) values('gemini','g','environment',1,'t')")
+    assert {r[0] for r in conn.execute("select provider from brain_configs")} == {"codex", "gemini"}
+
+
+def test_stream_gemini_emits_incremental_tokens(monkeypatch, capsys):
+    class FakeChunk:
+        def __init__(self, text, meta=None):
+            self.text = text
+            self.usage_metadata = meta
+
+    class FakeModels:
+        def generate_content_stream(self, *, model, contents, config):
+            yield FakeChunk("Hel")
+            yield FakeChunk("lo", SimpleNamespace(prompt_token_count=2, candidates_token_count=1, total_token_count=3))
+
+    class FakeClient:
+        def __init__(self, api_key):
+            self.models = FakeModels()
+
+    fake_types = SimpleNamespace(GenerateContentConfig=lambda **kw: ("cfg", kw))
+    fake_genai = SimpleNamespace(Client=FakeClient, types=fake_types)
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=fake_genai))
+    monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
+    monkeypatch.setitem(sys.modules, "google.genai.types", fake_types)
+
+    brain_runner.stream_gemini({"api_key": "k", "model": "m", "prompt": "hi"})
+    lines = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+    assert lines[0] == {"token": "Hel"}
+    assert lines[1] == {"token": "lo"}
+    assert lines[-1]["done"] is True
+    assert lines[-1]["usage"]["total_tokens"] == 3
+
+
+def test_run_streaming_buffered_fallback_emits_token_then_done(monkeypatch, capsys):
+    monkeypatch.setattr(brain_runner, "run_codex", lambda payload: {"content": "hello", "usage": {"total_tokens": 4}})
+    brain_runner.run_streaming({"provider": "codex", "api_key": "k", "model": "m", "prompt": "p"})
+    lines = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+    assert lines[0] == {"token": "hello"}
+    assert lines[-1] == {"done": True, "usage": {"total_tokens": 4}}
+
+
+def test_record_chat_usage_writes_paid_ledger():
+    db.init_db()
+    db.execute("delete from usage_ledger")
+    orchestrator.record_chat_usage("chat", "gemini", {"input_tokens": 3, "output_tokens": 2})
+    assert db.ledger_totals_today(paid_only=True)["total"] == 5
+
+
+def test_settings_round_trip_and_defaults():
+    db.init_db()
+    db.execute("delete from app_settings where key='token_budget_daily'")
+    assert db.get_setting_int("token_budget_daily") == 0  # falls back to default
+    db.set_setting("token_budget_daily", 5000)
+    db.set_setting("theme", "light")
+    assert db.get_setting_int("token_budget_daily") == 5000
+    settings_map = db.all_settings()
+    assert settings_map["theme"] == "light"
+    assert settings_map["token_budget_daily"] == "5000"
+
+
+def test_record_usage_writes_paid_and_local_ledger_rows():
+    db.init_db()
+    db.execute("delete from usage_ledger")
+    run_id = "run-ledger-" + secrets.token_hex(4)
+    db.execute(
+        "insert into runs(id,task,brain_provider,brain_model,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?)",
+        (run_id, "t", "gemini", "gemini-2.5-pro", "/x", "researching", db.utcnow(), db.utcnow()),
+    )
+    orchestrator.record_usage(run_id, {"usage": {"input_tokens": 100, "output_tokens": 40, "total_tokens": 140}}, "brain")
+    orchestrator.record_usage(run_id, {"usage": {"prompt_eval_count": 10, "eval_count": 5}}, "ollama")
+
+    paid = db.ledger_totals_today(paid_only=True)
+    everything = db.ledger_totals_today(paid_only=False)
+    assert paid["total"] == 140  # ollama excluded from paid budget
+    assert everything["total"] == 140 + 15
+    providers = {row["provider"] for row in db.ledger_by_provider_today()}
+    assert {"gemini", "ollama"} <= providers
+
+
+def test_check_budget_blocks_over_daily_cap():
+    db.init_db()
+    db.execute("delete from usage_ledger")
+    db.set_setting("token_budget_daily", "0")
+    orchestrator.check_budget()  # unlimited: no raise
+    db.record_ledger("brain", "gemini", 600, 400, 1000)
+    db.set_setting("token_budget_daily", "800")
+    with pytest.raises(orchestrator.BudgetExceeded):
+        orchestrator.check_budget()
+    db.set_setting("token_budget_daily", "5000")
+    orchestrator.check_budget()  # under cap: no raise
+
+
+def test_check_budget_blocks_over_run_cap():
+    db.init_db()
+    db.execute("delete from usage_ledger")
+    db.set_setting("token_budget_daily", "0")
+    db.set_setting("token_budget_run", "500")
+    run_id = "run-cap-" + secrets.token_hex(4)
+    db.execute(
+        "insert into runs(id,task,brain_provider,brain_model,target_path,status,usage_json,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?,?)",
+        (run_id, "t", "claude", "m", "/x", "researching", json.dumps({"brain": {"total_tokens": 700}}), db.utcnow(), db.utcnow()),
+    )
+    with pytest.raises(orchestrator.BudgetExceeded):
+        orchestrator.check_budget(run_id)
+    db.set_setting("token_budget_run", "0")
+    orchestrator.check_budget(run_id)  # unlimited: no raise
 
 
 def test_caveman_prompt_applies_to_brain_and_ollama(monkeypatch):

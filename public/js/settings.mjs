@@ -19,6 +19,12 @@ export const BRAIN_MODELS = {
     { value: "claude-opus-4-6", label: "Claude Opus 4.6" },
     { value: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
   ],
+  gemini: [
+    { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+    { value: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite" },
+    { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
+  ],
 };
 
 export function modelOptions(provider, current = "") {
@@ -34,7 +40,7 @@ export function modelLabel(provider, model) {
 }
 
 export function providerOptions(brains) {
-  const labels = { codex: "ChatGPT", claude: "Claude" };
+  const labels = { codex: "ChatGPT", claude: "Claude", gemini: "Gemini" };
   return brains
     .filter((brain) => brain.enabled && brain.linked)
     .map((brain) => ({

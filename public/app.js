@@ -1,8 +1,9 @@
 import { createApi } from "/js/api.mjs";
-import { buildChatPayload, chatEventStatus } from "/js/chat.mjs";
+import { buildChatPayload, chatAgentStep, chatEventStatus, cloudEngineValue } from "/js/chat.mjs";
 import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMarkdown } from "/js/render.mjs";
-import { artifactPresentation, explorerActivityState, fileActivity, runStatusLabel, tokenCounts } from "/js/runs.mjs";
+import { artifactPresentation, explorerActivityState, fileActivity, runChoreography, runStatusLabel, tokenCounts } from "/js/runs.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
+import { buildSettingsPayload, usageMeter } from "/js/settings_api.mjs";
 import { consumeSse } from "/js/sse.mjs";
 import { readPreferences, writePreferences } from "/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "/js/workspace.mjs";
@@ -19,8 +20,6 @@ let chats = [];
 let currentChat = null;
 let currentFile = null;
 let pinnedContextPaths = [];
-let claudeEnabled = false;
-let openaiEnabled = false;
 let allowedRoots = [];
 let csrfToken = "";
 let runs = [];
@@ -199,7 +198,7 @@ function switchEditor(id) {
 // Message rendering
 // ---------------------------------------------------------------------------
 
-function addMessageNode(role) {
+function addMessageNode(role, labelText) {
   // Remove stream cursor if it was floating
   const cursor = $("streamCursor");
   if (cursor && cursor.parentElement === $("messages")) {
@@ -210,7 +209,7 @@ function addMessageNode(role) {
   node.className = `msg ${role}`;
   const label = document.createElement("div");
   label.className = "role";
-  label.textContent = role === "assistant" ? "ollama" : role;
+  label.textContent = labelText || (role === "assistant" ? "assistant" : role);
   const body = document.createElement("div");
   body.className = "msg-body";
   node.append(label, body);
@@ -233,6 +232,33 @@ function addMessage(role, content) {
   const node = addMessageNode(role);
   renderMessageContent(node, content);
   return node;
+}
+
+// Render/update an inline agent choreography card inside an assistant message.
+function renderAgentStep(node, step) {
+  if (!step) return;
+  let strip = node.querySelector(".agent-strip");
+  if (!strip) {
+    strip = document.createElement("div");
+    strip.className = "agent-strip";
+    node.querySelector(".msg-body").before(strip);
+  }
+  let card = strip.querySelector(`[data-actor="${step.actor}"]`);
+  if (!card) {
+    card = document.createElement("div");
+    card.className = "agent-card";
+    card.dataset.actor = step.actor;
+    strip.appendChild(card);
+  }
+  const active = step.state === "planning" || step.state === "working";
+  card.classList.toggle("active", active);
+  card.classList.toggle("done", step.state === "done");
+  const planHtml = step.text ? `<details class="agent-plan"><summary>Plan</summary><div>${renderMarkdown(step.text)}</div></details>` : "";
+  card.innerHTML =
+    `<div class="agent-head"><span class="agent-dot"></span>` +
+    `<span class="agent-name">${escapeHtml(step.title)}</span>` +
+    `<span class="agent-state">${escapeHtml(step.label)}</span></div>${planHtml}`;
+  $("messages").scrollTop = $("messages").scrollHeight;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,17 +333,38 @@ async function deleteChat(chat) {
 async function loadModels() {
   const data = await api("/api/models");
   models = data.models || [];
+  renderChatEngines();
+}
+
+// Rebuild the chat engine picker: local Ollama models + linked cloud brains.
+function renderChatEngines() {
   const sel = $("modelSelect");
   const prev = sel.value || loadPrefs().model;
   sel.innerHTML = "";
+  const localGroup = document.createElement("optgroup");
+  localGroup.label = "Local (Ollama)";
   models.forEach((m) => {
     const opt = document.createElement("option");
     opt.value = m.name || m.model;
     opt.textContent = m.name || m.model;
-    sel.appendChild(opt);
+    localGroup.appendChild(opt);
   });
-  if (prev && models.find((m) => (m.name || m.model) === prev)) sel.value = prev;
-  $("ollamaStatus").textContent = sel.value || "no model";
+  sel.appendChild(localGroup);
+
+  const cloud = providerOptions(brains || []);
+  if (cloud.length) {
+    const cloudGroup = document.createElement("optgroup");
+    cloudGroup.label = "Cloud (API)";
+    cloud.forEach((provider) => {
+      const opt = document.createElement("option");
+      opt.value = cloudEngineValue(provider.value);
+      opt.textContent = provider.label;
+      cloudGroup.appendChild(opt);
+    });
+    sel.appendChild(cloudGroup);
+  }
+  if (prev && [...sel.options].some((opt) => opt.value === prev)) sel.value = prev;
+  $("ollamaStatus").textContent = (sel.value || "no model").replace(/^cloud:/, "");
 }
 
 async function loadChats(append = false) {
@@ -418,7 +465,10 @@ async function sendPrompt(event) {
   setStatus("Thinking…");
   setBusy(["sendBtn", "prompt"], true);
 
-  const node = addMessageNode("assistant");
+  const engineLabel = $("agentModeToggle").checked
+    ? "agents"
+    : ($("modelSelect").selectedOptions[0]?.textContent || "assistant");
+  const node = addMessageNode("assistant", engineLabel);
   show("streamCursor");
 
   let fullText = "";
@@ -435,6 +485,7 @@ async function sendPrompt(event) {
         $("modelSelect").value,
         $("targetPath").value.trim(),
         pinnedContextPaths,
+        { agentMode: $("agentModeToggle").checked, brainProvider: $("chatBrainSelect").value },
       )),
     });
 
@@ -454,6 +505,14 @@ async function sendPrompt(event) {
       buf = parsedFrames.remainder;
       for (const frame of parsedFrames.events) {
         const parsed = frame.data;
+        if (frame.event === "agent") {
+          const step = chatAgentStep(parsed);
+          if (step) {
+            renderAgentStep(node, step);
+            setStatus(`${step.title} — ${step.label}`);
+          }
+          continue;
+        }
         if (parsed.done) {
           if (parsed.workspace) setWorkspaceTag(parsed.workspace);
           continue;
@@ -1133,7 +1192,24 @@ function renderCurrentRun(run) {
   setStatus(runStatusLabel(run));
 }
 
+function renderRunChoreography(run, events) {
+  const lane = $("runChoreography");
+  if (!lane) return;
+  const steps = runChoreography(run || {}, events || []);
+  lane.innerHTML = steps.map((step, index) => {
+    const cls = { working: "active", done: "done", error: "error" }[step.state] || "";
+    const arrow = index < steps.length - 1 ? '<span class="agent-arrow">→</span>' : "";
+    return (
+      `<div class="agent-card ${cls}" data-actor="${step.role}">` +
+      `<div class="agent-head"><span class="agent-dot"></span>` +
+      `<span class="agent-name">${escapeHtml(step.title)}</span>` +
+      `<span class="agent-state">${escapeHtml(step.label)}</span></div></div>${arrow}`
+    );
+  }).join("");
+}
+
 function renderRunEvents(events) {
+  renderRunChoreography(currentRunData, events);
   const list = $("runEventList");
   list.innerHTML = "";
   (events || []).forEach((event) => {
@@ -1248,7 +1324,8 @@ async function loadBrains() {
   const data = await api("/api/brains");
   brains = data.brains || [];
   brains.forEach((brain) => {
-    const prefix = brain.provider === "codex" ? "codex" : "claude";
+    const prefix = brain.provider;
+    if (!$(`${prefix}Model`)) return; // provider has no card in the current view
     populateModelSelect(brain.provider, brain.model);
     $(`${prefix}Model`).value = brain.model;
     const linked = Boolean(brain.enabled && brain.linked && !brain.last_error);
@@ -1256,16 +1333,20 @@ async function loadBrains() {
       ? `Linked via ${brain.source}${brain.validated_at ? " · validated" : ""}${brain.last_error ? " · " + brain.last_error : ""}`
       : brain.last_error || "Not linked";
     $(`${prefix}State`).classList.toggle("linked", linked);
-    const indicator = brain.provider === "codex" ? $("openaiIndicator") : $("claudeIndicator");
-    indicator.textContent = `${modelLabel(brain.provider, brain.model)} ${linked ? "✓" : "!"}`;
-    indicator.classList.toggle("linked", linked);
-    indicator.classList.toggle("hidden", !brain.enabled && !brain.linked);
+    const indicator = $(BRAIN_INDICATORS[brain.provider]);
+    if (indicator) {
+      indicator.textContent = `${modelLabel(brain.provider, brain.model)} ${linked ? "✓" : "!"}`;
+      indicator.classList.toggle("linked", linked);
+      indicator.classList.toggle("hidden", !brain.enabled && !brain.linked);
+    }
   });
   syncProviderOptions();
 }
 
+const BRAIN_INDICATORS = { codex: "openaiIndicator", claude: "claudeIndicator", gemini: "geminiIndicator" };
+
 function populateModelSelect(provider, current = "") {
-  const select = $(provider === "codex" ? "codexModel" : "claudeModel");
+  const select = $(`${provider}Model`);
   const selected = current || select.value;
   select.innerHTML = "";
   modelOptions(provider, selected).forEach((model) => {
@@ -1296,10 +1377,25 @@ function syncProviderOptions() {
   } else if (enabled.some((provider) => provider.value === selected)) {
     select.value = selected;
   }
+
+  // Reflect linked providers into the chat engine picker + Agent Mode brain select.
+  renderChatEngines();
+  const brainSelect = $("chatBrainSelect");
+  if (brainSelect) {
+    const prev = brainSelect.value;
+    brainSelect.innerHTML = "";
+    enabled.forEach((provider) => {
+      const option = document.createElement("option");
+      option.value = provider.value;
+      option.textContent = provider.label;
+      brainSelect.appendChild(option);
+    });
+    if (enabled.some((provider) => provider.value === prev)) brainSelect.value = prev;
+  }
 }
 
 async function saveBrain(provider) {
-  const prefix = provider === "codex" ? "codex" : "claude";
+  const prefix = provider;
   try {
     await api("/api/brains", {
       method: "PUT",
@@ -1312,7 +1408,7 @@ async function saveBrain(provider) {
 }
 
 async function disconnectBrain(provider) {
-  const prefix = provider === "codex" ? "codex" : "claude";
+  const prefix = provider;
   try {
     await api("/api/brains", {
       method: "PUT",
@@ -1328,6 +1424,56 @@ async function testBrain(provider) {
     await api(`/api/brains/${provider}/validate`, { method: "POST", body: "{}" });
     await loadBrains();
     showToast(`${provider} validation passed`, "success");
+  } catch (err) { showToast(err.message, "error"); }
+}
+
+let appSettings = { theme: "dark", agent_mode_default: false };
+let agentModeTouched = false;
+
+function applyTheme(theme) {
+  const resolved = theme === "auto"
+    ? (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
+    : theme;
+  document.documentElement.setAttribute("data-theme", resolved);
+}
+
+async function loadSettings() {
+  try {
+    appSettings = await api("/api/settings");
+    $("budgetDaily").value = appSettings.token_budget_daily || 0;
+    $("budgetRun").value = appSettings.token_budget_run || 0;
+    $("maxOutputTokens").value = appSettings.max_output_tokens || 0;
+    $("themeSelect").value = appSettings.theme || "dark";
+    $("agentModeDefault").checked = Boolean(appSettings.agent_mode_default);
+    applyTheme(appSettings.theme || "dark");
+    if (!agentModeTouched) {
+      $("agentModeToggle").checked = Boolean(appSettings.agent_mode_default);
+      $("chatBrainSelect").classList.toggle("hidden", !$("agentModeToggle").checked);
+    }
+  } catch (_) {}
+  await loadUsage();
+}
+
+async function loadUsage() {
+  try {
+    const usage = await api("/api/usage");
+    const meter = usageMeter(usage);
+    $("usageMeterText").textContent = meter.label;
+    $("usageMeterFill").style.width = meter.unlimited ? "0%" : `${meter.pct}%`;
+    $("usageMeterFill").classList.toggle("over", meter.over);
+    const parts = (usage.by_provider || [])
+      .filter((row) => row.total > 0)
+      .map((row) => `${row.provider}: ${Number(row.total).toLocaleString()}`);
+    $("usageMeterBreakdown").textContent = parts.length ? parts.join(" · ") : "No usage recorded today.";
+  } catch (_) {}
+}
+
+async function saveSettings(values, message) {
+  try {
+    appSettings = await api("/api/settings", { method: "PUT", body: JSON.stringify(buildSettingsPayload(values)) });
+    applyTheme(appSettings.theme || "dark");
+    await loadUsage();
+    showToast(message, "success");
   } catch (err) { showToast(err.message, "error"); }
 }
 
@@ -1444,30 +1590,30 @@ async function boot() {
   // Config — know which AI providers are available
   try {
     const cfg = await api("/api/config");
-    claudeEnabled = cfg.claude_enabled;
-    openaiEnabled = cfg.openai_enabled;
     allowedRoots  = cfg.allowed_roots || [];
 
-    if (claudeEnabled) show("claudeIndicator");
-    if (openaiEnabled) show("openaiIndicator");
-
-    // Populate plan provider selector based on what's enabled
+    // Populate plan provider selector based on what's enabled (loadBrains re-syncs later)
+    const providerList = [
+      { key: "codex", enabled: cfg.openai_enabled, label: "Codex (OpenAI)", indicator: "openaiIndicator" },
+      { key: "claude", enabled: cfg.claude_enabled, label: "Claude (Anthropic)", indicator: "claudeIndicator" },
+      { key: "gemini", enabled: cfg.gemini_enabled, label: "Gemini (Google)", indicator: "geminiIndicator" },
+    ];
     const provSel = $("planProvider");
     provSel.innerHTML = "";
-    if (claudeEnabled) {
-      const o = document.createElement("option");
-      o.value = "claude"; o.textContent = "Claude (Anthropic)";
-      provSel.appendChild(o);
-    }
-    if (openaiEnabled) {
-      const o = document.createElement("option");
-      o.value = "codex"; o.textContent = "Codex (OpenAI)";
-      provSel.appendChild(o);
-    }
-    if (!claudeEnabled && !openaiEnabled) {
-      const o = document.createElement("option");
-      o.value = ""; o.textContent = "No AI provider configured";
-      provSel.appendChild(o);
+    let anyProvider = false;
+    providerList.forEach((provider) => {
+      if (!provider.enabled) return;
+      anyProvider = true;
+      show(provider.indicator);
+      const option = document.createElement("option");
+      option.value = provider.key;
+      option.textContent = provider.label;
+      provSel.appendChild(option);
+    });
+    if (!anyProvider) {
+      const option = document.createElement("option");
+      option.value = ""; option.textContent = "No AI provider configured";
+      provSel.appendChild(option);
     }
   } catch (_) {}
 
@@ -1488,7 +1634,7 @@ async function boot() {
     showToast("Ollama models unavailable: " + err.message, "error");
   }
   await loadChats();
-  await Promise.allSettled([loadRuns(), loadBrains(), loadAgents()]);
+  await Promise.allSettled([loadRuns(), loadBrains(), loadAgents(), loadSettings()]);
 
   if (prefs.chat && chats.find((c) => c.id === prefs.chat)) {
     await loadChat(prefs.chat);
@@ -1519,6 +1665,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Chat
   $("chatForm").onsubmit = sendPrompt;
+  $("agentModeToggle").onchange = () => {
+    agentModeTouched = true;
+    $("chatBrainSelect").classList.toggle("hidden", !$("agentModeToggle").checked);
+  };
   $("newChatBtn").onclick      = newChat;
   $("saveNewChatBtn").onclick  = saveAndNewChat;
   $("applyCodeBtn").onclick = applyLastCodeBlock;
@@ -1626,6 +1776,19 @@ document.addEventListener("DOMContentLoaded", () => {
   $("saveClaudeBtn").onclick = () => saveBrain("claude");
   $("testClaudeBtn").onclick = () => testBrain("claude");
   $("disconnectClaudeBtn").onclick = () => disconnectBrain("claude");
+  $("saveGeminiBtn").onclick = () => saveBrain("gemini");
+  $("testGeminiBtn").onclick = () => testBrain("gemini");
+  $("disconnectGeminiBtn").onclick = () => disconnectBrain("gemini");
+  $("saveBudgetBtn").onclick = () => saveSettings({
+    token_budget_daily: $("budgetDaily").value,
+    token_budget_run: $("budgetRun").value,
+    max_output_tokens: $("maxOutputTokens").value,
+  }, "Limits saved");
+  $("refreshUsageBtn").onclick = () => loadUsage();
+  $("saveAppearanceBtn").onclick = () => saveSettings({
+    theme: $("themeSelect").value,
+    agent_mode_default: $("agentModeDefault").checked,
+  }, "Appearance saved");
   $("discoverAgentsBtn").onclick = discoverAgentModels;
 
   // Activity bar — switches sidebar pane (plan button toggles the plan panel on mobile)
@@ -1636,12 +1799,12 @@ document.addEventListener("DOMContentLoaded", () => {
   $("activitySnaps").onclick    = () => { switchSidePane("snaps");    loadSnaps();    };
   $("activityTimeline").onclick = () => { switchSidePane("timeline"); loadTimeline(); };
   $("activityPlan").onclick     = () => { document.querySelector(".panel-area").classList.toggle("open"); syncDrawerState(); };
-  $("activitySettings").onclick = () => { switchSidePane("settings"); loadBrains(); loadAgents(); };
+  $("activitySettings").onclick = () => { switchSidePane("settings"); loadBrains(); loadAgents(); loadSettings(); };
   $("activityMore").onclick = () => switchSidePane("more");
   $("moreToolsBtn").onclick = () => switchSidePane("tools");
   $("moreSnapsBtn").onclick = () => { switchSidePane("snaps"); loadSnaps(); };
   $("moreTimelineBtn").onclick = () => { switchSidePane("timeline"); loadTimeline(); };
-  $("moreSettingsBtn").onclick = () => { switchSidePane("settings"); loadBrains(); loadAgents(); };
+  $("moreSettingsBtn").onclick = () => { switchSidePane("settings"); loadBrains(); loadAgents(); loadSettings(); };
 
   // Editor tabs
   document.querySelectorAll(".editor-tab").forEach((tab) => {
