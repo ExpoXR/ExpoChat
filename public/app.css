@@ -15,6 +15,42 @@
   --danger: #f48771;
   --input: #3c3c3c;
   --status: #007acc;
+  --surface-raised: #1b1b1b;
+  --msg-user: #1f2a33;
+}
+
+/* Light theme — the toggle stamps data-theme; applyTheme() resolves "auto".
+   Code/terminal/token tiles keep their dark surfaces on purpose (their
+   syntax/light-on-dark text stays readable and needs no re-theming). */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --title: #dcdcdc;
+  --activity: #e4e4e4;
+  --side: #f3f3f3;
+  --editor: #ffffff;
+  --panel: #f6f6f6;
+  --tab: #ececec;
+  --line: #cfcfcf;
+  --line-soft: #e4e4e4;
+  --text: #1f1f1f;
+  --muted: #5f5f5f;
+  --accent: #0066b8;
+  --accent-strong: #0e639c;
+  --danger: #c72e2e;
+  --input: #ffffff;
+  --status: #0066b8;
+  --surface-raised: #eef0f2;
+  --msg-user: #dbeafe;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --title: #dcdcdc; --activity: #e4e4e4; --side: #f3f3f3; --editor: #ffffff;
+    --panel: #f6f6f6; --tab: #ececec; --line: #cfcfcf; --line-soft: #e4e4e4;
+    --text: #1f1f1f; --muted: #5f5f5f; --accent: #0066b8; --status: #0066b8;
+    --input: #ffffff; --surface-raised: #eef0f2; --msg-user: #dbeafe;
+  }
 }
 
 * {
@@ -212,7 +248,7 @@ textarea {
   display: grid;
   align-content: start;
   background: var(--activity);
-  border-right: 1px solid #202020;
+  border-right: 1px solid var(--surface-raised);
 }
 
 .activity {
@@ -338,7 +374,7 @@ label {
 
 .tabs-row {
   overflow: auto hidden;
-  background: #252526;
+  background: var(--side);
   border-bottom: 1px solid #000;
 }
 
@@ -346,7 +382,7 @@ label {
   min-width: 130px;
   height: 35px;
   border: 0;
-  border-right: 1px solid #1b1b1b;
+  border-right: 1px solid var(--surface-raised);
   border-radius: 0;
   background: var(--tab);
   color: #aaa;
@@ -436,14 +472,14 @@ label {
   margin: 0 0 12px;
   border-left: 2px solid #555;
   padding: 8px 10px;
-  background: #252526;
+  background: var(--side);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
 .msg.user {
   border-left-color: var(--accent);
-  background: #1f2a33;
+  background: var(--msg-user);
 }
 
 .msg.error {
@@ -473,6 +509,19 @@ label {
   text-transform: uppercase;
 }
 
+.msg .role::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  vertical-align: middle;
+}
+.msg.user .role::before { background: var(--accent); }
+.msg.assistant .role::before { background: #b58900; }
+
 .composer {
   display: flex;
   flex-direction: column;
@@ -501,7 +550,7 @@ label {
 .composer textarea {
   min-height: 58px;
   max-height: 160px;
-  background: #1e1e1e;
+  background: var(--editor);
 }
 
 /* Agent choreography — inline cards inside an assistant message */
@@ -518,7 +567,7 @@ label {
   border-left: 3px solid var(--line);
   border-radius: 6px;
   padding: 7px 10px;
-  background: #1b1b1b;
+  background: var(--surface-raised);
 }
 .agent-card[data-actor="brain"] { border-left-color: var(--accent); }
 .agent-card[data-actor="worker"] { border-left-color: #b58900; }
@@ -548,6 +597,30 @@ label {
   100% { box-shadow: 0 0 0 0 rgba(0, 122, 204, 0); }
 }
 
+/* Run choreography lane — Brain → Worker → Verifier */
+.agent-lane {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 10px;
+}
+.agent-lane .agent-card { flex: 1 1 140px; margin: 0; }
+.agent-lane .agent-arrow {
+  display: flex;
+  align-items: center;
+  color: var(--muted);
+  font-size: 14px;
+}
+.agent-card[data-actor="verifier"] { border-left-color: #76c47c; }
+.agent-card[data-actor="verifier"].active .agent-dot {
+  background: #76c47c;
+  box-shadow: 0 0 0 0 rgba(118, 196, 124, 0.6);
+}
+.agent-card.error { border-left-color: var(--danger); }
+.agent-card.error .agent-dot { background: var(--danger); animation: none; }
+.agent-card.idle { opacity: 0.6; }
+
 /* -----------------------------------------------------------------------
    Terminal — under the chat
 ----------------------------------------------------------------------- */
@@ -564,7 +637,7 @@ label {
   padding: 3px 10px;
   border: 0;
   border-radius: 0;
-  background: #252526;
+  background: var(--side);
   color: #999;
   font-size: 11px;
   text-transform: uppercase;
@@ -590,7 +663,7 @@ label {
   gap: 6px;
   padding: 6px 8px;
   border-bottom: 1px solid var(--line);
-  background: #1e1e1e;
+  background: var(--editor);
 }
 
 .term-input-row textarea {
@@ -621,7 +694,7 @@ label {
   justify-content: space-between;
   gap: 10px;
   padding: 0 10px;
-  background: #252526;
+  background: var(--side);
   border-bottom: 1px solid #000;
   flex-shrink: 0;
 }
@@ -1446,7 +1519,7 @@ pre {
   gap: 3px;
   padding: 8px;
   border-bottom: 1px solid var(--line-soft);
-  background: #202020;
+  background: var(--surface-raised);
 }
 
 .agent-row span,
@@ -1596,3 +1669,20 @@ pre {
 .context-item:disabled { color: var(--muted); cursor: default; }
 .context-item.danger { color: var(--danger); }
 .context-item.danger:hover:not(:disabled) { background: #5a1d13; color: #ffd7cd; }
+
+/* -----------------------------------------------------------------------
+   Light-theme overrides for interactive chrome that otherwise hardcodes
+   dark hovers/active states (surfaces already theme via variables).
+----------------------------------------------------------------------- */
+:root[data-theme="light"] .activity { color: #6a6a6a; }
+:root[data-theme="light"] .activity:hover { color: #1f1f1f; }
+:root[data-theme="light"] .activity.active { border-left-color: var(--accent); color: var(--accent); }
+:root[data-theme="light"] .section-title { color: #4a4a4a; }
+:root[data-theme="light"] button:hover { background: #e2e2e2; }
+:root[data-theme="light"] .item:hover { background: #e8e8e8; }
+:root[data-theme="light"] .item.active { background: #d6e4f0; color: #0a0a0a; }
+:root[data-theme="light"] .command-center { background: #ffffff; border-color: var(--line); color: #4a4a4a; }
+:root[data-theme="light"] .window-dots span { background: #c4c4c4; }
+:root[data-theme="light"] .titlebar,
+:root[data-theme="light"] .tabs-row { border-bottom-color: var(--line); }
+:root[data-theme="light"] :focus-visible { outline-color: var(--accent); }

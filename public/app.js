@@ -1,7 +1,7 @@
 import { createApi } from "/js/api.mjs";
 import { buildChatPayload, chatAgentStep, chatEventStatus, cloudEngineValue } from "/js/chat.mjs";
 import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMarkdown } from "/js/render.mjs";
-import { artifactPresentation, explorerActivityState, fileActivity, runStatusLabel, tokenCounts } from "/js/runs.mjs";
+import { artifactPresentation, explorerActivityState, fileActivity, runChoreography, runStatusLabel, tokenCounts } from "/js/runs.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
 import { buildSettingsPayload, usageMeter } from "/js/settings_api.mjs";
 import { consumeSse } from "/js/sse.mjs";
@@ -198,7 +198,7 @@ function switchEditor(id) {
 // Message rendering
 // ---------------------------------------------------------------------------
 
-function addMessageNode(role) {
+function addMessageNode(role, labelText) {
   // Remove stream cursor if it was floating
   const cursor = $("streamCursor");
   if (cursor && cursor.parentElement === $("messages")) {
@@ -209,7 +209,7 @@ function addMessageNode(role) {
   node.className = `msg ${role}`;
   const label = document.createElement("div");
   label.className = "role";
-  label.textContent = role === "assistant" ? "ollama" : role;
+  label.textContent = labelText || (role === "assistant" ? "assistant" : role);
   const body = document.createElement("div");
   body.className = "msg-body";
   node.append(label, body);
@@ -465,7 +465,10 @@ async function sendPrompt(event) {
   setStatus("Thinking…");
   setBusy(["sendBtn", "prompt"], true);
 
-  const node = addMessageNode("assistant");
+  const engineLabel = $("agentModeToggle").checked
+    ? "agents"
+    : ($("modelSelect").selectedOptions[0]?.textContent || "assistant");
+  const node = addMessageNode("assistant", engineLabel);
   show("streamCursor");
 
   let fullText = "";
@@ -1189,7 +1192,24 @@ function renderCurrentRun(run) {
   setStatus(runStatusLabel(run));
 }
 
+function renderRunChoreography(run, events) {
+  const lane = $("runChoreography");
+  if (!lane) return;
+  const steps = runChoreography(run || {}, events || []);
+  lane.innerHTML = steps.map((step, index) => {
+    const cls = { working: "active", done: "done", error: "error" }[step.state] || "";
+    const arrow = index < steps.length - 1 ? '<span class="agent-arrow">→</span>' : "";
+    return (
+      `<div class="agent-card ${cls}" data-actor="${step.role}">` +
+      `<div class="agent-head"><span class="agent-dot"></span>` +
+      `<span class="agent-name">${escapeHtml(step.title)}</span>` +
+      `<span class="agent-state">${escapeHtml(step.label)}</span></div></div>${arrow}`
+    );
+  }).join("");
+}
+
 function renderRunEvents(events) {
+  renderRunChoreography(currentRunData, events);
   const list = $("runEventList");
   list.innerHTML = "";
   (events || []).forEach((event) => {

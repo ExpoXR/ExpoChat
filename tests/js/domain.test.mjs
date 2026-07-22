@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { buildChatPayload, chatAgentStep, chatEventStatus, cloudEngineValue, isCloudEngine } from "../../public/js/chat.mjs";
-import { artifactPresentation, explorerActivityState, fileActivity, runStatusLabel, tokenCounts } from "../../public/js/runs.mjs";
+import { artifactPresentation, explorerActivityState, fileActivity, runChoreography, runStatusLabel, tokenCounts } from "../../public/js/runs.mjs";
 import { BRAIN_MODELS, modelLabel, modelOptions, providerOptions } from "../../public/js/settings.mjs";
 import { buildSettingsPayload, usageMeter } from "../../public/js/settings_api.mjs";
 import { readPreferences, writePreferences } from "../../public/js/state.mjs";
@@ -68,6 +68,27 @@ test("run and artifact helpers select explicit render types", () => {
     artifactPresentation({ kind: "research" }, JSON.stringify({ summary: "# Human summary", events: [{ tool: "read" }] })),
     { type: "markdown", content: "# Human summary" },
   );
+});
+
+test("run choreography reflects brain, worker, verifier progress", () => {
+  const researching = runChoreography({ status: "researching", brain_provider: "gemini" }, []);
+  assert.equal(researching[0].state, "working");
+  assert.equal(researching[0].title, "Brain · gemini");
+  assert.equal(researching[1].state, "idle");
+
+  const implementing = runChoreography(
+    { status: "implementing", selected_agents: [{ name: "coder", roles: ["implementation"] }] },
+    [{ event_type: "plan.ready" }],
+  );
+  assert.equal(implementing[0].state, "done");
+  assert.equal(implementing[1].state, "working");
+  assert.equal(implementing[1].title, "Worker · coder");
+
+  const completed = runChoreography({ status: "completed" }, [{ event_type: "plan.ready" }, { event_type: "apply.completed" }]);
+  assert.deepEqual(completed.map((s) => s.state), ["done", "done", "done"]);
+
+  const rolledBack = runChoreography({ status: "rolled_back" }, [{ event_type: "plan.ready" }]);
+  assert.equal(rolledBack[2].state, "error");
 });
 
 test("token counters split Brain and Ollama usage", () => {
