@@ -13,6 +13,7 @@ import httpx
 
 from . import db
 from .config import settings
+from .plan_graph import GraphError, independent_pairs_sharing_globs, parse_task_graph, validate_graph
 from .prompts import with_caveman
 from .run_state import validate_transition
 from .security import decrypt_secret
@@ -434,6 +435,44 @@ def create_run(task: str, provider: str, target: Path, web_research: bool) -> di
     return db.one("select * from runs where id=?", (run_id,)) or {}
 
 
+DECOMPOSE_PROMPT = (
+    "You are the supervisor brain. Decompose the implementation plan below into a DAG of "
+    "independent subtasks a pool of coding agents can execute. Return JSON ONLY:\n"
+    '{"subtasks":[{"node_id":"kebab-id","title":"...","spec":"decision-complete instructions",'
+    '"depends_on":["other-node-id"],"file_globs":["path/glob/**"],"acceptance_criteria":"...",'
+    '"role":"implementation"}]}\n'
+    "Rules: keep each subtask independently verifiable; give every subtask a disjoint file_globs "
+    "scope; if two subtasks must touch the same files, serialize them with depends_on instead of "
+    "running them in parallel; use a single subtask if the plan is not decomposable. No prose.\n\nPLAN:\n"
+)
+
+
+def decompose_plan(run_id: str, plan: str, provider: str) -> list[dict[str, Any]]:
+    """Ask the brain to turn a plan into a validated task graph and persist it.
+
+    Best-effort and backward-compatible: any failure logs an event and leaves the run on
+    the existing single-implementer path (no subtasks persisted). Returns the node list.
+    """
+    try:
+        result = call_brain_result(provider, DECOMPOSE_PROMPT + plan, False, run_id=run_id)
+        record_usage(run_id, result, "brain")
+        nodes = validate_graph(parse_task_graph(result["content"]))
+        db.insert_subtasks(run_id, nodes)
+        save_artifact(run_id, "task_graph", "Task graph", {"subtasks": nodes})
+        conflicts = independent_pairs_sharing_globs(nodes)
+        db.add_event(
+            run_id,
+            "plan.decomposed",
+            f"Plan decomposed into {len(nodes)} subtask(s)",
+            {"count": len(nodes), "overlap_warnings": conflicts},
+        )
+        return nodes
+    except (GraphError, KeyError, RuntimeError) as exc:
+        log.warning("decompose_failed", extra={"run_id": run_id, "error": str(exc)})
+        db.add_event(run_id, "plan.decompose_skipped", "Plan kept as a single unit", {"reason": str(exc)[:400]})
+        return []
+
+
 def research_run(run_id: str) -> None:
     try:
         run = db.one("select * from runs where id=?", (run_id,))
@@ -473,6 +512,7 @@ def research_run(run_id: str) -> None:
         )
         save_artifact(run_id, "plan", "Supervisor plan", plan)
         db.add_plan_version(run_id, "draft", plan, run["brain_provider"])
+        decompose_plan(run_id, plan, run["brain_provider"])
         db.add_event(run_id, "plan.ready", "Plan ready for approval")
     except Exception as exc:
         log.exception("research_failed", extra={"run_id": run_id})

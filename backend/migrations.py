@@ -115,6 +115,61 @@ def _plan_history(db: sqlite3.Connection) -> None:
     _add_columns(db, "messages", {"plan": "text"})
 
 
+def _task_dag(db: sqlite3.Connection) -> None:
+    db.execute(
+        "create table if not exists subtasks ("
+        " id text primary key, run_id text not null, node_id text not null,"
+        " title text not null, spec text not null,"
+        " depends_on_json text not null default '[]', file_globs_json text not null default '[]',"
+        " role text not null default 'implementation', status text not null default 'pending',"
+        " agent_id text, worktree_ref text, result_summary text, verdict text,"
+        " attempts integer not null default 0, created_at text not null, updated_at text not null,"
+        " unique(run_id, node_id), foreign key(run_id) references runs(id) on delete cascade)"
+    )
+    db.execute("create index if not exists idx_subtasks_run_status on subtasks(run_id,status)")
+    db.execute(
+        "create table if not exists subtask_results ("
+        " id integer primary key autoincrement, subtask_id text not null, run_id text not null,"
+        " kind text not null, content text not null, created_at text not null,"
+        " foreign key(subtask_id) references subtasks(id) on delete cascade)"
+    )
+    db.execute("create index if not exists idx_subtask_results_subtask on subtask_results(subtask_id,id)")
+
+    # Extend jobs.job_type (SQLite can't ALTER a CHECK) to allow subtask/merge, add node_id,
+    # and re-scope uniqueness so many subtask jobs can be active at once (one per node),
+    # while research/implementation/merge stay one-active-per-type.
+    current = db.execute("select sql from sqlite_master where type='table' and name='jobs'").fetchone()
+    if current and "'subtask'" in (current[0] or ""):
+        return
+    db.execute(
+        "create table jobs_new ("
+        " id integer primary key autoincrement, run_id text not null,"
+        " job_type text not null check(job_type in ('research','implementation','subtask','merge')),"
+        " node_id text, status text not null default 'pending', attempts integer not null default 0,"
+        " error text, created_at text not null, updated_at text not null,"
+        " started_at text, completed_at text, lease_owner text, lease_expires_at text,"
+        " cancel_requested_at text, foreign key(run_id) references runs(id) on delete cascade)"
+    )
+    db.execute(
+        "insert into jobs_new(id,run_id,job_type,status,attempts,error,created_at,updated_at,"
+        "started_at,completed_at,lease_owner,lease_expires_at,cancel_requested_at) "
+        "select id,run_id,job_type,status,attempts,error,created_at,updated_at,"
+        "started_at,completed_at,lease_owner,lease_expires_at,cancel_requested_at from jobs"
+    )
+    db.execute("drop table jobs")
+    db.execute("alter table jobs_new rename to jobs")
+    db.execute("create index if not exists idx_jobs_status_id on jobs(status,id)")
+    db.execute("create index if not exists idx_jobs_run_type_status on jobs(run_id,job_type,status)")
+    db.execute(
+        "create unique index if not exists idx_jobs_one_active_type on jobs(run_id,job_type) "
+        "where status in ('pending','running') and job_type in ('research','implementation','merge')"
+    )
+    db.execute(
+        "create unique index if not exists idx_jobs_one_active_node on jobs(run_id,node_id) "
+        "where status in ('pending','running') and node_id is not null"
+    )
+
+
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _snapshot_metadata),
     (2, _durable_jobs),
@@ -124,6 +179,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (6, _brain_gemini),
     (7, _settings_and_ledger),
     (8, _plan_history),
+    (9, _task_dag),
 ]
 
 

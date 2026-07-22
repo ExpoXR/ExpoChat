@@ -105,6 +105,55 @@ def plan_versions(run_id: str) -> list[dict[str, Any]]:
     return all_rows("select * from plan_versions where run_id=? order by version", (run_id,))
 
 
+def insert_subtasks(run_id: str, nodes: list[dict[str, Any]]) -> None:
+    """Persist a validated task-graph (from plan_graph.validate_graph) for a run.
+
+    Replaces any prior graph for the run so a re-decomposition is clean. node_id is
+    unique per run; id is a stable surrogate key used by subtask_results/jobs.
+    """
+    now = utcnow()
+    with transaction() as conn:
+        conn.execute("delete from subtasks where run_id=?", (run_id,))
+        for node in nodes:
+            conn.execute(
+                "insert into subtasks(id,run_id,node_id,title,spec,depends_on_json,file_globs_json,"
+                "role,status,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    f"sub-{run_id}-{node['node_id']}",
+                    run_id,
+                    node["node_id"],
+                    node["title"],
+                    node["spec"],
+                    json.dumps(node.get("depends_on") or [], ensure_ascii=False),
+                    json.dumps(node.get("file_globs") or [], ensure_ascii=False),
+                    node.get("role") or "implementation",
+                    "pending",
+                    now,
+                    now,
+                ),
+            )
+
+
+def subtasks(run_id: str) -> list[dict[str, Any]]:
+    return all_rows("select * from subtasks where run_id=? order by id", (run_id,))
+
+
+def update_subtask(subtask_id: str, **values: Any) -> None:
+    if not values:
+        return
+    values["updated_at"] = utcnow()
+    columns = ",".join(f"{key}=?" for key in values)
+    execute(f"update subtasks set {columns} where id=?", (*values.values(), subtask_id))
+
+
+def add_subtask_result(subtask_id: str, run_id: str, kind: str, content: str) -> None:
+    """Append durable per-subtask evidence. Never pruned (unlike run_artifacts)."""
+    execute(
+        "insert into subtask_results(subtask_id,run_id,kind,content,created_at) values(?,?,?,?,?)",
+        (subtask_id, run_id, kind, content, utcnow()),
+    )
+
+
 DEFAULT_SETTINGS: dict[str, str] = {
     "token_budget_run": "0",      # per-run paid-token cap (0 = unlimited)
     "token_budget_daily": "0",    # per-day paid-token cap (0 = unlimited)

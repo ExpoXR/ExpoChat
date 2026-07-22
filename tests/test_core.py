@@ -15,7 +15,7 @@ WORKSPACES = TEST_ROOT / "workspaces"
 
 from fastapi import HTTPException  # noqa: E402
 
-from backend import brain_runner, db, orchestrator, worker, workspace  # noqa: E402
+from backend import brain_runner, db, orchestrator, plan_graph, worker, workspace  # noqa: E402
 from backend.main import pinned_context  # noqa: E402
 from backend.migrations import MIGRATIONS  # noqa: E402
 from backend.prompts import CAVEMAN_OUTPUT_INSTRUCTIONS  # noqa: E402
@@ -37,8 +37,9 @@ def setup_module():
 
 def clear_workflow_tables():
     for table in (
-        "jobs", "verification_results", "run_approvals", "history_snippets",
-        "plan_versions", "run_artifacts", "run_events", "runs", "agent_profiles", "snapshots",
+        "jobs", "subtask_results", "subtasks", "verification_results", "run_approvals",
+        "history_snippets", "plan_versions", "run_artifacts", "run_events", "runs",
+        "agent_profiles", "snapshots",
     ):
         db.execute(f"delete from {table}")
 
@@ -610,6 +611,107 @@ def test_plan_versions_are_append_only_history():
     assert [row["version"] for row in versions] == [1, 2, 3]
     assert [row["kind"] for row in versions] == ["draft", "edit", "approved"]
     assert versions[0]["content"] == "plan v1"
+
+
+def test_parse_task_graph_tolerates_fences_and_prose():
+    fenced = "here is the graph\n```json\n{\"subtasks\": [{\"node_id\": \"a\", \"spec\": \"do a\"}]}\n```\nthanks"
+    graph = plan_graph.parse_task_graph(fenced)
+    assert graph["subtasks"][0]["node_id"] == "a"
+    with pytest.raises(plan_graph.GraphError):
+        plan_graph.parse_task_graph("no json here")
+
+
+def test_validate_graph_orders_topologically_and_normalizes():
+    graph = {
+        "subtasks": [
+            {"node_id": "b", "spec": "depends on a", "depends_on": ["a"], "file_globs": ["src/b/**"]},
+            {"node_id": "a", "title": "First", "spec": "root", "file_globs": ["src/a/**"], "role": "implementation"},
+        ]
+    }
+    nodes = plan_graph.validate_graph(graph)
+    assert [n["node_id"] for n in nodes] == ["a", "b"]  # dependency before dependant
+    assert nodes[0]["title"] == "First"
+
+
+def test_validate_graph_rejects_cycles_and_bad_refs():
+    with pytest.raises(plan_graph.GraphError):
+        plan_graph.validate_graph({"subtasks": [
+            {"node_id": "a", "spec": "x", "depends_on": ["b"]},
+            {"node_id": "b", "spec": "y", "depends_on": ["a"]},
+        ]})
+    with pytest.raises(plan_graph.GraphError):
+        plan_graph.validate_graph({"subtasks": [{"node_id": "a", "spec": "x", "depends_on": ["ghost"]}]})
+    with pytest.raises(plan_graph.GraphError):
+        plan_graph.validate_graph({"subtasks": []})
+
+
+def test_independent_pairs_sharing_globs_flags_parallel_overlap():
+    nodes = plan_graph.validate_graph({"subtasks": [
+        {"node_id": "a", "spec": "x", "file_globs": ["src/shared.py"]},
+        {"node_id": "b", "spec": "y", "file_globs": ["src/shared.py"]},
+        {"node_id": "c", "spec": "z", "depends_on": ["a"], "file_globs": ["src/shared.py"]},
+    ]})
+    conflicts = plan_graph.independent_pairs_sharing_globs(nodes)
+    # a and b are independent and share a glob → conflict; c depends on a so a-c is serialized.
+    assert ("a", "b") in conflicts
+    assert ("a", "c") not in conflicts
+
+
+def test_insert_subtasks_persists_and_replaces_graph():
+    clear_workflow_tables()
+    run_id = "d" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "DAG run", "codex", str(WORKSPACES), "awaiting_approval", now, now),
+    )
+    nodes = plan_graph.validate_graph({"subtasks": [
+        {"node_id": "a", "spec": "build a", "file_globs": ["a/**"]},
+        {"node_id": "b", "spec": "build b", "depends_on": ["a"]},
+    ]})
+    db.insert_subtasks(run_id, nodes)
+    persisted = db.subtasks(run_id)
+    assert [row["node_id"] for row in persisted] == ["a", "b"]
+    assert json.loads(persisted[1]["depends_on_json"]) == ["a"]
+
+    db.update_subtask(persisted[0]["id"], status="done", result_summary="done a")
+    db.add_subtask_result(persisted[0]["id"], run_id, "implementation", "transcript a")
+    assert db.subtasks(run_id)[0]["status"] == "done"
+    assert db.all_rows("select * from subtask_results where run_id=?", (run_id,))[0]["content"] == "transcript a"
+
+    # Re-decomposition replaces the prior graph rather than duplicating node_ids.
+    db.insert_subtasks(run_id, plan_graph.validate_graph({"subtasks": [{"node_id": "a", "spec": "only a"}]}))
+    assert [row["node_id"] for row in db.subtasks(run_id)] == ["a"]
+
+
+def test_two_subtask_jobs_can_be_active_but_types_stay_singleton():
+    clear_workflow_tables()
+    run_id = "g" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "Concurrent subtasks", "codex", str(WORKSPACES), "implementing", now, now),
+    )
+    # Two active subtask jobs (distinct node_id) are allowed simultaneously.
+    db.execute(
+        "insert into jobs(run_id,job_type,node_id,status,created_at,updated_at) values(?,?,?,?,?,?)",
+        (run_id, "subtask", "a", "running", now, now),
+    )
+    db.execute(
+        "insert into jobs(run_id,job_type,node_id,status,created_at,updated_at) values(?,?,?,?,?,?)",
+        (run_id, "subtask", "b", "pending", now, now),
+    )
+    assert len(db.all_rows("select id from jobs where run_id=? and job_type='subtask'", (run_id,))) == 2
+    # A second active job of the same non-subtask type is rejected by the partial unique index.
+    db.execute(
+        "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,?,?,?,?)",
+        (run_id, "merge", "pending", now, now),
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,?,?,?,?)",
+            (run_id, "merge", "pending", now, now),
+        )
 
 
 def test_worker_activity_records_safe_live_file_states():
