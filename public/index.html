@@ -151,6 +151,12 @@
             <input id="claudeKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
             <div class="btn-row"><button id="saveClaudeBtn">Link / Rotate</button><button id="testClaudeBtn">Test</button><button id="disconnectClaudeBtn">Disconnect</button></div>
             <p id="claudeState" class="field-hint"></p>
+            <label>Gemini model</label>
+            <select id="geminiModel"></select>
+            <label>Google Gemini API key</label>
+            <input id="geminiKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
+            <div class="btn-row"><button id="saveGeminiBtn">Link / Rotate</button><button id="testGeminiBtn">Test</button><button id="disconnectGeminiBtn">Disconnect</button></div>
+            <p id="geminiState" class="field-hint"></p>
             <div class="section-title with-gap">OLLAMA AGENTS</div>
             <button id="discoverAgentsBtn">Discover Models</button>
             <div id="agentList" class="tree"></div>
@@ -305,6 +311,7 @@
         <span class="status-spacer"></span>
         <span id="claudeIndicator" class="brain-indicator hidden"></span>
         <span id="openaiIndicator" class="brain-indicator hidden"></span>
+        <span id="geminiIndicator" class="brain-indicator hidden"></span>
         <span>Ollama</span>
       </footer>
     </main>

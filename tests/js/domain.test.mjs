@@ -80,12 +80,16 @@ test("settings and preferences are pure and bounded", () => {
   assert.deepEqual(readPreferences(storage).context, ["a"]);
   assert.ok(BRAIN_MODELS.codex.length > 2);
   assert.ok(BRAIN_MODELS.claude.length > 2);
+  assert.ok(BRAIN_MODELS.gemini.length >= 2);
   assert.equal(modelLabel("codex", "gpt-5.6-terra"), "GPT-5.6 Terra");
+  assert.equal(modelLabel("gemini", "gemini-2.5-pro"), "Gemini 2.5 Pro");
   assert.equal(modelOptions("claude", "custom-model")[0].value, "custom-model");
   assert.deepEqual(providerOptions([
     { provider: "codex", model: "gpt-5.6-sol", enabled: true, linked: true },
     { provider: "claude", model: "claude-sonnet-5", enabled: false, linked: false },
+    { provider: "gemini", model: "gemini-2.5-pro", enabled: true, linked: true },
   ]), [
     { value: "codex", label: "ChatGPT · GPT-5.6 Sol" },
+    { value: "gemini", label: "Gemini · Gemini 2.5 Pro" },
   ]);
 });

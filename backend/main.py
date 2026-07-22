@@ -71,7 +71,7 @@ class LoginBody(BaseModel):
 
 
 class BrainBody(BaseModel):
-    provider: str = Field(pattern="^(codex|claude)$")
+    provider: str = Field(pattern="^(codex|claude|gemini)$")
     model: str = Field(min_length=1, max_length=200)
     api_key: str = Field(default="", max_length=20_000)
     enabled: bool = True
@@ -100,7 +100,7 @@ class AgentCreateBody(BaseModel):
 
 class RunBody(BaseModel):
     task: str = Field(min_length=3, max_length=40_000)
-    brain_provider: str = Field(pattern="^(codex|claude)$")
+    brain_provider: str = Field(pattern="^(codex|claude|gemini)$")
     target_path: str
     web_research: bool = False
 
@@ -388,7 +388,7 @@ def me(request: Request):
 
 
 def _public_brain(row: dict[str, Any]) -> dict[str, Any]:
-    environment_key = settings.openai_key if row.get("provider") == "codex" else settings.claude_key
+    environment_key = settings.environment_key(row.get("provider", ""))
     has_key = bool(row.get("key_ciphertext")) if row.get("source") == "stored" else bool(environment_key)
     return {
         key: row.get(key)
@@ -404,6 +404,8 @@ def config(_: dict = Depends(require_user)):
         "claude_model": brains.get("claude", {}).get("model", settings.claude_model),
         "openai_enabled": bool(brains.get("codex", {}).get("linked")),
         "openai_model": brains.get("codex", {}).get("model", settings.openai_model),
+        "gemini_enabled": bool(brains.get("gemini", {}).get("linked")),
+        "gemini_model": brains.get("gemini", {}).get("model", settings.gemini_model),
         "ollama_url": settings.ollama_url,
         "allowed_roots": [str(root) for root in settings.allowed_roots],
         "credential_storage_enabled": bool(settings.credential_key),
@@ -426,7 +428,7 @@ def save_brain(body: BrainBody, _: dict = Depends(require_user)):
     if not body.enabled:
         ciphertext = None
         source = "environment"
-    environment_key = settings.openai_key if body.provider == "codex" else settings.claude_key
+    environment_key = settings.environment_key(body.provider)
     if body.enabled and not (ciphertext if source == "stored" else environment_key):
         raise HTTPException(400, "API key required before linking provider")
     model = body.model.strip()

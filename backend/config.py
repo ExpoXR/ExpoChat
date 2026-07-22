@@ -49,6 +49,11 @@ class Settings:
     openai_model: str = field(default_factory=lambda: os.getenv("OPENAI_MODEL", "gpt-5.6-sol"))
     claude_key: str = field(default_factory=lambda: os.getenv("CLAUDE_API_KEY", ""))
     claude_model: str = field(default_factory=lambda: os.getenv("CLAUDE_MODEL", "claude-sonnet-5"))
+    gemini_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
+    gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-pro"))
+
+    def environment_key(self, provider: str) -> str:
+        return {"codex": self.openai_key, "claude": self.claude_key, "gemini": self.gemini_key}.get(provider, "")
 
     @property
     def db_path(self) -> Path:

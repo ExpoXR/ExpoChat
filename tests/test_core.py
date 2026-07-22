@@ -120,6 +120,78 @@ def test_codex_runner_applies_api_key_before_starting_thread(monkeypatch):
     ]
 
 
+def test_gemini_runner_maps_usage_and_wires_web_search(monkeypatch):
+    calls = {}
+
+    class FakeModels:
+        def generate_content(self, *, model, contents, config):
+            calls.update(model=model, contents=contents, config=config)
+            meta = SimpleNamespace(prompt_token_count=5, candidates_token_count=7, total_token_count=12)
+            return SimpleNamespace(text="OK", usage_metadata=meta)
+
+    class FakeClient:
+        def __init__(self, api_key):
+            calls["api_key"] = api_key
+            self.models = FakeModels()
+
+    fake_types = SimpleNamespace(
+        GenerateContentConfig=lambda **kw: ("config", kw),
+        Tool=lambda **kw: ("tool", kw),
+        GoogleSearch=lambda: "search",
+    )
+    fake_genai = SimpleNamespace(Client=FakeClient, types=fake_types)
+    monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=fake_genai))
+    monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
+    monkeypatch.setitem(sys.modules, "google.genai.types", fake_types)
+
+    result = brain_runner.run_gemini(
+        {"api_key": "gk", "model": "gemini-x", "prompt": "ping", "allow_web": True}
+    )
+
+    assert result == {"content": "OK", "usage": {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}}
+    assert calls["api_key"] == "gk"
+    assert calls["model"] == "gemini-x"
+    # allow_web wires a google_search tool into the generate config
+    assert calls["config"][0] == "config"
+    assert "tools" in calls["config"][1]
+
+
+def test_gemini_provider_config_uses_stored_key():
+    db.init_db()
+    db.execute(
+        "insert into brain_configs(provider,model,key_ciphertext,source,enabled,updated_at) "
+        "values(?,?,?,?,?,?) on conflict(provider) do update set "
+        "model=excluded.model,key_ciphertext=excluded.key_ciphertext,source=excluded.source,enabled=excluded.enabled",
+        ("gemini", "gemini-2.5-pro", encrypt_secret("gk-123"), "stored", 1, db.utcnow()),
+    )
+    key, model = orchestrator.provider_config("gemini")
+    assert key == "gk-123"
+    assert model == "gemini-2.5-pro"
+
+
+def test_migration_widens_brain_check_to_gemini():
+    from backend.migrations import _brain_gemini
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        "create table brain_configs ("
+        " provider text primary key check(provider in ('codex','claude')),"
+        " model text not null, key_ciphertext text, source text not null default 'environment',"
+        " enabled integer not null default 0, validated_at text, last_error text, updated_at text not null);"
+        "insert into brain_configs(provider,model,source,enabled,updated_at)"
+        " values('codex','gpt-x','environment',1,'t0');"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("insert into brain_configs(provider,model,source,enabled,updated_at) values('gemini','g','e',1,'t')")
+
+    _brain_gemini(conn)  # upgrade path
+    _brain_gemini(conn)  # idempotent
+
+    assert conn.execute("select model from brain_configs where provider='codex'").fetchone()[0] == "gpt-x"
+    conn.execute("insert into brain_configs(provider,model,source,enabled,updated_at) values('gemini','g','environment',1,'t')")
+    assert {r[0] for r in conn.execute("select provider from brain_configs")} == {"codex", "gemini"}
+
+
 def test_caveman_prompt_applies_to_brain_and_ollama(monkeypatch):
     captured = {}
     monkeypatch.setattr(orchestrator, "provider_config", lambda _: ("key", "model"))

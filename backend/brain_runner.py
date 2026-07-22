@@ -59,6 +59,31 @@ async def run_claude(payload: dict[str, Any]) -> dict[str, Any]:
     return {"content": result, "usage": usage}
 
 
+def run_gemini(payload: dict[str, Any]) -> dict[str, Any]:
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=payload["api_key"])
+    config_kwargs: dict[str, Any] = {}
+    if payload.get("allow_web"):
+        config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+    if payload.get("max_output_tokens"):
+        config_kwargs["max_output_tokens"] = int(payload["max_output_tokens"])
+    config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
+    response = client.models.generate_content(
+        model=payload["model"],
+        contents=payload["prompt"],
+        config=config,
+    )
+    meta = getattr(response, "usage_metadata", None)
+    usage = {
+        "input_tokens": int(getattr(meta, "prompt_token_count", 0) or 0),
+        "output_tokens": int(getattr(meta, "candidates_token_count", 0) or 0),
+        "total_tokens": int(getattr(meta, "total_token_count", 0) or 0),
+    }
+    return {"content": response.text or "", "usage": usage}
+
+
 def main() -> None:
     payload = json.loads(sys.stdin.read())
     try:
@@ -67,6 +92,8 @@ def main() -> None:
             result = run_codex(payload)
         elif provider == "claude":
             result = asyncio.run(run_claude(payload))
+        elif provider == "gemini":
+            result = run_gemini(payload)
         else:
             raise ValueError("Unsupported brain provider")
         print(json.dumps({"ok": True, **result}, ensure_ascii=False))

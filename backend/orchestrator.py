@@ -138,10 +138,8 @@ def provider_config(provider: str) -> tuple[str, str]:
         raise RuntimeError(f"{provider} brain is not linked")
     if row["source"] == "stored":
         key = decrypt_secret(row["key_ciphertext"])
-    elif provider == "codex":
-        key = settings.openai_key
     else:
-        key = settings.claude_key
+        key = settings.environment_key(provider)
     if not key:
         raise RuntimeError(f"{provider} API key is missing")
     return key, row["model"]

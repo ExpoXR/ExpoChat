@@ -100,7 +100,7 @@ def init_db() -> None:
               created_at real not null, last_seen real not null, expires_at real not null
             );
             create table if not exists brain_configs (
-              provider text primary key check(provider in ('codex','claude')),
+              provider text primary key check(provider in ('codex','claude','gemini')),
               model text not null, key_ciphertext text, source text not null default 'environment',
               enabled integer not null default 0, validated_at text, last_error text,
               updated_at text not null
@@ -169,6 +169,10 @@ def init_db() -> None:
         db.execute(
             "insert or ignore into brain_configs(provider,model,source,enabled,updated_at) values(?,?,?,?,?)",
             ("claude", settings.claude_model, "environment", int(bool(settings.claude_key)), utcnow()),
+        )
+        db.execute(
+            "insert or ignore into brain_configs(provider,model,source,enabled,updated_at) values(?,?,?,?,?)",
+            ("gemini", settings.gemini_model, "environment", int(bool(settings.gemini_key)), utcnow()),
         )
         db.execute(
             "update jobs set status='pending',error='Interrupted; queued for recovery',lease_owner=null,"

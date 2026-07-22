@@ -19,8 +19,6 @@ let chats = [];
 let currentChat = null;
 let currentFile = null;
 let pinnedContextPaths = [];
-let claudeEnabled = false;
-let openaiEnabled = false;
 let allowedRoots = [];
 let csrfToken = "";
 let runs = [];
@@ -1248,7 +1246,8 @@ async function loadBrains() {
   const data = await api("/api/brains");
   brains = data.brains || [];
   brains.forEach((brain) => {
-    const prefix = brain.provider === "codex" ? "codex" : "claude";
+    const prefix = brain.provider;
+    if (!$(`${prefix}Model`)) return; // provider has no card in the current view
     populateModelSelect(brain.provider, brain.model);
     $(`${prefix}Model`).value = brain.model;
     const linked = Boolean(brain.enabled && brain.linked && !brain.last_error);
@@ -1256,16 +1255,20 @@ async function loadBrains() {
       ? `Linked via ${brain.source}${brain.validated_at ? " · validated" : ""}${brain.last_error ? " · " + brain.last_error : ""}`
       : brain.last_error || "Not linked";
     $(`${prefix}State`).classList.toggle("linked", linked);
-    const indicator = brain.provider === "codex" ? $("openaiIndicator") : $("claudeIndicator");
-    indicator.textContent = `${modelLabel(brain.provider, brain.model)} ${linked ? "✓" : "!"}`;
-    indicator.classList.toggle("linked", linked);
-    indicator.classList.toggle("hidden", !brain.enabled && !brain.linked);
+    const indicator = $(BRAIN_INDICATORS[brain.provider]);
+    if (indicator) {
+      indicator.textContent = `${modelLabel(brain.provider, brain.model)} ${linked ? "✓" : "!"}`;
+      indicator.classList.toggle("linked", linked);
+      indicator.classList.toggle("hidden", !brain.enabled && !brain.linked);
+    }
   });
   syncProviderOptions();
 }
 
+const BRAIN_INDICATORS = { codex: "openaiIndicator", claude: "claudeIndicator", gemini: "geminiIndicator" };
+
 function populateModelSelect(provider, current = "") {
-  const select = $(provider === "codex" ? "codexModel" : "claudeModel");
+  const select = $(`${provider}Model`);
   const selected = current || select.value;
   select.innerHTML = "";
   modelOptions(provider, selected).forEach((model) => {
@@ -1299,7 +1302,7 @@ function syncProviderOptions() {
 }
 
 async function saveBrain(provider) {
-  const prefix = provider === "codex" ? "codex" : "claude";
+  const prefix = provider;
   try {
     await api("/api/brains", {
       method: "PUT",
@@ -1312,7 +1315,7 @@ async function saveBrain(provider) {
 }
 
 async function disconnectBrain(provider) {
-  const prefix = provider === "codex" ? "codex" : "claude";
+  const prefix = provider;
   try {
     await api("/api/brains", {
       method: "PUT",
@@ -1444,30 +1447,30 @@ async function boot() {
   // Config — know which AI providers are available
   try {
     const cfg = await api("/api/config");
-    claudeEnabled = cfg.claude_enabled;
-    openaiEnabled = cfg.openai_enabled;
     allowedRoots  = cfg.allowed_roots || [];
 
-    if (claudeEnabled) show("claudeIndicator");
-    if (openaiEnabled) show("openaiIndicator");
-
-    // Populate plan provider selector based on what's enabled
+    // Populate plan provider selector based on what's enabled (loadBrains re-syncs later)
+    const providerList = [
+      { key: "codex", enabled: cfg.openai_enabled, label: "Codex (OpenAI)", indicator: "openaiIndicator" },
+      { key: "claude", enabled: cfg.claude_enabled, label: "Claude (Anthropic)", indicator: "claudeIndicator" },
+      { key: "gemini", enabled: cfg.gemini_enabled, label: "Gemini (Google)", indicator: "geminiIndicator" },
+    ];
     const provSel = $("planProvider");
     provSel.innerHTML = "";
-    if (claudeEnabled) {
-      const o = document.createElement("option");
-      o.value = "claude"; o.textContent = "Claude (Anthropic)";
-      provSel.appendChild(o);
-    }
-    if (openaiEnabled) {
-      const o = document.createElement("option");
-      o.value = "codex"; o.textContent = "Codex (OpenAI)";
-      provSel.appendChild(o);
-    }
-    if (!claudeEnabled && !openaiEnabled) {
-      const o = document.createElement("option");
-      o.value = ""; o.textContent = "No AI provider configured";
-      provSel.appendChild(o);
+    let anyProvider = false;
+    providerList.forEach((provider) => {
+      if (!provider.enabled) return;
+      anyProvider = true;
+      show(provider.indicator);
+      const option = document.createElement("option");
+      option.value = provider.key;
+      option.textContent = provider.label;
+      provSel.appendChild(option);
+    });
+    if (!anyProvider) {
+      const option = document.createElement("option");
+      option.value = ""; option.textContent = "No AI provider configured";
+      provSel.appendChild(option);
     }
   } catch (_) {}
 
@@ -1626,6 +1629,9 @@ document.addEventListener("DOMContentLoaded", () => {
   $("saveClaudeBtn").onclick = () => saveBrain("claude");
   $("testClaudeBtn").onclick = () => testBrain("claude");
   $("disconnectClaudeBtn").onclick = () => disconnectBrain("claude");
+  $("saveGeminiBtn").onclick = () => saveBrain("gemini");
+  $("testGeminiBtn").onclick = () => testBrain("gemini");
+  $("disconnectGeminiBtn").onclick = () => disconnectBrain("gemini");
   $("discoverAgentsBtn").onclick = discoverAgentModels;
 
   // Activity bar — switches sidebar pane (plan button toggles the plan panel on mobile)

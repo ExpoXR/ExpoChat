@@ -17,7 +17,7 @@ app = FastAPI(title="Ollma Isolated Brain", docs_url=None, redoc_url=None)
 
 
 class BrainRequest(BaseModel):
-    provider: Literal["codex", "claude"]
+    provider: Literal["codex", "claude", "gemini"]
     api_key: str = Field(min_length=1, max_length=20_000)
     model: str = Field(min_length=1, max_length=200)
     prompt: str = Field(min_length=1, max_length=1_000_000)

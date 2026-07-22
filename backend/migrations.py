@@ -64,12 +64,38 @@ def _unique_active_jobs(db: sqlite3.Connection) -> None:
     )
 
 
+def _brain_gemini(db: sqlite3.Connection) -> None:
+    # SQLite can't ALTER a CHECK constraint, so rebuild brain_configs allowing 'gemini'.
+    check = db.execute(
+        "select sql from sqlite_master where type='table' and name='brain_configs'"
+    ).fetchone()
+    if check and "gemini" in (check[0] or ""):
+        return
+    db.execute(
+        """
+        create table brain_configs_new (
+          provider text primary key check(provider in ('codex','claude','gemini')),
+          model text not null, key_ciphertext text, source text not null default 'environment',
+          enabled integer not null default 0, validated_at text, last_error text,
+          updated_at text not null
+        )
+        """
+    )
+    db.execute(
+        "insert into brain_configs_new(provider,model,key_ciphertext,source,enabled,validated_at,last_error,updated_at) "
+        "select provider,model,key_ciphertext,source,enabled,validated_at,last_error,updated_at from brain_configs"
+    )
+    db.execute("drop table brain_configs")
+    db.execute("alter table brain_configs_new rename to brain_configs")
+
+
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _snapshot_metadata),
     (2, _durable_jobs),
     (3, _run_usage),
     (4, _unique_active_jobs),
     (5, _chat_pinned),
+    (6, _brain_gemini),
 ]
 
 
