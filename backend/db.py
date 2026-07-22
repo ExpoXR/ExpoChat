@@ -9,6 +9,8 @@ from .config import settings
 from .migrations import apply_migrations
 
 MAX_RUN_EVENTS = 500
+MAX_RUN_ARTIFACTS = 200
+MAX_TIMELINE_ENTRIES = 5000
 
 
 def utcnow() -> str:
@@ -54,6 +56,18 @@ def all_rows(sql: str, args: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         return [dict(row) for row in db.execute(sql, args).fetchall()]
 
 
+def retention_cap(key: str, fallback: int) -> int:
+    """Configurable retention limit for the live SSE feed / prunable evidence tables.
+
+    Reads an app_settings override; a non-positive/invalid value falls back to the
+    historical default so a bad value can never wipe a table. These caps govern only
+    prunable tables — durable history lives in append-only tables (plan_versions,
+    subtask_results, verification_results) that are never pruned.
+    """
+    value = get_setting_int(key)
+    return value if value > 0 else fallback
+
+
 def add_event(run_id: str, event_type: str, message: str, data: Any = None) -> int:
     with closing(connect()) as db:
         cursor = db.execute(
@@ -63,10 +77,32 @@ def add_event(run_id: str, event_type: str, message: str, data: Any = None) -> i
         db.execute(
             "delete from run_events where run_id=? and id not in "
             "(select id from run_events where run_id=? order by id desc limit ?)",
-            (run_id, run_id, MAX_RUN_EVENTS),
+            (run_id, run_id, retention_cap("run_events_cap", MAX_RUN_EVENTS)),
         )
         db.commit()
         return int(cursor.lastrowid)
+
+
+def add_plan_version(run_id: str, kind: str, content: str, brain_provider: str | None = None) -> int:
+    """Append an immutable plan snapshot. kind: draft | edit | redo | approved.
+
+    runs.draft_plan / approved_plan remain the 'current' pointer; this table is the
+    never-pruned history that powers plan-diff views.
+    """
+    with closing(connect()) as db:
+        version = int(
+            (db.execute("select coalesce(max(version),0)+1 as v from plan_versions where run_id=?", (run_id,)).fetchone() or {"v": 1})["v"]
+        )
+        cursor = db.execute(
+            "insert into plan_versions(run_id,version,kind,content,brain_provider,created_at) values(?,?,?,?,?,?)",
+            (run_id, version, kind, content, brain_provider, utcnow()),
+        )
+        db.commit()
+        return int(cursor.lastrowid)
+
+
+def plan_versions(run_id: str) -> list[dict[str, Any]]:
+    return all_rows("select * from plan_versions where run_id=? order by version", (run_id,))
 
 
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -75,6 +111,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "max_output_tokens": "0",     # cap on brain/API response length (0 = provider default)
     "theme": "dark",              # dark | light | auto
     "agent_mode_default": "0",    # chat Agent Mode default (0/1)
+    "run_events_cap": "500",      # live run-event feed retention (default 500; raise to keep more)
+    "run_artifacts_cap": "200",   # run-artifact retention (default 200)
+    "timeline_cap": "5000",       # global timeline retention (default 5000)
 }
 
 

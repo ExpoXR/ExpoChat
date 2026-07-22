@@ -23,7 +23,6 @@ executor = ThreadPoolExecutor(max_workers=settings.runner_concurrency, thread_na
 _run_lock = threading.Lock()
 _queue_lock = threading.Lock()
 _active_drainers = 0
-MAX_RUN_ARTIFACTS = 200
 
 
 def _lease_heartbeat(job_id: int, lease_owner: str, stopped: threading.Event) -> None:
@@ -347,7 +346,7 @@ def save_artifact(run_id: str, kind: str, name: str, content: Any) -> None:
         conn.execute(
             "delete from run_artifacts where run_id=? and id not in "
             "(select id from run_artifacts where run_id=? order by id desc limit ?)",
-            (run_id, run_id, MAX_RUN_ARTIFACTS),
+            (run_id, run_id, db.retention_cap("run_artifacts_cap", db.MAX_RUN_ARTIFACTS)),
         )
 
 
@@ -473,6 +472,7 @@ def research_run(run_id: str) -> None:
             status="awaiting_approval",
         )
         save_artifact(run_id, "plan", "Supervisor plan", plan)
+        db.add_plan_version(run_id, "draft", plan, run["brain_provider"])
         db.add_event(run_id, "plan.ready", "Plan ready for approval")
     except Exception as exc:
         log.exception("research_failed", extra={"run_id": run_id})
@@ -513,6 +513,7 @@ def approve_run(run_id: str, approved_plan: str) -> dict[str, Any]:
                     "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,'implementation','pending',?,?)",
                     (run_id, now, now),
                 )
+            db.add_plan_version(run_id, "approved", approved_plan, run["brain_provider"])
             db.add_event(run_id, "scope.approved", "Expanded scope approved and implementation queued")
             start_job_queue()
             return db.one("select * from runs where id=?", (run_id,)) or {}
@@ -543,6 +544,7 @@ def approve_run(run_id: str, approved_plan: str) -> dict[str, Any]:
         except Exception:
             discard_snapshot(snapshot["id"])
             raise
+        db.add_plan_version(run_id, "approved", approved_plan, run["brain_provider"])
         db.add_event(run_id, "plan.approved", "History and snapshot created", {"snapshot_id": snapshot["id"]})
         start_job_queue()
         return db.one("select * from runs where id=?", (run_id,)) or {}
@@ -554,6 +556,7 @@ def edit_plan(run_id: str, plan: str) -> dict[str, Any]:
         raise RuntimeError("Run is not awaiting plan edits")
     update_run(run_id, draft_plan=plan, error=None)
     save_artifact(run_id, "plan_edit", "User-edited plan", plan)
+    db.add_plan_version(run_id, "edit", plan, run["brain_provider"])
     db.add_event(run_id, "plan.edited", "Plan changes saved")
     return db.one("select * from runs where id=?", (run_id,)) or {}
 

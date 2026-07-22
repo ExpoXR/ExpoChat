@@ -103,6 +103,18 @@ def _settings_and_ledger(db: sqlite3.Connection) -> None:
     db.execute("create index if not exists idx_usage_ledger_day on usage_ledger(day)")
 
 
+def _plan_history(db: sqlite3.Connection) -> None:
+    db.execute(
+        "create table if not exists plan_versions ("
+        " id integer primary key autoincrement, run_id text not null, version integer not null,"
+        " kind text not null, content text not null, brain_provider text, created_at text not null,"
+        " foreign key(run_id) references runs(id) on delete cascade)"
+    )
+    db.execute("create index if not exists idx_plan_versions_run on plan_versions(run_id,version)")
+    # Persist the Agent-Mode supervisor plan alongside the assistant chat message.
+    _add_columns(db, "messages", {"plan": "text"})
+
+
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _snapshot_metadata),
     (2, _durable_jobs),
@@ -111,6 +123,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (5, _chat_pinned),
     (6, _brain_gemini),
     (7, _settings_and_ledger),
+    (8, _plan_history),
 ]
 
 

@@ -38,7 +38,7 @@ def setup_module():
 def clear_workflow_tables():
     for table in (
         "jobs", "verification_results", "run_approvals", "history_snippets",
-        "run_artifacts", "run_events", "runs", "agent_profiles", "snapshots",
+        "plan_versions", "run_artifacts", "run_events", "runs", "agent_profiles", "snapshots",
     ):
         db.execute(f"delete from {table}")
 
@@ -563,7 +563,7 @@ def test_active_job_uniqueness():
         )
 
 
-def test_run_events_and_artifacts_are_bounded(monkeypatch):
+def test_run_events_and_artifacts_are_bounded():
     clear_workflow_tables()
     run_id = "e" * 24
     now = db.utcnow()
@@ -571,13 +571,45 @@ def test_run_events_and_artifacts_are_bounded(monkeypatch):
         "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
         (run_id, "Bound history", "codex", str(WORKSPACES), "researching", now, now),
     )
-    monkeypatch.setattr(db, "MAX_RUN_EVENTS", 2)
-    monkeypatch.setattr(orchestrator, "MAX_RUN_ARTIFACTS", 2)
-    for index in range(3):
-        db.add_event(run_id, "test", f"event {index}")
-        orchestrator.save_artifact(run_id, "test", f"artifact {index}", str(index))
-    assert [row["message"] for row in db.all_rows("select message from run_events order by id")] == ["event 1", "event 2"]
-    assert [row["name"] for row in db.all_rows("select name from run_artifacts order by id")] == ["artifact 1", "artifact 2"]
+    try:
+        db.set_setting("run_events_cap", 2)
+        db.set_setting("run_artifacts_cap", 2)
+        for index in range(3):
+            db.add_event(run_id, "test", f"event {index}")
+            orchestrator.save_artifact(run_id, "test", f"artifact {index}", str(index))
+        assert [row["message"] for row in db.all_rows("select message from run_events order by id")] == ["event 1", "event 2"]
+        assert [row["name"] for row in db.all_rows("select name from run_artifacts order by id")] == ["artifact 1", "artifact 2"]
+    finally:
+        db.set_setting("run_events_cap", 500)
+        db.set_setting("run_artifacts_cap", 200)
+
+
+def test_retention_cap_ignores_nonpositive_override():
+    # A zero/invalid override must never wipe a table; it falls back to the default floor.
+    try:
+        db.set_setting("run_events_cap", 0)
+        assert db.retention_cap("run_events_cap", db.MAX_RUN_EVENTS) == db.MAX_RUN_EVENTS
+        db.set_setting("run_events_cap", 1200)
+        assert db.retention_cap("run_events_cap", db.MAX_RUN_EVENTS) == 1200
+    finally:
+        db.set_setting("run_events_cap", 500)
+
+
+def test_plan_versions_are_append_only_history():
+    clear_workflow_tables()
+    run_id = "p" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "Plan history", "codex", str(WORKSPACES), "awaiting_approval", now, now),
+    )
+    db.add_plan_version(run_id, "draft", "plan v1", "codex")
+    db.add_plan_version(run_id, "edit", "plan v2 edited", "codex")
+    db.add_plan_version(run_id, "approved", "plan v2 edited", "codex")
+    versions = db.plan_versions(run_id)
+    assert [row["version"] for row in versions] == [1, 2, 3]
+    assert [row["kind"] for row in versions] == ["draft", "edit", "approved"]
+    assert versions[0]["content"] == "plan v1"
 
 
 def test_worker_activity_records_safe_live_file_states():
