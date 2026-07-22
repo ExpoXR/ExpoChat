@@ -4,6 +4,7 @@ import test from "node:test";
 import { buildChatPayload, chatEventStatus } from "../../public/js/chat.mjs";
 import { artifactPresentation, explorerActivityState, fileActivity, runStatusLabel, tokenCounts } from "../../public/js/runs.mjs";
 import { BRAIN_MODELS, modelLabel, modelOptions, providerOptions } from "../../public/js/settings.mjs";
+import { buildSettingsPayload, usageMeter } from "../../public/js/settings_api.mjs";
 import { readPreferences, writePreferences } from "../../public/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "../../public/js/workspace.mjs";
 import { baseName, duplicateName, joinPath, parentDir, pasteTarget } from "../../public/js/fsops.mjs";
@@ -92,4 +93,25 @@ test("settings and preferences are pure and bounded", () => {
     { value: "codex", label: "ChatGPT · GPT-5.6 Sol" },
     { value: "gemini", label: "Gemini · Gemini 2.5 Pro" },
   ]);
+});
+
+test("settings payload building and usage meter are pure and clamped", () => {
+  // clamps negatives/garbage to 0, drops blanks, validates theme, coerces bool
+  assert.deepEqual(
+    buildSettingsPayload({ token_budget_daily: "-5", token_budget_run: "", max_output_tokens: "2048", theme: "neon", agent_mode_default: 1 }),
+    { token_budget_daily: 0, max_output_tokens: 2048, agent_mode_default: true },
+  );
+  assert.deepEqual(buildSettingsPayload({ theme: "light" }), { theme: "light" });
+
+  const unlimited = usageMeter({ paid_today: { total: 1200 }, budgets: { daily: 0 } });
+  assert.equal(unlimited.unlimited, true);
+  assert.equal(unlimited.pct, 0);
+
+  const capped = usageMeter({ paid_today: { total: 800 }, budgets: { daily: 1000 } });
+  assert.equal(capped.pct, 80);
+  assert.equal(capped.over, false);
+
+  const over = usageMeter({ paid_today: { total: 1200 }, budgets: { daily: 1000 } });
+  assert.equal(over.over, true);
+  assert.equal(over.pct, 100);
 });

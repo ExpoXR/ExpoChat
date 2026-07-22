@@ -77,6 +77,14 @@ class BrainBody(BaseModel):
     enabled: bool = True
 
 
+class SettingsBody(BaseModel):
+    token_budget_run: int | None = Field(default=None, ge=0, le=1_000_000_000)
+    token_budget_daily: int | None = Field(default=None, ge=0, le=1_000_000_000)
+    max_output_tokens: int | None = Field(default=None, ge=0, le=1_000_000)
+    theme: str | None = Field(default=None, pattern="^(dark|light|auto)$")
+    agent_mode_default: bool | None = None
+
+
 class AgentBody(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     roles: list[str] | None = None
@@ -409,6 +417,51 @@ def config(_: dict = Depends(require_user)):
         "ollama_url": settings.ollama_url,
         "allowed_roots": [str(root) for root in settings.allowed_roots],
         "credential_storage_enabled": bool(settings.credential_key),
+    }
+
+
+def _public_settings() -> dict[str, Any]:
+    stored = db.all_settings()
+    return {
+        "token_budget_run": int(stored["token_budget_run"]),
+        "token_budget_daily": int(stored["token_budget_daily"]),
+        "max_output_tokens": int(stored["max_output_tokens"]),
+        "theme": stored["theme"],
+        "agent_mode_default": stored["agent_mode_default"] in ("1", "true", "True"),
+    }
+
+
+@config_router.get("/api/settings")
+def get_settings(_: dict = Depends(require_user)):
+    return _public_settings()
+
+
+@config_router.put("/api/settings")
+def put_settings(body: SettingsBody, _: dict = Depends(require_user)):
+    updates = body.model_dump(exclude_none=True)
+    for key, value in updates.items():
+        db.set_setting(key, int(value) if isinstance(value, bool) else value)
+    return _public_settings()
+
+
+@config_router.get("/api/usage")
+def usage(_: dict = Depends(require_user)):
+    settings_now = _public_settings()
+    paid = db.ledger_totals_today(paid_only=True)
+    return {
+        "day_utc": db.utcnow()[:10],
+        "paid_today": paid,
+        "all_today": db.ledger_totals_today(paid_only=False),
+        "by_provider": db.ledger_by_provider_today(),
+        "budgets": {
+            "run": settings_now["token_budget_run"],
+            "daily": settings_now["token_budget_daily"],
+            "max_output_tokens": settings_now["max_output_tokens"],
+        },
+        "daily_remaining": (
+            max(0, settings_now["token_budget_daily"] - paid["total"])
+            if settings_now["token_budget_daily"] > 0 else None
+        ),
     }
 
 

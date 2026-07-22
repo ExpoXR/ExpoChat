@@ -157,6 +157,30 @@
             <input id="geminiKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
             <div class="btn-row"><button id="saveGeminiBtn">Link / Rotate</button><button id="testGeminiBtn">Test</button><button id="disconnectGeminiBtn">Disconnect</button></div>
             <p id="geminiState" class="field-hint"></p>
+            <div class="section-title with-gap">BUDGET &amp; LIMITS</div>
+            <div id="usageMeter" class="usage-meter">
+              <div class="usage-meter-label"><span id="usageMeterText">—</span></div>
+              <div class="usage-meter-track"><div id="usageMeterFill" class="usage-meter-fill"></div></div>
+              <p id="usageMeterBreakdown" class="field-hint"></p>
+            </div>
+            <label>Daily API token budget <span class="label-hint">(0 = unlimited)</span></label>
+            <input id="budgetDaily" type="number" min="0" step="1000" placeholder="0">
+            <label>Per-run API token budget <span class="label-hint">(0 = unlimited)</span></label>
+            <input id="budgetRun" type="number" min="0" step="1000" placeholder="0">
+            <label>Max output tokens per response <span class="label-hint">(0 = provider default)</span></label>
+            <input id="maxOutputTokens" type="number" min="0" step="256" placeholder="0">
+            <div class="btn-row"><button id="saveBudgetBtn">Save Limits</button><button id="refreshUsageBtn">Refresh Usage</button></div>
+
+            <div class="section-title with-gap">APPEARANCE</div>
+            <label>Theme</label>
+            <select id="themeSelect">
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+              <option value="auto">Match system</option>
+            </select>
+            <label class="check-label"><input id="agentModeDefault" type="checkbox"> Default new chats to Agent Mode</label>
+            <div class="btn-row"><button id="saveAppearanceBtn">Save Appearance</button></div>
+
             <div class="section-title with-gap">OLLAMA AGENTS</div>
             <button id="discoverAgentsBtn">Discover Models</button>
             <div id="agentList" class="tree"></div>

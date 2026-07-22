@@ -3,6 +3,7 @@ import { buildChatPayload, chatEventStatus } from "/js/chat.mjs";
 import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMarkdown } from "/js/render.mjs";
 import { artifactPresentation, explorerActivityState, fileActivity, runStatusLabel, tokenCounts } from "/js/runs.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
+import { buildSettingsPayload, usageMeter } from "/js/settings_api.mjs";
 import { consumeSse } from "/js/sse.mjs";
 import { readPreferences, writePreferences } from "/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "/js/workspace.mjs";
@@ -1334,6 +1335,51 @@ async function testBrain(provider) {
   } catch (err) { showToast(err.message, "error"); }
 }
 
+let appSettings = { theme: "dark", agent_mode_default: false };
+
+function applyTheme(theme) {
+  const resolved = theme === "auto"
+    ? (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
+    : theme;
+  document.documentElement.setAttribute("data-theme", resolved);
+}
+
+async function loadSettings() {
+  try {
+    appSettings = await api("/api/settings");
+    $("budgetDaily").value = appSettings.token_budget_daily || 0;
+    $("budgetRun").value = appSettings.token_budget_run || 0;
+    $("maxOutputTokens").value = appSettings.max_output_tokens || 0;
+    $("themeSelect").value = appSettings.theme || "dark";
+    $("agentModeDefault").checked = Boolean(appSettings.agent_mode_default);
+    applyTheme(appSettings.theme || "dark");
+  } catch (_) {}
+  await loadUsage();
+}
+
+async function loadUsage() {
+  try {
+    const usage = await api("/api/usage");
+    const meter = usageMeter(usage);
+    $("usageMeterText").textContent = meter.label;
+    $("usageMeterFill").style.width = meter.unlimited ? "0%" : `${meter.pct}%`;
+    $("usageMeterFill").classList.toggle("over", meter.over);
+    const parts = (usage.by_provider || [])
+      .filter((row) => row.total > 0)
+      .map((row) => `${row.provider}: ${Number(row.total).toLocaleString()}`);
+    $("usageMeterBreakdown").textContent = parts.length ? parts.join(" · ") : "No usage recorded today.";
+  } catch (_) {}
+}
+
+async function saveSettings(values, message) {
+  try {
+    appSettings = await api("/api/settings", { method: "PUT", body: JSON.stringify(buildSettingsPayload(values)) });
+    applyTheme(appSettings.theme || "dark");
+    await loadUsage();
+    showToast(message, "success");
+  } catch (err) { showToast(err.message, "error"); }
+}
+
 async function loadAgents() {
   const data = await api("/api/agents");
   agents = data.agents || [];
@@ -1491,7 +1537,7 @@ async function boot() {
     showToast("Ollama models unavailable: " + err.message, "error");
   }
   await loadChats();
-  await Promise.allSettled([loadRuns(), loadBrains(), loadAgents()]);
+  await Promise.allSettled([loadRuns(), loadBrains(), loadAgents(), loadSettings()]);
 
   if (prefs.chat && chats.find((c) => c.id === prefs.chat)) {
     await loadChat(prefs.chat);
@@ -1632,6 +1678,16 @@ document.addEventListener("DOMContentLoaded", () => {
   $("saveGeminiBtn").onclick = () => saveBrain("gemini");
   $("testGeminiBtn").onclick = () => testBrain("gemini");
   $("disconnectGeminiBtn").onclick = () => disconnectBrain("gemini");
+  $("saveBudgetBtn").onclick = () => saveSettings({
+    token_budget_daily: $("budgetDaily").value,
+    token_budget_run: $("budgetRun").value,
+    max_output_tokens: $("maxOutputTokens").value,
+  }, "Limits saved");
+  $("refreshUsageBtn").onclick = () => loadUsage();
+  $("saveAppearanceBtn").onclick = () => saveSettings({
+    theme: $("themeSelect").value,
+    agent_mode_default: $("agentModeDefault").checked,
+  }, "Appearance saved");
   $("discoverAgentsBtn").onclick = discoverAgentModels;
 
   // Activity bar — switches sidebar pane (plan button toggles the plan panel on mobile)
@@ -1642,12 +1698,12 @@ document.addEventListener("DOMContentLoaded", () => {
   $("activitySnaps").onclick    = () => { switchSidePane("snaps");    loadSnaps();    };
   $("activityTimeline").onclick = () => { switchSidePane("timeline"); loadTimeline(); };
   $("activityPlan").onclick     = () => { document.querySelector(".panel-area").classList.toggle("open"); syncDrawerState(); };
-  $("activitySettings").onclick = () => { switchSidePane("settings"); loadBrains(); loadAgents(); };
+  $("activitySettings").onclick = () => { switchSidePane("settings"); loadBrains(); loadAgents(); loadSettings(); };
   $("activityMore").onclick = () => switchSidePane("more");
   $("moreToolsBtn").onclick = () => switchSidePane("tools");
   $("moreSnapsBtn").onclick = () => { switchSidePane("snaps"); loadSnaps(); };
   $("moreTimelineBtn").onclick = () => { switchSidePane("timeline"); loadTimeline(); };
-  $("moreSettingsBtn").onclick = () => { switchSidePane("settings"); loadBrains(); loadAgents(); };
+  $("moreSettingsBtn").onclick = () => { switchSidePane("settings"); loadBrains(); loadAgents(); loadSettings(); };
 
   // Editor tabs
   document.querySelectorAll(".editor-tab").forEach((tab) => {

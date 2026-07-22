@@ -89,6 +89,20 @@ def _brain_gemini(db: sqlite3.Connection) -> None:
     db.execute("alter table brain_configs_new rename to brain_configs")
 
 
+def _settings_and_ledger(db: sqlite3.Connection) -> None:
+    db.execute(
+        "create table if not exists app_settings ("
+        " key text primary key, value text not null, updated_at text not null)"
+    )
+    db.execute(
+        "create table if not exists usage_ledger ("
+        " id integer primary key autoincrement, day text not null, source text not null,"
+        " provider text not null, input integer not null default 0, output integer not null default 0,"
+        " total integer not null default 0, created_at text not null)"
+    )
+    db.execute("create index if not exists idx_usage_ledger_day on usage_ledger(day)")
+
+
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _snapshot_metadata),
     (2, _durable_jobs),
@@ -96,6 +110,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (4, _unique_active_jobs),
     (5, _chat_pinned),
     (6, _brain_gemini),
+    (7, _settings_and_ledger),
 ]
 
 

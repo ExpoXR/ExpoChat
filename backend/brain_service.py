@@ -22,6 +22,7 @@ class BrainRequest(BaseModel):
     model: str = Field(min_length=1, max_length=200)
     prompt: str = Field(min_length=1, max_length=1_000_000)
     allow_web: bool = False
+    max_output_tokens: int = Field(default=0, ge=0, le=1_000_000)
     timeout: int = Field(default=900, ge=1, le=1800)
 
 

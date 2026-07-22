@@ -1,5 +1,6 @@
 import json
 import os
+import secrets
 import sqlite3
 import sys
 import time
@@ -190,6 +191,67 @@ def test_migration_widens_brain_check_to_gemini():
     assert conn.execute("select model from brain_configs where provider='codex'").fetchone()[0] == "gpt-x"
     conn.execute("insert into brain_configs(provider,model,source,enabled,updated_at) values('gemini','g','environment',1,'t')")
     assert {r[0] for r in conn.execute("select provider from brain_configs")} == {"codex", "gemini"}
+
+
+def test_settings_round_trip_and_defaults():
+    db.init_db()
+    assert db.get_setting_int("token_budget_daily") == 0  # default
+    db.set_setting("token_budget_daily", 5000)
+    db.set_setting("theme", "light")
+    assert db.get_setting_int("token_budget_daily") == 5000
+    settings_map = db.all_settings()
+    assert settings_map["theme"] == "light"
+    assert settings_map["token_budget_daily"] == "5000"
+
+
+def test_record_usage_writes_paid_and_local_ledger_rows():
+    db.init_db()
+    db.execute("delete from usage_ledger")
+    run_id = "run-ledger-" + secrets.token_hex(4)
+    db.execute(
+        "insert into runs(id,task,brain_provider,brain_model,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?)",
+        (run_id, "t", "gemini", "gemini-2.5-pro", "/x", "researching", db.utcnow(), db.utcnow()),
+    )
+    orchestrator.record_usage(run_id, {"usage": {"input_tokens": 100, "output_tokens": 40, "total_tokens": 140}}, "brain")
+    orchestrator.record_usage(run_id, {"usage": {"prompt_eval_count": 10, "eval_count": 5}}, "ollama")
+
+    paid = db.ledger_totals_today(paid_only=True)
+    everything = db.ledger_totals_today(paid_only=False)
+    assert paid["total"] == 140  # ollama excluded from paid budget
+    assert everything["total"] == 140 + 15
+    providers = {row["provider"] for row in db.ledger_by_provider_today()}
+    assert {"gemini", "ollama"} <= providers
+
+
+def test_check_budget_blocks_over_daily_cap():
+    db.init_db()
+    db.execute("delete from usage_ledger")
+    db.set_setting("token_budget_daily", "0")
+    orchestrator.check_budget()  # unlimited: no raise
+    db.record_ledger("brain", "gemini", 600, 400, 1000)
+    db.set_setting("token_budget_daily", "800")
+    with pytest.raises(orchestrator.BudgetExceeded):
+        orchestrator.check_budget()
+    db.set_setting("token_budget_daily", "5000")
+    orchestrator.check_budget()  # under cap: no raise
+
+
+def test_check_budget_blocks_over_run_cap():
+    db.init_db()
+    db.execute("delete from usage_ledger")
+    db.set_setting("token_budget_daily", "0")
+    db.set_setting("token_budget_run", "500")
+    run_id = "run-cap-" + secrets.token_hex(4)
+    db.execute(
+        "insert into runs(id,task,brain_provider,brain_model,target_path,status,usage_json,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?,?)",
+        (run_id, "t", "claude", "m", "/x", "researching", json.dumps({"brain": {"total_tokens": 700}}), db.utcnow(), db.utcnow()),
+    )
+    with pytest.raises(orchestrator.BudgetExceeded):
+        orchestrator.check_budget(run_id)
+    db.set_setting("token_budget_run", "0")
+    orchestrator.check_budget(run_id)  # unlimited: no raise
 
 
 def test_caveman_prompt_applies_to_brain_and_ollama(monkeypatch):
