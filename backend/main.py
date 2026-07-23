@@ -621,6 +621,9 @@ def run_get(run_id: str, _: dict = Depends(require_user)):
     row["subtasks"] = db.subtasks(run_id)
     for subtask in row["subtasks"]:
         parse_json_fields(subtask, ["depends_on_json", "file_globs_json"])
+        subtask["depends_on"] = subtask.pop("depends_on_json", [])
+        agent = db.one("select name from agent_profiles where id=?", (subtask.get("agent_id"),)) if subtask.get("agent_id") else None
+        subtask["agent_name"] = agent["name"] if agent else ""
     row["verification_results"] = db.all_rows("select * from verification_results where run_id=? order by id", (run_id,))
     row["jobs"] = db.all_rows(
         "select id,job_type,status,attempts,error,started_at,completed_at,cancel_requested_at,created_at,updated_at "

@@ -12,8 +12,18 @@ from typing import Any
 import httpx
 
 from . import db
+from .brain_io import (
+    build_decompose_prompt,
+    build_plan_prompt,
+    build_subtask_verify_prompt,
+    build_verdict_prompt,
+    build_verification_prompt,
+    extract_json,
+    parse_subtask_verdict,
+    parse_verdict,
+)
 from .config import settings
-from .plan_graph import GraphError, independent_pairs_sharing_globs, parse_task_graph, validate_graph
+from .plan_graph import GraphError, independent_pairs_sharing_globs, validate_graph
 from .prompts import with_caveman
 from .run_state import validate_transition
 from .security import decrypt_secret
@@ -45,17 +55,23 @@ def _lease_heartbeat(job_id: int, lease_owner: str, stopped: threading.Event) ->
         )
 
 
-def enqueue_job(run_id: str, job_type: str) -> None:
+def enqueue_job(run_id: str, job_type: str, node_id: str | None = None) -> None:
     now = db.utcnow()
     with db.transaction() as conn:
-        active = conn.execute(
-            "select id from jobs where run_id=? and job_type=? and status in ('pending','running') limit 1",
-            (run_id, job_type),
-        ).fetchone()
+        if node_id:
+            active = conn.execute(
+                "select id from jobs where run_id=? and node_id=? and status in ('pending','running') limit 1",
+                (run_id, node_id),
+            ).fetchone()
+        else:
+            active = conn.execute(
+                "select id from jobs where run_id=? and job_type=? and status in ('pending','running') limit 1",
+                (run_id, job_type),
+            ).fetchone()
         if not active:
             conn.execute(
-                "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,?,'pending',?,?)",
-                (run_id, job_type, now, now),
+                "insert into jobs(run_id,job_type,node_id,status,created_at,updated_at) values(?,?,?,'pending',?,?)",
+                (run_id, job_type, node_id, now, now),
             )
     start_job_queue()
 
@@ -104,10 +120,12 @@ def _drain_jobs() -> None:
             )
             heartbeat.start()
             try:
-                # implementation jobs also drive the subtask DAG + merge inside implement_run;
-                # subtask/merge job_types are reserved for a future fully-durable per-node queue.
                 if job["job_type"] == "research":
                     research_run(job["run_id"])
+                elif job["job_type"] == "subtask":
+                    _run_durable_subtask(job["run_id"], job)
+                elif job["job_type"] == "merge":
+                    _merge_and_verify(job["run_id"])
                 else:
                     implement_run(job["run_id"])
                 now = db.utcnow()
@@ -219,7 +237,47 @@ def call_brain(provider: str, prompt: str, allow_web: bool = False, timeout: int
     return call_brain_result(provider, prompt, allow_web, timeout)["content"]
 
 
-def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = "workspace", max_turns: int = 24) -> dict[str, Any]:
+def _build_memory_digest(run_id: str) -> str:
+    """Build a bounded digest of prior brain interactions for this run."""
+    entries = db.brain_memory(run_id)
+    if not entries:
+        return ""
+    budget = db.get_setting_int("brain_memory_budget") or 4000
+    char_budget = budget * 4  # tokens_estimate = chars // 4
+    parts: list[str] = []
+    total_chars = 0
+    # newest last — build in order, trim oldest if over budget
+    for entry in entries:
+        line = f"[{entry['step']}/{entry['role']}] {entry['content']}"
+        total_chars += len(line)
+        parts.append(line)
+    # Drop oldest entries until within budget
+    while total_chars > char_budget and len(parts) > 1:
+        dropped = parts.pop(0)
+        total_chars -= len(dropped)
+    return "PRIOR CONTEXT (brain's earlier reasoning this run):\n" + "\n\n".join(parts) + "\n\n"
+
+
+def call_brain_with_memory(
+    run_id: str, provider: str, step: str, prompt: str,
+    allow_web: bool = False, timeout: int = 900,
+) -> dict[str, Any]:
+    """Brain call with per-run memory continuity.
+
+    Injects a digest of prior brain steps, calls the brain, and persists both
+    a prompt summary and the response for future calls to reference.
+    """
+    digest = _build_memory_digest(run_id)
+    full_prompt = digest + prompt if digest else prompt
+    result = call_brain_result(provider, full_prompt, allow_web, timeout, run_id=run_id)
+    # Persist prompt summary (first 2000 chars) and full response
+    summary = prompt[:2000]
+    db.add_brain_memory(run_id, step, "prompt", summary)
+    db.add_brain_memory(run_id, step, "response", result["content"][:4000])
+    return result
+
+
+def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = "workspace", max_turns: int = 24, node_id: str | None = None) -> dict[str, Any]:
     attempts = 1 if mode == "implementation" else 3
     for attempt in range(attempts):
         try:
@@ -228,7 +286,7 @@ def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = 
                     "POST",
                     settings.worker_url + "/execute/stream",
                     headers={"X-Worker-Token": settings.worker_token},
-                    json={"run_id": run_id, "workspace": workspace, "model": model, "mode": mode, "task": task, "max_turns": max_turns},
+                    json={"run_id": run_id, "workspace": workspace, "model": model, "mode": mode, "task": task, "max_turns": max_turns, **({"node_id": node_id} if node_id else {})},
                 ) as response:
                     response.raise_for_status()
                     for line in response.iter_lines():
@@ -239,7 +297,7 @@ def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = 
                             return item["result"]
                         if item.get("type") == "error":
                             raise RuntimeError(item.get("error") or "Worker failed")
-                        record_worker_activity(run_id, mode, item)
+                        record_worker_activity(run_id, mode, item, node_id=node_id)
         except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.HTTPStatusError):
             if attempt + 1 >= attempts:
                 raise
@@ -247,12 +305,15 @@ def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = 
     raise RuntimeError("Worker unavailable")
 
 
-def record_worker_activity(run_id: str, mode: str, item: dict[str, Any]) -> None:
+def record_worker_activity(run_id: str, mode: str, item: dict[str, Any], *, node_id: str | None = None) -> None:
     kind = str(item.get("type") or "")
     if kind == "message":
         content = " ".join(str(item.get("content") or "").split())[:1000]
         if content:
-            db.add_event(run_id, "agent.activity", content, {"phase": mode, "state": "message"})
+            data: dict[str, Any] = {"phase": mode, "state": "message"}
+            if node_id:
+                data["node_id"] = node_id
+            db.add_event(run_id, "agent.activity", content, data)
         return
     if kind not in {"tool.started", "tool.completed"}:
         return
@@ -268,12 +329,10 @@ def record_worker_activity(run_id: str, mode: str, item: dict[str, Any]) -> None
         state = "changed"
     verb = "Working" if kind == "tool.started" else "Finished"
     message = f"{verb}: {tool}{f' · {target}' if target else ''}"
-    db.add_event(
-        run_id,
-        "agent.activity",
-        message,
-        {"phase": mode, "state": state, "tool": tool, "path": path, "turn": item.get("turn")},
-    )
+    data = {"phase": mode, "state": state, "tool": tool, "path": path, "turn": item.get("turn")}
+    if node_id:
+        data["node_id"] = node_id
+    db.add_event(run_id, "agent.activity", message, data)
 
 
 def discover_agents() -> list[dict[str, Any]]:
@@ -347,6 +406,50 @@ def choose_agent(role: str, exclude: set[str] | None = None, discover: bool = Tr
         )
     candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].lower()))
     return candidates[0][-1]
+
+
+# In-memory round-robin counters per run for distributing work across equally-scored agents.
+_subtask_assignment_counts: dict[str, dict[str, int]] = {}
+
+
+def choose_subtask_agent(
+    node: dict[str, Any], exclude: set[str] | None = None, run_id: str | None = None,
+) -> dict[str, Any]:
+    """Choose an agent for a specific subtask, honoring role and optional model hint.
+
+    1. If node has suggested_model and that model is enabled+eligible -> use it.
+    2. Else choose_agent(node.role, exclude) — now honoring the subtask's role.
+    3. Round-robin tiebreak: when multiple agents have equal scores, rotate.
+    """
+    exclude = exclude or set()
+    role = node.get("role") or "implementation"
+    suggested = node.get("suggested_model") or ""
+    if suggested:
+        agent = db.one("select * from agent_profiles where model=? and enabled=1", (suggested,))
+        if agent and _agent_is_eligible(agent, role, exclude):
+            return agent
+    # Collect all eligible candidates for round-robin
+    candidates = []
+    for row in db.all_rows("select * from agent_profiles where enabled=1"):
+        if not _agent_is_eligible(row, role, exclude):
+            continue
+        scores = json.loads(row["role_scores_json"] or "{}")
+        candidates.append((int(scores.get(role, 0)), int(row["priority"]), int(row["context_size"]), row["name"], row))
+    if not candidates:
+        # Fallback to standard choose_agent which can auto-discover
+        return choose_agent(role, exclude)
+    candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].lower()))
+    # Round-robin among top-tied candidates
+    top_score = (candidates[0][0], candidates[0][1])
+    tied = [c for c in candidates if (c[0], c[1]) == top_score]
+    if len(tied) > 1 and run_id:
+        counts = _subtask_assignment_counts.setdefault(run_id, {})
+        # Pick the agent with the fewest assignments
+        tied.sort(key=lambda c: (counts.get(c[-1]["id"], 0), c[3].lower()))
+        chosen = tied[0][-1]
+        counts[chosen["id"]] = counts.get(chosen["id"], 0) + 1
+        return chosen
+    return tied[0][-1]
 
 
 def save_artifact(run_id: str, kind: str, name: str, content: Any) -> None:
@@ -447,18 +550,6 @@ def create_run(task: str, provider: str, target: Path, web_research: bool) -> di
     return db.one("select * from runs where id=?", (run_id,)) or {}
 
 
-DECOMPOSE_PROMPT = (
-    "You are the supervisor brain. Decompose the implementation plan below into a DAG of "
-    "independent subtasks a pool of coding agents can execute. Return JSON ONLY:\n"
-    '{"subtasks":[{"node_id":"kebab-id","title":"...","spec":"decision-complete instructions",'
-    '"depends_on":["other-node-id"],"file_globs":["path/glob/**"],"acceptance_criteria":"...",'
-    '"role":"implementation"}]}\n'
-    "Rules: keep each subtask independently verifiable; give every subtask a disjoint file_globs "
-    "scope; if two subtasks must touch the same files, serialize them with depends_on instead of "
-    "running them in parallel; use a single subtask if the plan is not decomposable. No prose.\n\nPLAN:\n"
-)
-
-
 def decompose_plan(run_id: str, plan: str, provider: str) -> list[dict[str, Any]]:
     """Ask the brain to turn a plan into a validated task graph and persist it.
 
@@ -466,9 +557,9 @@ def decompose_plan(run_id: str, plan: str, provider: str) -> list[dict[str, Any]
     the existing single-implementer path (no subtasks persisted). Returns the node list.
     """
     try:
-        result = call_brain_result(provider, DECOMPOSE_PROMPT + plan, False, run_id=run_id)
+        result = call_brain_with_memory(run_id, provider, "decompose", build_decompose_prompt(plan))
         record_usage(run_id, result, "brain")
-        nodes = validate_graph(parse_task_graph(result["content"]))
+        nodes = validate_graph(extract_json(result["content"]))
         db.insert_subtasks(run_id, nodes)
         save_artifact(run_id, "task_graph", "Task graph", {"subtasks": nodes})
         conflicts = independent_pairs_sharing_globs(nodes)
@@ -479,7 +570,7 @@ def decompose_plan(run_id: str, plan: str, provider: str) -> list[dict[str, Any]
             {"count": len(nodes), "overlap_warnings": conflicts},
         )
         return nodes
-    except (GraphError, KeyError, RuntimeError) as exc:
+    except (GraphError, KeyError, RuntimeError, ValueError) as exc:
         log.warning("decompose_failed", extra={"run_id": run_id, "error": str(exc)})
         db.add_event(run_id, "plan.decompose_skipped", "Plan kept as a single unit", {"reason": str(exc)[:400]})
         return []
@@ -504,12 +595,11 @@ def research_run(run_id: str) -> None:
         dossier = result.get("content", "")
         save_artifact(run_id, "research", "Ollama research dossier", {"summary": dossier, "events": result.get("events", [])})
         db.add_event(run_id, "research.completed", "Ollama research complete")
-        prompt = (
-            "You are supervisor brain. Use worker dossier to write decision-complete Markdown implementation plan. "
-            "Include architecture, exact behavior, interfaces, failure handling, tests, and acceptance criteria. "
-            "Do not implement or edit files.\n\nUSER TASK:\n" + run["task"] + "\n\nWORKER DOSSIER:\n" + dossier
+        prompt = build_plan_prompt(run["task"], dossier)
+        brain_result = call_brain_with_memory(
+            run_id, run["brain_provider"], "plan", prompt,
+            allow_web=bool(run["web_research"]),
         )
-        brain_result = call_brain_result(run["brain_provider"], prompt, bool(run["web_research"]), run_id=run_id)
         record_usage(run_id, brain_result, "brain")
         plan = brain_result["content"]
         if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
@@ -636,30 +726,15 @@ def redo_plan(run_id: str) -> dict[str, Any]:
 
 
 def verification_prompt(run: dict[str, Any], implementation_summary: str) -> str:
-    return (
-        "Verify approved implementation independently. Inspect staged code and run relevant safe checks. "
-        "Start final answer with PASS or FAIL. Cite exact files and test output.\n\nAPPROVED PLAN:\n"
-        + (run["approved_plan"] or "") + "\n\nIMPLEMENTER SUMMARY:\n" + implementation_summary
-    )
+    return build_verification_prompt(run["approved_plan"] or "", implementation_summary)
 
 
 def brain_verdict(run: dict[str, Any], reports: list[str]) -> tuple[bool, str]:
-    prompt = (
-        "Act as supervisor. Judge whether implementation satisfies approved plan using verifier reports. "
-        "Return JSON only: {\"passed\":boolean,\"verdict\":string,\"repair_task\":string,\"scope_expansion\":boolean}. "
-        "Set scope_expansion true when a required repair exceeds approved scope; otherwise repair_task must remain inside scope.\n\nPLAN:\n" + (run["approved_plan"] or "")
-        + "\n\nREPORTS:\n" + "\n\n---\n\n".join(reports)
-    )
-    brain_result = call_brain_result(run["brain_provider"], prompt, False, run_id=run["id"])
+    prompt = build_verdict_prompt(run["approved_plan"] or "", reports)
+    brain_result = call_brain_with_memory(run["id"], run["brain_provider"], "verdict", prompt)
     record_usage(run["id"], brain_result, "brain")
-    raw = brain_result["content"]
-    cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
-    try:
-        value = json.loads(cleaned)
-        return bool(value.get("passed")), json.dumps(value, ensure_ascii=False)
-    except json.JSONDecodeError:
-        passed = "\"passed\":true" in raw.replace(" ", "").lower()
-        return passed, raw
+    verdict = parse_verdict(brain_result["content"])
+    return verdict.passed, verdict.to_json()
 
 
 def _run_subtask(run_id: str, node: dict[str, Any], base_stage: Path) -> dict[str, Any]:
@@ -667,7 +742,7 @@ def _run_subtask(run_id: str, node: dict[str, Any], base_stage: Path) -> dict[st
     subtask_id = node["id"]
     if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
         raise RuntimeError("Run cancelled")
-    agent = choose_agent("implementation")
+    agent = choose_subtask_agent(node, run_id=run_id)
     worktree = stage_subtask(run_id, node["node_id"], base_stage)
     db.update_subtask(subtask_id, status="running", agent_id=agent["id"], worktree_ref=str(worktree), attempts=int(node.get("attempts") or 0) + 1)
     db.add_event(run_id, "subtask.started", f"{node['title']} started with {agent['name']}", {"node_id": node["node_id"]})
@@ -681,15 +756,241 @@ def _run_subtask(run_id: str, node: dict[str, Any], base_stage: Path) -> dict[st
     result = worker_call(
         run_id, agent["model"], "implementation", agent_task(agent, task),
         workspace=f"subtasks/{node['node_id']}/workspace", max_turns=32,
+        node_id=node["node_id"],
     )
     record_usage(run_id, result)
     db.add_subtask_result(subtask_id, run_id, "implementation", result.get("content", ""))
     if not result.get("ok"):
         db.update_subtask(subtask_id, status="failed", result_summary=(result.get("error") or "failed")[:2000])
         raise RuntimeError(f"Subtask {node['node_id']} failed: {result.get('error') or 'worker error'}")
-    db.update_subtask(subtask_id, status="done", result_summary=result.get("content", "")[:4000])
+    impl_summary = result.get("content", "")[:4000]
+    criteria = node.get("acceptance_criteria") or ""
+    if criteria:
+        run = db.one("select * from runs where id=?", (run_id,)) or {}
+        provider = run.get("brain_provider") or "codex"
+        verify_prompt = build_subtask_verify_prompt(node["title"], criteria, impl_summary)
+        verify_result = call_brain_with_memory(run_id, provider, "subtask_verify", verify_prompt)
+        sv = parse_subtask_verdict(verify_result)
+        db.add_event(run_id, "subtask.verified", f"{node['title']}: {'passed' if sv.passed else 'FAILED'}", {"node_id": node["node_id"], "passed": sv.passed, "issues": sv.issues})
+        if not sv.passed:
+            db.update_subtask(subtask_id, status="failed", result_summary=f"Verification failed: {sv.issues}"[:2000])
+            raise RuntimeError(f"Subtask {node['node_id']} failed verification: {sv.issues}")
+    db.update_subtask(subtask_id, status="done", result_summary=impl_summary)
     db.add_event(run_id, "subtask.completed", f"{node['title']} complete", {"node_id": node["node_id"]})
     return node
+
+
+def _transitive_deps(node_id: str, dep_map: dict[str, list[str]], seen: set[str] | None = None) -> set[str]:
+    """Return all transitive dependencies for a node."""
+    if seen is None:
+        seen = set()
+    for dep in dep_map.get(node_id, []):
+        if dep not in seen:
+            seen.add(dep)
+            _transitive_deps(dep, dep_map, seen)
+    return seen
+
+
+def _enqueue_ready_subtasks(run_id: str) -> None:
+    """Check DAG progress and enqueue jobs for ready nodes, or merge if all done."""
+    nodes = db.subtasks(run_id)
+    if not nodes:
+        return
+    status_map = {n["node_id"]: n["status"] for n in nodes}
+    dep_map = {n["node_id"]: json.loads(n.get("depends_on_json") or "[]") for n in nodes}
+    failed_nodes = {nid for nid, s in status_map.items() if s == "failed"}
+    blocked_by_failure = set()
+    for nid in status_map:
+        if _transitive_deps(nid, dep_map) & failed_nodes:
+            blocked_by_failure.add(nid)
+    non_blocked = {nid for nid in status_map if nid not in failed_nodes and nid not in blocked_by_failure}
+    if non_blocked and all(status_map[nid] == "done" for nid in non_blocked) and not any(
+        status_map[nid] in ("pending", "running") for nid in blocked_by_failure
+    ):
+        enqueue_job(run_id, "merge")
+        return
+    for node in nodes:
+        if node["status"] != "pending":
+            continue
+        if node["node_id"] in blocked_by_failure:
+            continue
+        deps = dep_map[node["node_id"]]
+        if all(status_map.get(dep) == "done" for dep in deps):
+            enqueue_job(run_id, "subtask", node_id=node["node_id"])
+
+
+def _run_durable_subtask(run_id: str, job: dict[str, Any]) -> None:
+    """Execute one subtask node via the durable job queue, then chain next ready nodes."""
+    run_status = (db.one("select status from runs where id=?", (run_id,)) or {}).get("status")
+    if run_status in ("cancelled", "failed"):
+        return
+    node_id = job["node_id"]
+    nodes = db.subtasks(run_id)
+    node = next((n for n in nodes if n["node_id"] == node_id), None)
+    if not node:
+        raise RuntimeError(f"Subtask node {node_id} not found")
+    if node["status"] == "done":
+        _enqueue_ready_subtasks(run_id)
+        return
+    base_stage = settings.jobs_dir / run_id / "workspace"
+    max_attempts = db.get_setting_int("subtask_max_attempts") or 2
+    try:
+        _run_subtask(run_id, node, base_stage)
+        _enqueue_ready_subtasks(run_id)
+    except Exception as exc:
+        current_attempts = int(node.get("attempts") or 0) + 1
+        log.warning("subtask_failed", extra={"run_id": run_id, "node_id": node_id, "attempt": current_attempts, "max": max_attempts})
+        if current_attempts < max_attempts:
+            db.update_subtask(node["id"], status="pending")
+            db.add_event(run_id, "subtask.retry", f"{node['title']} retry {current_attempts}/{max_attempts}", {"node_id": node_id, "attempt": current_attempts, "error": str(exc)[:500]})
+            now = db.utcnow()
+            db.execute(
+                "insert into jobs(run_id,job_type,node_id,status,created_at,updated_at) values(?,?,?,'pending',?,?)",
+                (run_id, "subtask", node_id, now, now),
+            )
+            start_job_queue()
+            return
+        db.update_subtask(node["id"], status="failed", result_summary=str(exc)[:2000])
+        db.add_event(run_id, "subtask.failed", f"{node['title']} failed after {current_attempts} attempt(s)", {"node_id": node_id, "error": str(exc)[:1000]})
+        _enqueue_ready_subtasks(run_id)
+        all_nodes = db.subtasks(run_id)
+        status_map = {n["node_id"]: n["status"] for n in all_nodes}
+        if all(s in ("done", "failed") for s in status_map.values()):
+            if all(s == "failed" for s in status_map.values()):
+                update_run(run_id, status="failed", error=f"All subtasks failed (last: {exc})"[:4000])
+                db.add_event(run_id, "run.failed", "All subtasks failed")
+                raise
+            enqueue_job(run_id, "merge")
+
+
+def _verify_and_apply(run_id: str, summary: str, implementer_ids: set[str], repair_agent: dict[str, Any]) -> None:
+    """Verification loop + apply + post-check. Shared by single-agent and multi-agent paths."""
+    update_run(run_id, status="verifying")
+    for repair in range(3):
+        run = db.one("select * from runs where id=?", (run_id,)) or {}
+        first = choose_agent("verification", set(implementer_ids))
+        try:
+            second = choose_agent("verification", implementer_ids | {first["id"]})
+        except RuntimeError:
+            second = first
+        reports = []
+        verifier_ids = []
+        for verifier in (first, second):
+            result = worker_call(run_id, verifier["model"], "verification", agent_task(verifier, verification_prompt(run, summary)), max_turns=18)
+            record_usage(run_id, result)
+            reports.append(result.get("content", ""))
+            verifier_ids.append(verifier["id"])
+            save_artifact(run_id, "verification", verifier["name"], result)
+            verifier_passed = bool(result.get("ok")) and result.get("content", "").lstrip().upper().startswith("PASS")
+            db.execute(
+                "insert into verification_results(run_id,agent_id,cycle,report,passed,created_at) values(?,?,?,?,?,?)",
+                (run_id, verifier["id"], repair, result.get("content", ""), int(verifier_passed), db.utcnow()),
+            )
+            if not result.get("ok"):
+                raise RuntimeError(result.get("error") or f"Verifier {verifier['name']} failed")
+        if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
+            return
+        update_run(run_id, verification_agent_ids_json=json.dumps(verifier_ids))
+        passed, verdict = brain_verdict(run, reports)
+        update_run(run_id, verdict=verdict)
+        db.add_event(run_id, "verification.completed", "Supervisor verdict", {"passed": passed, "repair": repair})
+        if passed:
+            break
+        try:
+            parsed = json.loads(verdict)
+        except json.JSONDecodeError:
+            parsed = {}
+        if parsed.get("scope_expansion"):
+            expansion = parsed.get("repair_task") or parsed.get("verdict") or "Verifier requested expanded scope."
+            revised_plan = (run.get("approved_plan") or "") + "\n\n## Requested Scope Expansion\n\n" + expansion
+            update_run(run_id, status="awaiting_approval", draft_plan=revised_plan, error="Scope expansion requires approval")
+            db.add_event(run_id, "scope.approval_required", "Repair exceeds approved scope")
+            return
+        if repair >= 2:
+            update_run(run_id, status="failed", error="Verification failed after two repair cycles")
+            return
+        repair_task = parsed.get("repair_task") or "Fix every defect in these verifier reports:\n" + "\n\n".join(reports)
+        update_run(run_id, status="implementing", repair_count=repair + 1)
+        repair_result = worker_call(run_id, repair_agent["model"], "implementation", agent_task(repair_agent, repair_task), max_turns=24)
+        record_usage(run_id, repair_result)
+        if not repair_result.get("ok"):
+            raise RuntimeError(repair_result.get("error") or "Repair agent failed")
+        summary = repair_result.get("content", "")
+        save_artifact(run_id, "repair", f"Repair cycle {repair + 1}", repair_result)
+        update_run(run_id, status="verifying")
+    if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
+        return
+    target = Path(run["target_path"])
+    if manifest_hash(target) != run["baseline_hash"]:
+        raise RuntimeError("Workspace changed during run; verified stage was not applied")
+    update_run(run_id, status="applying")
+    stage = settings.jobs_dir / run_id / "workspace"
+    changes = apply_stage(target, stage)
+    save_artifact(run_id, "changes", "Applied file manifest", changes)
+    db.add_event(run_id, "apply.completed", "Verified changes applied", changes)
+    update_run(run_id, status="post_check")
+    stage_workspace(run_id, target, "postcheck")
+    verifier = choose_agent("verification", set(implementer_ids))
+    post = worker_call(
+        run_id, verifier["model"], "verification",
+        agent_task(verifier, "Post-apply check. Verify copied final server state still satisfies approved plan. Start with PASS or FAIL.\n\n" + (run.get("approved_plan") or "")),
+        workspace="postcheck", max_turns=18,
+    )
+    record_usage(run_id, post)
+    save_artifact(run_id, "post_check", "Post-apply verification", post)
+    post_pass = post.get("ok") and post.get("content", "").lstrip().upper().startswith("PASS")
+    if not post_pass:
+        restore_snapshot(run["snapshot_id"])
+        update_run(run_id, status="rolled_back", error="Post-apply verification failed; snapshot restored", completed_at=db.utcnow())
+        db.add_event(run_id, "rollback.completed", "Post-check failed; snapshot restored")
+        return
+    completed = db.utcnow()
+    update_run(run_id, status="completed", completed_at=completed)
+    final_run = db.one("select verdict from runs where id=?", (run_id,)) or {}
+    db.execute("update history_snippets set final_verdict=?,completed_at=? where run_id=?", (final_run.get("verdict"), completed, run_id))
+    db.add_event(run_id, "run.completed", "Run completed successfully")
+    _subtask_assignment_counts.pop(run_id, None)
+
+
+def _merge_and_verify(run_id: str) -> None:
+    """Merge subtask worktrees then run verification+apply. Called by merge job."""
+    try:
+        run = db.one("select * from runs where id=?", (run_id,))
+        if not run or run["status"] in ("cancelled", "failed"):
+            return
+        base_stage = settings.jobs_dir / run_id / "workspace"
+        nodes = db.subtasks(run_id)
+        done_nodes = [n for n in nodes if n["status"] == "done"]
+        failed_nodes = [n for n in nodes if n["status"] == "failed"]
+        worktrees = [(n["node_id"], settings.jobs_dir / run_id / "subtasks" / n["node_id"] / "workspace") for n in done_nodes]
+        merged = merge_worktrees(base_stage, worktrees)
+        save_artifact(run_id, "merge", "Merged subtask manifest", merged)
+        failed_info = f" ({len(failed_nodes)} subtask(s) failed)" if failed_nodes else ""
+        db.add_event(run_id, "subtasks.merged", f"Merged {merged['subtasks']} subtask worktree(s){failed_info}", merged)
+        implementer_ids = {n["agent_id"] for n in done_nodes if n.get("agent_id")}
+        summary = "\n\n".join(f"### {n['title']}\n{n.get('result_summary') or ''}" for n in done_nodes)
+        if failed_nodes:
+            summary += "\n\n## FAILED SUBTASKS (not merged)\n" + "\n".join(f"- {n['title']}: {n.get('result_summary') or 'failed'}" for n in failed_nodes)
+        repair_agent = choose_agent("implementation")
+        _verify_and_apply(run_id, summary, implementer_ids, repair_agent)
+    except MergeConflict as exc:
+        log.warning("merge_conflict", extra={"run_id": run_id})
+        update_run(run_id, status="failed", error=str(exc)[:4000])
+        db.add_event(run_id, "subtasks.conflict", "Subtask worktrees conflict; re-plan with disjoint scopes", {"conflicts": exc.conflicts})
+    except Exception as exc:
+        log.exception("merge_verify_failed", extra={"run_id": run_id})
+        run = db.one("select * from runs where id=?", (run_id,))
+        if run and run.get("status") == "cancelled":
+            return
+        if run and run.get("snapshot_id") and run.get("status") in {"applying", "post_check"}:
+            try:
+                restore_snapshot(run["snapshot_id"])
+                update_run(run_id, status="rolled_back", error=str(exc)[:4000], completed_at=db.utcnow())
+            except Exception as rollback_error:
+                update_run(run_id, status="failed", error=f"{exc}; rollback failed: {rollback_error}"[:4000])
+        else:
+            update_run(run_id, status="failed", error=str(exc)[:4000])
+        db.add_event(run_id, "run.failed", "Merge/verification workflow failed", {"error": str(exc)[:1000]})
 
 
 def execute_dag(run_id: str, base_stage: Path) -> tuple[str, set[str]]:
@@ -746,118 +1047,29 @@ def implement_run(run_id: str) -> None:
         run = db.one("select * from runs where id=?", (run_id,))
         if not run or run["status"] == "cancelled":
             return
-        base_stage = settings.jobs_dir / run_id / "workspace"
         subtask_nodes = db.subtasks(run_id)
         if subtask_nodes:
-            # Multi-agent path: execute the approved task DAG, then merge into base_stage.
-            db.add_event(run_id, "implementation.started", f"Executing {len(subtask_nodes)} subtask(s) (pool {settings.worker_pool_size})")
-            summary, implementer_ids = execute_dag(run_id, base_stage)
-            repair_agent = choose_agent("implementation")
-        else:
-            # Single-agent path (backward compatible): one implementer runs the whole plan.
-            agent = db.one("select * from agent_profiles where id=?", (run["implementation_agent_id"],))
-            if not agent:
-                raise RuntimeError("Implementation agent missing")
-            db.add_event(run_id, "implementation.started", f"Implementation started with {agent['name']}")
-            task = "Implement this approved plan completely.\n\n" + (run["approved_plan"] or "")
-            implementation = worker_call(run_id, agent["model"], "implementation", agent_task(agent, task), max_turns=32)
-            record_usage(run_id, implementation)
-            summary = implementation.get("content", "")
-            save_artifact(run_id, "implementation", "Implementation transcript", implementation)
-            if not implementation.get("ok"):
-                raise RuntimeError(implementation.get("error") or "Implementation agent failed")
-            implementer_ids = {agent["id"]}
-            repair_agent = agent
+            # Multi-agent path: dispatch durable subtask jobs and return.
+            # Completion is driven by _run_durable_subtask chaining → merge job.
+            pending = [n for n in subtask_nodes if n["status"] not in ("done", "running")]
+            db.add_event(run_id, "implementation.started", f"Dispatching {len(pending)} subtask(s) via durable queue")
+            _enqueue_ready_subtasks(run_id)
+            return
+        # Single-agent path (backward compatible): one implementer runs the whole plan.
+        agent = db.one("select * from agent_profiles where id=?", (run["implementation_agent_id"],))
+        if not agent:
+            raise RuntimeError("Implementation agent missing")
+        db.add_event(run_id, "implementation.started", f"Implementation started with {agent['name']}")
+        task = "Implement this approved plan completely.\n\n" + (run["approved_plan"] or "")
+        implementation = worker_call(run_id, agent["model"], "implementation", agent_task(agent, task), max_turns=32)
+        record_usage(run_id, implementation)
+        summary = implementation.get("content", "")
+        save_artifact(run_id, "implementation", "Implementation transcript", implementation)
+        if not implementation.get("ok"):
+            raise RuntimeError(implementation.get("error") or "Implementation agent failed")
         if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
             return
-        update_run(run_id, status="verifying")
-        for repair in range(3):
-            run = db.one("select * from runs where id=?", (run_id,)) or run
-            first = choose_agent("verification", set(implementer_ids))
-            try:
-                second = choose_agent("verification", implementer_ids | {first["id"]})
-            except RuntimeError:
-                second = first
-            reports = []
-            verifier_ids = []
-            for verifier in (first, second):
-                result = worker_call(run_id, verifier["model"], "verification", agent_task(verifier, verification_prompt(run, summary)), max_turns=18)
-                record_usage(run_id, result)
-                reports.append(result.get("content", ""))
-                verifier_ids.append(verifier["id"])
-                save_artifact(run_id, "verification", verifier["name"], result)
-                verifier_passed = bool(result.get("ok")) and result.get("content", "").lstrip().upper().startswith("PASS")
-                db.execute(
-                    "insert into verification_results(run_id,agent_id,cycle,report,passed,created_at) values(?,?,?,?,?,?)",
-                    (run_id, verifier["id"], repair, result.get("content", ""), int(verifier_passed), db.utcnow()),
-                )
-                if not result.get("ok"):
-                    raise RuntimeError(result.get("error") or f"Verifier {verifier['name']} failed")
-            if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
-                return
-            update_run(run_id, verification_agent_ids_json=json.dumps(verifier_ids))
-            passed, verdict = brain_verdict(run, reports)
-            update_run(run_id, verdict=verdict)
-            db.add_event(run_id, "verification.completed", "Supervisor verdict", {"passed": passed, "repair": repair})
-            if passed:
-                break
-            try:
-                parsed = json.loads(verdict)
-            except json.JSONDecodeError:
-                parsed = {}
-            if parsed.get("scope_expansion"):
-                expansion = parsed.get("repair_task") or parsed.get("verdict") or "Verifier requested expanded scope."
-                revised_plan = (run["approved_plan"] or "") + "\n\n## Requested Scope Expansion\n\n" + expansion
-                update_run(run_id, status="awaiting_approval", draft_plan=revised_plan, error="Scope expansion requires approval")
-                db.add_event(run_id, "scope.approval_required", "Repair exceeds approved scope")
-                return
-            if repair >= 2:
-                update_run(run_id, status="failed", error="Verification failed after two repair cycles")
-                return
-            repair_task = parsed.get("repair_task") or "Fix every defect in these verifier reports:\n" + "\n\n".join(reports)
-            update_run(run_id, status="implementing", repair_count=repair + 1)
-            repair_result = worker_call(run_id, repair_agent["model"], "implementation", agent_task(repair_agent, repair_task), max_turns=24)
-            record_usage(run_id, repair_result)
-            if not repair_result.get("ok"):
-                raise RuntimeError(repair_result.get("error") or "Repair agent failed")
-            summary = repair_result.get("content", "")
-            save_artifact(run_id, "repair", f"Repair cycle {repair + 1}", repair_result)
-            update_run(run_id, status="verifying")
-        if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
-            return
-        target = Path(run["target_path"])
-        if manifest_hash(target) != run["baseline_hash"]:
-            raise RuntimeError("Workspace changed during run; verified stage was not applied")
-        update_run(run_id, status="applying")
-        stage = settings.jobs_dir / run_id / "workspace"
-        changes = apply_stage(target, stage)
-        save_artifact(run_id, "changes", "Applied file manifest", changes)
-        db.add_event(run_id, "apply.completed", "Verified changes applied", changes)
-        update_run(run_id, status="post_check")
-        stage_workspace(run_id, target, "postcheck")
-        verifier = choose_agent("verification", set(implementer_ids))
-        post = worker_call(
-            run_id, verifier["model"], "verification",
-            agent_task(verifier, "Post-apply check. Verify copied final server state still satisfies approved plan. Start with PASS or FAIL.\n\n" + (run["approved_plan"] or "")),
-            workspace="postcheck", max_turns=18,
-        )
-        record_usage(run_id, post)
-        save_artifact(run_id, "post_check", "Post-apply verification", post)
-        post_pass = post.get("ok") and post.get("content", "").lstrip().upper().startswith("PASS")
-        if not post_pass:
-            restore_snapshot(run["snapshot_id"])
-            update_run(run_id, status="rolled_back", error="Post-apply verification failed; snapshot restored", completed_at=db.utcnow())
-            db.add_event(run_id, "rollback.completed", "Post-check failed; snapshot restored")
-            return
-        completed = db.utcnow()
-        update_run(run_id, status="completed", completed_at=completed)
-        final_run = db.one("select verdict from runs where id=?", (run_id,)) or {}
-        db.execute("update history_snippets set final_verdict=?,completed_at=? where run_id=?", (final_run.get("verdict"), completed, run_id))
-        db.add_event(run_id, "run.completed", "Run completed successfully")
-    except MergeConflict as exc:
-        log.warning("merge_conflict", extra={"run_id": run_id})
-        update_run(run_id, status="failed", error=str(exc)[:4000])
-        db.add_event(run_id, "subtasks.conflict", "Subtask worktrees conflict; re-plan with disjoint scopes", {"conflicts": exc.conflicts})
+        _verify_and_apply(run_id, summary, {agent["id"]}, agent)
     except Exception as exc:
         log.exception("implementation_failed", extra={"run_id": run_id})
         run = db.one("select * from runs where id=?", (run_id,))

@@ -1,20 +1,22 @@
 """Task-graph parsing and validation for multi-agent decomposition.
 
 The supervisor brain decomposes an approved plan into a DAG of subtasks. This module
-is pure (no DB, no network): it extracts the JSON graph from a brain response and
-validates its shape so the orchestrator can persist and schedule it safely.
+is pure (no DB, no network): it validates graph shape so the orchestrator can persist
+and schedule it safely.  JSON extraction is delegated to brain_io.extract_json.
 
 Graph shape (what the brain is asked to emit):
     {"subtasks": [
         {"node_id": "a", "title": "...", "spec": "...", "depends_on": [],
-         "file_globs": ["src/x/**"], "acceptance_criteria": "...", "role": "implementation"}
+         "file_globs": ["src/x/**"], "acceptance_criteria": "...",
+         "role": "implementation", "suggested_model": null}
     ]}
 """
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
+
+from .brain_io import extract_json as _extract_json
 
 VALID_ROLES = {"research", "implementation", "verification"}
 MAX_SUBTASKS = 40
@@ -28,29 +30,14 @@ class GraphError(ValueError):
 
 
 def parse_task_graph(text: str) -> dict[str, Any]:
-    """Extract a JSON object from a brain response, tolerating ```json fences and prose.
+    """Extract a JSON task graph from brain text. Delegates to brain_io.extract_json.
 
-    Mirrors the lenient parsing already used for brain verdicts: strip fences, else fall
-    back to the first balanced {...} span. Raises GraphError if nothing parses.
+    Kept as a named entry point for backward compatibility; raises GraphError on failure.
     """
-    if not text or not text.strip():
-        raise GraphError("Empty task graph")
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("```", 2)[1] if cleaned.count("```") >= 2 else cleaned.strip("`")
-        cleaned = cleaned.removeprefix("json").strip()
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
-        try:
-            return json.loads(text[start : end + 1])
-        except json.JSONDecodeError as exc:
-            raise GraphError(f"Task graph is not valid JSON: {exc}") from exc
-    raise GraphError("No JSON object found in task graph")
+        return _extract_json(text)
+    except ValueError as exc:
+        raise GraphError(str(exc)) from exc
 
 
 def _as_str_list(value: Any) -> list[str]:
@@ -65,7 +52,7 @@ def validate_graph(graph: dict[str, Any]) -> list[dict[str, Any]]:
     Enforces: non-empty, unique node_ids, dependency references resolve, and the graph
     is acyclic. Returns nodes in a topological order (dependencies before dependants),
     each normalized to: node_id, title, spec, depends_on, file_globs, acceptance_criteria,
-    role. Raises GraphError on any violation.
+    role, suggested_model. Raises GraphError on any violation.
     """
     raw = graph.get("subtasks") if isinstance(graph, dict) else None
     if not isinstance(raw, list) or not raw:
@@ -92,6 +79,7 @@ def validate_graph(graph: dict[str, Any]) -> list[dict[str, Any]]:
         role = str(item.get("role") or item.get("suggested_role") or "implementation").strip().lower()
         if role not in VALID_ROLES:
             role = "implementation"
+        suggested_model = str(item["suggested_model"]).strip() if item.get("suggested_model") else None
         nodes[node_id] = {
             "node_id": node_id,
             "title": title[:200],
@@ -100,6 +88,7 @@ def validate_graph(graph: dict[str, Any]) -> list[dict[str, Any]]:
             "file_globs": _as_str_list(item.get("file_globs")),
             "acceptance_criteria": str(item.get("acceptance_criteria") or "").strip(),
             "role": role,
+            "suggested_model": suggested_model,
         }
         order.append(node_id)
 

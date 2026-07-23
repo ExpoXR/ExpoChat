@@ -24,6 +24,10 @@ JOBS_ROOT = settings.jobs_dir.resolve()
 _cancel_events: dict[str, asyncio.Event] = {}
 _active_tasks: dict[str, asyncio.Task[Any]] = {}
 _cancel_lock = threading.Lock()
+
+
+def _cancel_key(run_id: str, node_id: str | None = None) -> str:
+    return f"{run_id}:{node_id}" if node_id else run_id
 MODE_PROMPTS = {
     "research": "Inspect workspace deeply. Use tools before answering. Return architecture, relevant files, risks, tests, and implementation advice. Never edit.",
     "implementation": "Implement approved task fully in staged workspace. Use precise file tools, run relevant checks, fix failures, then summarize changed files and evidence.",
@@ -39,6 +43,7 @@ class WorkRequest(BaseModel):
     mode: Literal["research", "implementation", "verification", "console"]
     task: str
     max_turns: int = Field(default=24, ge=1, le=40)
+    node_id: str | None = None
 
 
 class CheckRequest(BaseModel):
@@ -161,10 +166,11 @@ async def execute(request: WorkRequest) -> dict[str, Any]:
     root = workspace_for(request)
     event = asyncio.Event()
     task = asyncio.current_task()
+    key = _cancel_key(request.run_id, request.node_id)
     with _cancel_lock:
-        _cancel_events[request.run_id] = event
+        _cancel_events[key] = event
         if task:
-            _active_tasks[request.run_id] = task
+            _active_tasks[key] = task
     try:
         return await agent_loop(request, root, event)
     except asyncio.CancelledError:
@@ -173,8 +179,8 @@ async def execute(request: WorkRequest) -> dict[str, Any]:
         raise HTTPException(502, f"Ollama request failed: {exc}") from exc
     finally:
         with _cancel_lock:
-            _cancel_events.pop(request.run_id, None)
-            _active_tasks.pop(request.run_id, None)
+            _cancel_events.pop(key, None)
+            _active_tasks.pop(key, None)
 
 
 @app.post("/execute/stream", dependencies=[Depends(authorize)])
@@ -189,9 +195,10 @@ async def execute_stream(request: WorkRequest) -> StreamingResponse:
             await queue.put(item)
 
         task = asyncio.create_task(agent_loop(request, root, cancelled, emit))
+        key = _cancel_key(request.run_id, request.node_id)
         with _cancel_lock:
-            _cancel_events[request.run_id] = cancelled
-            _active_tasks[request.run_id] = task
+            _cancel_events[key] = cancelled
+            _active_tasks[key] = task
         try:
             while not task.done() or not queue.empty():
                 try:
@@ -211,8 +218,8 @@ async def execute_stream(request: WorkRequest) -> StreamingResponse:
             yield json.dumps({"type": "error", "error": f"Ollama request failed: {exc}"}) + "\n"
         finally:
             with _cancel_lock:
-                _cancel_events.pop(request.run_id, None)
-                _active_tasks.pop(request.run_id, None)
+                _cancel_events.pop(key, None)
+                _active_tasks.pop(key, None)
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
@@ -229,12 +236,24 @@ def check(request: CheckRequest) -> dict[str, Any]:
 
 
 @app.post("/cancel/{run_id}", dependencies=[Depends(authorize)])
-async def cancel(run_id: str) -> dict[str, Any]:
+async def cancel(run_id: str, node_id: str | None = None) -> dict[str, Any]:
+    cancelled = 0
     with _cancel_lock:
-        event = _cancel_events.get(run_id)
-        task = _active_tasks.get(run_id)
-        if event:
-            event.set()
-        if task:
-            task.cancel()
-    return {"ok": True, "active": event is not None}
+        if node_id:
+            key = _cancel_key(run_id, node_id)
+            event = _cancel_events.get(key)
+            task = _active_tasks.get(key)
+            if event:
+                event.set()
+                cancelled += 1
+            if task:
+                task.cancel()
+        else:
+            for key in list(_cancel_events):
+                if key == run_id or key.startswith(f"{run_id}:"):
+                    _cancel_events[key].set()
+                    cancelled += 1
+            for key in list(_active_tasks):
+                if key == run_id or key.startswith(f"{run_id}:"):
+                    _active_tasks[key].cancel()
+    return {"ok": True, "cancelled": cancelled}

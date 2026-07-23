@@ -11,11 +11,13 @@ Browser -> FastAPI web -> SQLite / snapshots / staged jobs
 ```
 
 - `backend/main.py`: app factory, authenticated HTTP/SSE API, static UI.
-- `backend/orchestrator.py`: durable queue and supervised run state machine.
+- `backend/orchestrator.py`: durable job queue, run state machine, DAG subtask execution.
+- `backend/brain_io.py`: structured brain I/O — prompt builders, JSON extraction, typed results.
 - `backend/worker.py`: credential-isolated Ollama agent loop.
 - `backend/workspace.py`: staging, manifests, atomic snapshots, restore, storage reporting.
 - `backend/workspace_tools.py`: shared path-safe file/search/check tools.
-- `backend/migrations.py`: ordered, idempotent SQLite migrations.
+- `backend/plan_graph.py`: task-graph validation, dependency resolution, `suggested_model` pass-through.
+- `backend/migrations.py`: ordered, idempotent SQLite migrations (12 migrations through Series B).
 - `public/`: native ES-module workbench; no frontend build step.
 
 Providers never receive original workspace mounts. Ollama workers edit `/jobs`; web service applies verified results after approval. Interactive chat uses read-only tools or bounded pinned-file context.
@@ -71,6 +73,9 @@ make backup     # SQLite online backup
 | `WORKER_POOL_SIZE` | `1` | Subtasks a single run runs in parallel (1 = serialized; raise only when Ollama serves models concurrently) |
 | `CHAT_CONTEXT_BYTES` | `120000` | Pinned chat context budget |
 
+Brain memory budget (per-run context window for brain continuity) is a DB setting
+(`brain_memory_budget`, default 4000 tokens). Configurable at runtime via settings API.
+
 Keep concurrency at `1` until Ollama host has capacity for parallel model requests.
 
 ## Operations
@@ -101,7 +106,8 @@ Migrations run transactionally at startup. Restore a DB backup only while servic
 - `Snapshot source exceeds limit`: narrow target or intentionally raise `SNAPSHOT_MAX_BYTES`.
 - `Insufficient snapshot storage`: free space or lower target size; reserve is intentionally conservative.
 - E2E browser library errors: use `make e2e`, not host Playwright.
-- Run stuck after restart: pending jobs recover automatically; failed runs expose Resume.
+- Run stuck after restart: pending jobs and running subtasks recover automatically to pending; failed runs expose Resume.
+- Subtask stuck in "running": `init_db` resets running subtasks to pending on startup. Already-done subtasks skipped on re-execution.
 - Cancellation: web marks run cancelled and asks worker to close active Ollama request; verify worker connectivity if response remains active.
 
 ## Release Checklist

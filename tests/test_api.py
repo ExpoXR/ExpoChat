@@ -210,7 +210,7 @@ def test_worker_cancellation_interrupts_active_task(monkeypatch):
             cancelled = await client.post(f"/cancel/{run_id}", headers=headers)
             response = await asyncio.wait_for(request, timeout=1)
         assert cancelled.status_code == 200
-        assert cancelled.json()["active"] is True
+        assert cancelled.json()["cancelled"] >= 1
         assert response.json()["cancelled"] is True
 
     asyncio.run(run())
