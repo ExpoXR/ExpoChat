@@ -170,6 +170,20 @@ def _task_dag(db: sqlite3.Connection) -> None:
     )
 
 
+def _brain_memory(db: sqlite3.Connection) -> None:
+    db.execute(
+        "create table if not exists brain_memory ("
+        " id integer primary key autoincrement, run_id text not null,"
+        " seq integer not null, step text not null, role text not null,"
+        " content text not null, tokens_estimate integer not null default 0,"
+        " created_at text not null,"
+        " unique(run_id, seq), foreign key(run_id) references runs(id) on delete cascade)"
+    )
+    db.execute("create index if not exists idx_brain_memory_run on brain_memory(run_id, seq)")
+    # Add suggested_model to subtasks for per-subtask agent hints.
+    _add_columns(db, "subtasks", {"suggested_model": "text"})
+
+
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _snapshot_metadata),
     (2, _durable_jobs),
@@ -180,6 +194,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (7, _settings_and_ledger),
     (8, _plan_history),
     (9, _task_dag),
+    (10, _brain_memory),
 ]
 
 

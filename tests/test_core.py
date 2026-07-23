@@ -15,7 +15,7 @@ WORKSPACES = TEST_ROOT / "workspaces"
 
 from fastapi import HTTPException  # noqa: E402
 
-from backend import brain_runner, db, orchestrator, plan_graph, worker, workspace  # noqa: E402
+from backend import brain_io, brain_runner, db, orchestrator, plan_graph, worker, workspace  # noqa: E402
 from backend.main import pinned_context  # noqa: E402
 from backend.migrations import MIGRATIONS  # noqa: E402
 from backend.prompts import CAVEMAN_OUTPUT_INSTRUCTIONS  # noqa: E402
@@ -37,9 +37,9 @@ def setup_module():
 
 def clear_workflow_tables():
     for table in (
-        "jobs", "subtask_results", "subtasks", "verification_results", "run_approvals",
-        "history_snippets", "plan_versions", "run_artifacts", "run_events", "runs",
-        "agent_profiles", "snapshots",
+        "brain_memory", "jobs", "subtask_results", "subtasks", "verification_results",
+        "run_approvals", "history_snippets", "plan_versions", "run_artifacts", "run_events",
+        "runs", "agent_profiles", "snapshots",
     ):
         db.execute(f"delete from {table}")
 
@@ -932,3 +932,283 @@ def test_resume_researches_again_when_workspace_changed(monkeypatch):
     assert resumed["baseline_hash"] == manifest_hash(target)
     assert (orchestrator.settings.jobs_dir / run_id / "workspace" / "main.py").read_text() == "print('external change')\n"
     assert db.one("select id from jobs where run_id=? and job_type='research' and status='pending'", (run_id,))
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: brain_io structured I/O
+# ---------------------------------------------------------------------------
+
+def test_extract_json_handles_fences_and_prose():
+    # Fenced JSON
+    fenced = '```json\n{"passed": true, "verdict": "ok"}\n```'
+    result = brain_io.extract_json(fenced)
+    assert result["passed"] is True
+
+    # Prose around JSON
+    prose = 'Here is my analysis:\n\n{"key": "value"}\n\nHope that helps!'
+    result = brain_io.extract_json(prose)
+    assert result["key"] == "value"
+
+    # Clean JSON
+    clean = '{"subtasks": [{"node_id": "a"}]}'
+    result = brain_io.extract_json(clean)
+    assert result["subtasks"][0]["node_id"] == "a"
+
+    # No JSON
+    with pytest.raises(ValueError, match="No JSON"):
+        brain_io.extract_json("no json here at all")
+
+    # Empty
+    with pytest.raises(ValueError, match="Empty"):
+        brain_io.extract_json("")
+
+
+def test_parse_verdict_typed_result():
+    # Well-formed JSON verdict
+    raw = '{"passed": true, "verdict": "all good", "repair_task": "", "scope_expansion": false}'
+    v = brain_io.parse_verdict(raw)
+    assert v.passed is True
+    assert v.verdict == "all good"
+    assert v.scope_expansion is False
+    assert '"passed": true' in v.to_json()
+
+    # Fenced JSON
+    fenced = '```json\n{"passed": false, "verdict": "bugs", "repair_task": "fix it", "scope_expansion": true}\n```'
+    v = brain_io.parse_verdict(fenced)
+    assert v.passed is False
+    assert v.repair_task == "fix it"
+    assert v.scope_expansion is True
+
+    # Fallback: no JSON, string-sniff
+    raw_pass = 'Here is the verdict: "passed":true somewhere'
+    v = brain_io.parse_verdict(raw_pass)
+    assert v.passed is True
+    assert v.verdict == raw_pass  # raw text preserved
+
+    raw_fail = "The implementation has bugs."
+    v = brain_io.parse_verdict(raw_fail)
+    assert v.passed is False
+
+
+def test_build_prompts_contain_expected_structure():
+    plan = brain_io.build_plan_prompt("build API", "dossier content")
+    assert "USER TASK:" in plan and "build API" in plan
+    assert "WORKER DOSSIER:" in plan and "dossier content" in plan
+
+    decompose = brain_io.build_decompose_prompt("the plan")
+    assert "suggested_model" in decompose  # new field in schema
+    assert "the plan" in decompose
+
+    verdict = brain_io.build_verdict_prompt("plan text", ["report1", "report2"])
+    assert "PLAN:" in verdict and "REPORTS:" in verdict
+
+    verify = brain_io.build_verification_prompt("plan text", "summary text")
+    assert "PASS or FAIL" in verify
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: brain memory
+# ---------------------------------------------------------------------------
+
+def test_brain_memory_accumulates_and_truncates():
+    clear_workflow_tables()
+    run_id = "m" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "Memory test", "codex", str(WORKSPACES), "researching", now, now),
+    )
+
+    # Accumulate entries
+    db.add_brain_memory(run_id, "plan", "prompt", "What should we build?")
+    db.add_brain_memory(run_id, "plan", "response", "Build a REST API with auth.")
+    db.add_brain_memory(run_id, "decompose", "prompt", "Break into subtasks.")
+    db.add_brain_memory(run_id, "decompose", "response", "Two subtasks: auth + endpoints.")
+
+    entries = db.brain_memory(run_id)
+    assert len(entries) == 4
+    assert entries[0]["seq"] == 1
+    assert entries[3]["seq"] == 4
+    assert entries[0]["step"] == "plan"
+    assert entries[2]["role"] == "prompt"
+    assert all(e["tokens_estimate"] > 0 for e in entries)
+
+    # Digest should contain prior context
+    digest = orchestrator._build_memory_digest(run_id)
+    assert "PRIOR CONTEXT" in digest
+    assert "plan/prompt" in digest
+    assert "Build a REST API" in digest
+
+    # Empty run has no digest
+    empty_id = "n" * 24
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (empty_id, "No memory", "codex", str(WORKSPACES), "researching", now, now),
+    )
+    assert orchestrator._build_memory_digest(empty_id) == ""
+
+
+def test_brain_memory_budget_truncation():
+    clear_workflow_tables()
+    run_id = "t" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "Budget test", "codex", str(WORKSPACES), "researching", now, now),
+    )
+    # Set very tight budget
+    db.set_setting("brain_memory_budget", "10")  # 10 tokens = 40 chars
+
+    # Add entries that exceed budget
+    db.add_brain_memory(run_id, "plan", "prompt", "A" * 100)
+    db.add_brain_memory(run_id, "plan", "response", "B" * 100)
+    db.add_brain_memory(run_id, "decompose", "prompt", "C" * 30)
+
+    digest = orchestrator._build_memory_digest(run_id)
+    # Should have dropped oldest entries to stay within budget
+    assert "PRIOR CONTEXT" in digest
+    # Last entry should always be present
+    assert "C" * 30 in digest
+
+    # Reset
+    db.set_setting("brain_memory_budget", "4000")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: per-subtask agent selection
+# ---------------------------------------------------------------------------
+
+def test_choose_subtask_agent_honors_role(monkeypatch):
+    clear_workflow_tables()
+    seed_agent("researcher", "research-model", ["research"], [], 80)
+    seed_agent("implementer", "impl-model", ["implementation"], ["tools"], 80)
+    monkeypatch.setattr(orchestrator, "discover_agents", lambda: [])
+
+    # Research-role subtask should pick the research agent
+    node = {"role": "research", "node_id": "a"}
+    agent = orchestrator.choose_subtask_agent(node)
+    assert agent["id"] == "researcher"
+
+    # Implementation-role subtask should pick the implementation agent
+    node = {"role": "implementation", "node_id": "b"}
+    agent = orchestrator.choose_subtask_agent(node)
+    assert agent["id"] == "implementer"
+
+
+def test_choose_subtask_agent_suggested_model(monkeypatch):
+    clear_workflow_tables()
+    seed_agent("default", "default-model", ["implementation"], ["tools"], 90)
+    seed_agent("special", "special-model", ["implementation"], ["tools"], 50)
+    monkeypatch.setattr(orchestrator, "discover_agents", lambda: [])
+
+    # Without hint, picks highest priority
+    node = {"role": "implementation", "node_id": "a"}
+    agent = orchestrator.choose_subtask_agent(node)
+    assert agent["id"] == "default"
+
+    # With suggested_model, picks that specific model
+    node = {"role": "implementation", "node_id": "b", "suggested_model": "special-model"}
+    agent = orchestrator.choose_subtask_agent(node)
+    assert agent["id"] == "special"
+
+    # Unknown suggested_model falls back to default selection
+    node = {"role": "implementation", "node_id": "c", "suggested_model": "nonexistent-model"}
+    agent = orchestrator.choose_subtask_agent(node)
+    assert agent["id"] == "default"
+
+
+def test_round_robin_distributes_across_equal_agents(monkeypatch):
+    clear_workflow_tables()
+    orchestrator._subtask_assignment_counts.clear()
+    seed_agent("agent-a", "model-a", ["implementation"], ["tools"], 80)
+    seed_agent("agent-b", "model-b", ["implementation"], ["tools"], 80)
+    # Equal role scores
+    db.execute("update agent_profiles set role_scores_json=? where id='agent-a'", (json.dumps({"implementation": 80}),))
+    db.execute("update agent_profiles set role_scores_json=? where id='agent-b'", (json.dumps({"implementation": 80}),))
+    monkeypatch.setattr(orchestrator, "discover_agents", lambda: [])
+
+    run_id = "r" * 24
+    assignments = []
+    for i in range(4):
+        node = {"role": "implementation", "node_id": f"task-{i}"}
+        agent = orchestrator.choose_subtask_agent(node, run_id=run_id)
+        assignments.append(agent["id"])
+
+    # Both agents should be used (round-robin distributes)
+    assert "agent-a" in assignments
+    assert "agent-b" in assignments
+    # Each should get roughly equal assignments
+    assert abs(assignments.count("agent-a") - assignments.count("agent-b")) <= 1
+    orchestrator._subtask_assignment_counts.clear()
+
+
+def test_validate_graph_passes_through_suggested_model():
+    graph = {
+        "subtasks": [
+            {"node_id": "a", "spec": "do a", "role": "implementation", "suggested_model": "qwen3-coder"},
+            {"node_id": "b", "spec": "do b", "role": "research", "suggested_model": None},
+            {"node_id": "c", "spec": "do c"},
+        ]
+    }
+    nodes = plan_graph.validate_graph(graph)
+    assert nodes[0]["suggested_model"] == "qwen3-coder"
+    assert nodes[1]["suggested_model"] is None
+    assert nodes[2]["suggested_model"] is None
+
+
+def test_execute_dag_uses_subtask_role(monkeypatch):
+    """Integration: DAG execution uses per-subtask agent selection with mixed roles."""
+    clear_workflow_tables()
+    orchestrator._subtask_assignment_counts.clear()
+    run_id = "d" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "Mixed role DAG", "codex", str(WORKSPACES), "implementing", now, now),
+    )
+    base = _make_base_stage(run_id, "dag-role-target")
+    nodes = plan_graph.validate_graph({"subtasks": [
+        {"node_id": "research-step", "spec": "research first", "role": "research", "file_globs": ["r.txt"]},
+        {"node_id": "impl-step", "spec": "implement it", "depends_on": ["research-step"], "file_globs": ["i.txt"]},
+    ]})
+    db.insert_subtasks(run_id, nodes)
+    seed_agent("res-agent", "res-model", ["research"], [], 80)
+    seed_agent("impl-agent", "impl-model", ["implementation"], ["tools"], 80)
+
+    chosen_agents = []
+
+    def fake_choose_subtask(node, exclude=None, run_id=None):
+        role = node.get("role", "implementation")
+        if role == "research":
+            agent = {"id": "res-agent", "model": "res-model", "name": "ResAgent"}
+        else:
+            agent = {"id": "impl-agent", "model": "impl-model", "name": "ImplAgent"}
+        chosen_agents.append((node["node_id"], agent["id"]))
+        return agent
+
+    def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24):
+        node = Path(workspace).parts[1] if workspace.startswith("subtasks/") else "main"
+        (orchestrator.settings.jobs_dir / rid / workspace / f"{node}.txt").write_text(f"from {node}\n")
+        return {"ok": True, "content": f"did {node}", "usage": {}}
+
+    monkeypatch.setattr(orchestrator, "choose_subtask_agent", fake_choose_subtask)
+    monkeypatch.setattr(orchestrator, "worker_call", fake_worker_call)
+    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
+
+    summary, implementer_ids = orchestrator.execute_dag(run_id, base)
+    # Research subtask should have been assigned res-agent
+    assert ("research-step", "res-agent") in chosen_agents
+    # Implementation subtask should have been assigned impl-agent
+    assert ("impl-step", "impl-agent") in chosen_agents
+    orchestrator._subtask_assignment_counts.clear()
+
+
+def test_migration_10_creates_brain_memory_table():
+    """Migration 10 creates brain_memory table and subtasks.suggested_model column."""
+    with db.connect() as conn:
+        tables = {row[0] for row in conn.execute(
+            "select name from sqlite_master where type='table'"
+        ).fetchall()}
+        assert "brain_memory" in tables
+        cols = {row[1] for row in conn.execute("pragma table_info(subtasks)")}
+        assert "suggested_model" in cols

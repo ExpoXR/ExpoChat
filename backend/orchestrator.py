@@ -12,8 +12,16 @@ from typing import Any
 import httpx
 
 from . import db
+from .brain_io import (
+    build_decompose_prompt,
+    build_plan_prompt,
+    build_verdict_prompt,
+    build_verification_prompt,
+    extract_json,
+    parse_verdict,
+)
 from .config import settings
-from .plan_graph import GraphError, independent_pairs_sharing_globs, parse_task_graph, validate_graph
+from .plan_graph import GraphError, independent_pairs_sharing_globs, validate_graph
 from .prompts import with_caveman
 from .run_state import validate_transition
 from .security import decrypt_secret
@@ -219,6 +227,46 @@ def call_brain(provider: str, prompt: str, allow_web: bool = False, timeout: int
     return call_brain_result(provider, prompt, allow_web, timeout)["content"]
 
 
+def _build_memory_digest(run_id: str) -> str:
+    """Build a bounded digest of prior brain interactions for this run."""
+    entries = db.brain_memory(run_id)
+    if not entries:
+        return ""
+    budget = db.get_setting_int("brain_memory_budget") or 4000
+    char_budget = budget * 4  # tokens_estimate = chars // 4
+    parts: list[str] = []
+    total_chars = 0
+    # newest last — build in order, trim oldest if over budget
+    for entry in entries:
+        line = f"[{entry['step']}/{entry['role']}] {entry['content']}"
+        total_chars += len(line)
+        parts.append(line)
+    # Drop oldest entries until within budget
+    while total_chars > char_budget and len(parts) > 1:
+        dropped = parts.pop(0)
+        total_chars -= len(dropped)
+    return "PRIOR CONTEXT (brain's earlier reasoning this run):\n" + "\n\n".join(parts) + "\n\n"
+
+
+def call_brain_with_memory(
+    run_id: str, provider: str, step: str, prompt: str,
+    allow_web: bool = False, timeout: int = 900,
+) -> dict[str, Any]:
+    """Brain call with per-run memory continuity.
+
+    Injects a digest of prior brain steps, calls the brain, and persists both
+    a prompt summary and the response for future calls to reference.
+    """
+    digest = _build_memory_digest(run_id)
+    full_prompt = digest + prompt if digest else prompt
+    result = call_brain_result(provider, full_prompt, allow_web, timeout, run_id=run_id)
+    # Persist prompt summary (first 2000 chars) and full response
+    summary = prompt[:2000]
+    db.add_brain_memory(run_id, step, "prompt", summary)
+    db.add_brain_memory(run_id, step, "response", result["content"][:4000])
+    return result
+
+
 def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = "workspace", max_turns: int = 24) -> dict[str, Any]:
     attempts = 1 if mode == "implementation" else 3
     for attempt in range(attempts):
@@ -349,6 +397,50 @@ def choose_agent(role: str, exclude: set[str] | None = None, discover: bool = Tr
     return candidates[0][-1]
 
 
+# In-memory round-robin counters per run for distributing work across equally-scored agents.
+_subtask_assignment_counts: dict[str, dict[str, int]] = {}
+
+
+def choose_subtask_agent(
+    node: dict[str, Any], exclude: set[str] | None = None, run_id: str | None = None,
+) -> dict[str, Any]:
+    """Choose an agent for a specific subtask, honoring role and optional model hint.
+
+    1. If node has suggested_model and that model is enabled+eligible -> use it.
+    2. Else choose_agent(node.role, exclude) — now honoring the subtask's role.
+    3. Round-robin tiebreak: when multiple agents have equal scores, rotate.
+    """
+    exclude = exclude or set()
+    role = node.get("role") or "implementation"
+    suggested = node.get("suggested_model") or ""
+    if suggested:
+        agent = db.one("select * from agent_profiles where model=? and enabled=1", (suggested,))
+        if agent and _agent_is_eligible(agent, role, exclude):
+            return agent
+    # Collect all eligible candidates for round-robin
+    candidates = []
+    for row in db.all_rows("select * from agent_profiles where enabled=1"):
+        if not _agent_is_eligible(row, role, exclude):
+            continue
+        scores = json.loads(row["role_scores_json"] or "{}")
+        candidates.append((int(scores.get(role, 0)), int(row["priority"]), int(row["context_size"]), row["name"], row))
+    if not candidates:
+        # Fallback to standard choose_agent which can auto-discover
+        return choose_agent(role, exclude)
+    candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].lower()))
+    # Round-robin among top-tied candidates
+    top_score = (candidates[0][0], candidates[0][1])
+    tied = [c for c in candidates if (c[0], c[1]) == top_score]
+    if len(tied) > 1 and run_id:
+        counts = _subtask_assignment_counts.setdefault(run_id, {})
+        # Pick the agent with the fewest assignments
+        tied.sort(key=lambda c: (counts.get(c[-1]["id"], 0), c[3].lower()))
+        chosen = tied[0][-1]
+        counts[chosen["id"]] = counts.get(chosen["id"], 0) + 1
+        return chosen
+    return tied[0][-1]
+
+
 def save_artifact(run_id: str, kind: str, name: str, content: Any) -> None:
     serialized = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
     with db.transaction() as conn:
@@ -447,18 +539,6 @@ def create_run(task: str, provider: str, target: Path, web_research: bool) -> di
     return db.one("select * from runs where id=?", (run_id,)) or {}
 
 
-DECOMPOSE_PROMPT = (
-    "You are the supervisor brain. Decompose the implementation plan below into a DAG of "
-    "independent subtasks a pool of coding agents can execute. Return JSON ONLY:\n"
-    '{"subtasks":[{"node_id":"kebab-id","title":"...","spec":"decision-complete instructions",'
-    '"depends_on":["other-node-id"],"file_globs":["path/glob/**"],"acceptance_criteria":"...",'
-    '"role":"implementation"}]}\n'
-    "Rules: keep each subtask independently verifiable; give every subtask a disjoint file_globs "
-    "scope; if two subtasks must touch the same files, serialize them with depends_on instead of "
-    "running them in parallel; use a single subtask if the plan is not decomposable. No prose.\n\nPLAN:\n"
-)
-
-
 def decompose_plan(run_id: str, plan: str, provider: str) -> list[dict[str, Any]]:
     """Ask the brain to turn a plan into a validated task graph and persist it.
 
@@ -466,9 +546,9 @@ def decompose_plan(run_id: str, plan: str, provider: str) -> list[dict[str, Any]
     the existing single-implementer path (no subtasks persisted). Returns the node list.
     """
     try:
-        result = call_brain_result(provider, DECOMPOSE_PROMPT + plan, False, run_id=run_id)
+        result = call_brain_with_memory(run_id, provider, "decompose", build_decompose_prompt(plan))
         record_usage(run_id, result, "brain")
-        nodes = validate_graph(parse_task_graph(result["content"]))
+        nodes = validate_graph(extract_json(result["content"]))
         db.insert_subtasks(run_id, nodes)
         save_artifact(run_id, "task_graph", "Task graph", {"subtasks": nodes})
         conflicts = independent_pairs_sharing_globs(nodes)
@@ -479,7 +559,7 @@ def decompose_plan(run_id: str, plan: str, provider: str) -> list[dict[str, Any]
             {"count": len(nodes), "overlap_warnings": conflicts},
         )
         return nodes
-    except (GraphError, KeyError, RuntimeError) as exc:
+    except (GraphError, KeyError, RuntimeError, ValueError) as exc:
         log.warning("decompose_failed", extra={"run_id": run_id, "error": str(exc)})
         db.add_event(run_id, "plan.decompose_skipped", "Plan kept as a single unit", {"reason": str(exc)[:400]})
         return []
@@ -504,12 +584,11 @@ def research_run(run_id: str) -> None:
         dossier = result.get("content", "")
         save_artifact(run_id, "research", "Ollama research dossier", {"summary": dossier, "events": result.get("events", [])})
         db.add_event(run_id, "research.completed", "Ollama research complete")
-        prompt = (
-            "You are supervisor brain. Use worker dossier to write decision-complete Markdown implementation plan. "
-            "Include architecture, exact behavior, interfaces, failure handling, tests, and acceptance criteria. "
-            "Do not implement or edit files.\n\nUSER TASK:\n" + run["task"] + "\n\nWORKER DOSSIER:\n" + dossier
+        prompt = build_plan_prompt(run["task"], dossier)
+        brain_result = call_brain_with_memory(
+            run_id, run["brain_provider"], "plan", prompt,
+            allow_web=bool(run["web_research"]),
         )
-        brain_result = call_brain_result(run["brain_provider"], prompt, bool(run["web_research"]), run_id=run_id)
         record_usage(run_id, brain_result, "brain")
         plan = brain_result["content"]
         if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
@@ -636,30 +715,15 @@ def redo_plan(run_id: str) -> dict[str, Any]:
 
 
 def verification_prompt(run: dict[str, Any], implementation_summary: str) -> str:
-    return (
-        "Verify approved implementation independently. Inspect staged code and run relevant safe checks. "
-        "Start final answer with PASS or FAIL. Cite exact files and test output.\n\nAPPROVED PLAN:\n"
-        + (run["approved_plan"] or "") + "\n\nIMPLEMENTER SUMMARY:\n" + implementation_summary
-    )
+    return build_verification_prompt(run["approved_plan"] or "", implementation_summary)
 
 
 def brain_verdict(run: dict[str, Any], reports: list[str]) -> tuple[bool, str]:
-    prompt = (
-        "Act as supervisor. Judge whether implementation satisfies approved plan using verifier reports. "
-        "Return JSON only: {\"passed\":boolean,\"verdict\":string,\"repair_task\":string,\"scope_expansion\":boolean}. "
-        "Set scope_expansion true when a required repair exceeds approved scope; otherwise repair_task must remain inside scope.\n\nPLAN:\n" + (run["approved_plan"] or "")
-        + "\n\nREPORTS:\n" + "\n\n---\n\n".join(reports)
-    )
-    brain_result = call_brain_result(run["brain_provider"], prompt, False, run_id=run["id"])
+    prompt = build_verdict_prompt(run["approved_plan"] or "", reports)
+    brain_result = call_brain_with_memory(run["id"], run["brain_provider"], "verdict", prompt)
     record_usage(run["id"], brain_result, "brain")
-    raw = brain_result["content"]
-    cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
-    try:
-        value = json.loads(cleaned)
-        return bool(value.get("passed")), json.dumps(value, ensure_ascii=False)
-    except json.JSONDecodeError:
-        passed = "\"passed\":true" in raw.replace(" ", "").lower()
-        return passed, raw
+    verdict = parse_verdict(brain_result["content"])
+    return verdict.passed, verdict.to_json()
 
 
 def _run_subtask(run_id: str, node: dict[str, Any], base_stage: Path) -> dict[str, Any]:
@@ -667,7 +731,7 @@ def _run_subtask(run_id: str, node: dict[str, Any], base_stage: Path) -> dict[st
     subtask_id = node["id"]
     if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
         raise RuntimeError("Run cancelled")
-    agent = choose_agent("implementation")
+    agent = choose_subtask_agent(node, run_id=run_id)
     worktree = stage_subtask(run_id, node["node_id"], base_stage)
     db.update_subtask(subtask_id, status="running", agent_id=agent["id"], worktree_ref=str(worktree), attempts=int(node.get("attempts") or 0) + 1)
     db.add_event(run_id, "subtask.started", f"{node['title']} started with {agent['name']}", {"node_id": node["node_id"]})
@@ -854,6 +918,7 @@ def implement_run(run_id: str) -> None:
         final_run = db.one("select verdict from runs where id=?", (run_id,)) or {}
         db.execute("update history_snippets set final_verdict=?,completed_at=? where run_id=?", (final_run.get("verdict"), completed, run_id))
         db.add_event(run_id, "run.completed", "Run completed successfully")
+        _subtask_assignment_counts.pop(run_id, None)
     except MergeConflict as exc:
         log.warning("merge_conflict", extra={"run_id": run_id})
         update_run(run_id, status="failed", error=str(exc)[:4000])

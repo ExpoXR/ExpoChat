@@ -117,7 +117,7 @@ def insert_subtasks(run_id: str, nodes: list[dict[str, Any]]) -> None:
         for node in nodes:
             conn.execute(
                 "insert into subtasks(id,run_id,node_id,title,spec,depends_on_json,file_globs_json,"
-                "role,status,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?)",
+                "role,suggested_model,status,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     f"sub-{run_id}-{node['node_id']}",
                     run_id,
@@ -127,6 +127,7 @@ def insert_subtasks(run_id: str, nodes: list[dict[str, Any]]) -> None:
                     json.dumps(node.get("depends_on") or [], ensure_ascii=False),
                     json.dumps(node.get("file_globs") or [], ensure_ascii=False),
                     node.get("role") or "implementation",
+                    node.get("suggested_model"),
                     "pending",
                     now,
                     now,
@@ -154,6 +155,30 @@ def add_subtask_result(subtask_id: str, run_id: str, kind: str, content: str) ->
     )
 
 
+# ---------------------------------------------------------------------------
+# Brain memory — per-run continuity across brain calls
+# ---------------------------------------------------------------------------
+
+def add_brain_memory(run_id: str, step: str, role: str, content: str) -> int:
+    """Append a brain memory entry. seq auto-increments per run. Never pruned."""
+    with closing(connect()) as db:
+        seq = int(
+            (db.execute("select coalesce(max(seq),0)+1 as s from brain_memory where run_id=?", (run_id,)).fetchone() or {"s": 1})["s"]
+        )
+        tokens_estimate = len(content) // 4
+        cursor = db.execute(
+            "insert into brain_memory(run_id,seq,step,role,content,tokens_estimate,created_at) values(?,?,?,?,?,?,?)",
+            (run_id, seq, step, role, content, tokens_estimate, utcnow()),
+        )
+        db.commit()
+        return int(cursor.lastrowid)
+
+
+def brain_memory(run_id: str) -> list[dict[str, Any]]:
+    """Retrieve all brain memory entries for a run, ordered by sequence."""
+    return all_rows("select * from brain_memory where run_id=? order by seq", (run_id,))
+
+
 DEFAULT_SETTINGS: dict[str, str] = {
     "token_budget_run": "0",      # per-run paid-token cap (0 = unlimited)
     "token_budget_daily": "0",    # per-day paid-token cap (0 = unlimited)
@@ -163,6 +188,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "run_events_cap": "500",      # live run-event feed retention (default 500; raise to keep more)
     "run_artifacts_cap": "200",   # run-artifact retention (default 200)
     "timeline_cap": "5000",       # global timeline retention (default 5000)
+    "brain_memory_budget": "4000", # per-run brain memory token budget (chars / 4)
 }
 
 
