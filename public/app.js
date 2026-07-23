@@ -1,7 +1,7 @@
 import { createApi } from "/js/api.mjs";
 import { buildChatPayload, chatAgentStep, chatEventStatus, cloudEngineValue } from "/js/chat.mjs";
 import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMarkdown } from "/js/render.mjs";
-import { artifactPresentation, explorerActivityState, fileActivity, runChoreography, runStatusLabel, tokenCounts } from "/js/runs.mjs";
+import { artifactPresentation, explorerActivityState, fileActivity, runChoreography, runStatusLabel, subtaskCards, tokenCounts } from "/js/runs.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
 import { buildSettingsPayload, usageMeter } from "/js/settings_api.mjs";
 import { consumeSse } from "/js/sse.mjs";
@@ -1208,8 +1208,33 @@ function renderRunChoreography(run, events) {
   }).join("");
 }
 
+function renderSubtasks(run) {
+  const section = $("subtaskSection");
+  const container = $("subtaskCards");
+  if (!section || !container) return;
+  const subs = run?.subtasks || [];
+  if (!subs.length) { section.classList.add("hidden"); return; }
+  section.classList.remove("hidden");
+  const cards = subtaskCards(subs);
+  container.innerHTML = cards.map((card) => {
+    const depLabel = card.deps.length ? `after ${card.deps.join(", ")}` : "";
+    return (
+      `<div class="subtask-card" data-status="${escapeHtml(card.status)}" data-node="${escapeHtml(card.node_id)}">` +
+      `<div class="subtask-head"><span class="subtask-dot"></span>` +
+      `<span class="subtask-title" title="${escapeHtml(card.title)}">${escapeHtml(card.title)}</span></div>` +
+      `<div class="subtask-meta">` +
+      `<span class="subtask-role">${escapeHtml(card.role)}</span>` +
+      (card.agent_name ? `<span>${escapeHtml(card.agent_name)}</span>` : "") +
+      `<span>${escapeHtml(card.status)}</span>` +
+      (depLabel ? `<span class="subtask-deps">${escapeHtml(depLabel)}</span>` : "") +
+      `</div></div>`
+    );
+  }).join("");
+}
+
 function renderRunEvents(events) {
   renderRunChoreography(currentRunData, events);
+  renderSubtasks(currentRunData);
   const list = $("runEventList");
   list.innerHTML = "";
   (events || []).forEach((event) => {
@@ -1296,7 +1321,7 @@ function subscribeRun(id) {
   if (runEventSource) runEventSource.close();
   runEventSource = new EventSource(`/api/runs/${id}/events`);
   runEventSource.onmessage = () => loadRun(id).catch(() => {});
-  ["run.created", "research.started", "research.completed", "plan.ready", "plan.edited", "plan.redo", "plan.approved", "scope.approved", "scope.approval_required", "implementation.started", "agent.activity", "verification.completed", "apply.completed", "rollback.completed", "run.completed", "run.failed", "run.cancelled", "plan.stale"].forEach((name) => {
+  ["run.created", "research.started", "research.completed", "plan.ready", "plan.edited", "plan.redo", "plan.approved", "plan.decomposed", "scope.approved", "scope.approval_required", "implementation.started", "agent.activity", "subtask.started", "subtask.completed", "subtasks.merged", "subtasks.conflict", "verification.completed", "apply.completed", "rollback.completed", "run.completed", "run.failed", "run.cancelled", "plan.stale"].forEach((name) => {
     runEventSource.addEventListener(name, () => {
       loadRun(id).then((run) => {
         loadRuns().catch(() => {});

@@ -86,14 +86,37 @@ export function runChoreography(run = {}, events = []) {
     ["applying", "post_check", "completed"].includes(status);
   const verifyDone = status === "completed";
 
+  // Subtask progress label
+  const subs = run.subtasks || [];
+  let workerLabel = "implementing…";
+  if (subs.length > 0 && status === "implementing") {
+    const done = subs.filter((s) => s.status === "done").length;
+    workerLabel = `subtasks ${done}/${subs.length}`;
+  }
+
   return [
     { role: "brain", title: `Brain · ${run.brain_provider || "supervisor"}`,
       ...step(status === "researching", brainDone, bad && !brainDone, "planning…", "planned") },
     { role: "worker", title: `Worker · ${worker.name || "Ollama"}`,
-      ...step(status === "implementing", implDone, false, "implementing…", "implemented") },
+      ...step(status === "implementing", implDone, false, workerLabel, "implemented") },
     { role: "verifier", title: "Verifier",
       ...step(["verifying", "post_check"].includes(status), verifyDone, status === "rolled_back", "verifying…", "passed") },
   ];
+}
+
+export function subtaskCards(subtasks = []) {
+  if (!subtasks.length) return [];
+  return subtasks.map((node) => {
+    const deps = node.depends_on || [];
+    return {
+      node_id: node.node_id,
+      title: node.title,
+      status: node.status || "pending",
+      role: node.role || "implementation",
+      agent_name: node.agent_name || "",
+      deps,
+    };
+  });
 }
 
 export function artifactPresentation(artifact, content) {

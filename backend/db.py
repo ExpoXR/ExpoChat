@@ -117,7 +117,7 @@ def insert_subtasks(run_id: str, nodes: list[dict[str, Any]]) -> None:
         for node in nodes:
             conn.execute(
                 "insert into subtasks(id,run_id,node_id,title,spec,depends_on_json,file_globs_json,"
-                "role,suggested_model,status,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "acceptance_criteria,role,suggested_model,status,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     f"sub-{run_id}-{node['node_id']}",
                     run_id,
@@ -126,6 +126,7 @@ def insert_subtasks(run_id: str, nodes: list[dict[str, Any]]) -> None:
                     node["spec"],
                     json.dumps(node.get("depends_on") or [], ensure_ascii=False),
                     json.dumps(node.get("file_globs") or [], ensure_ascii=False),
+                    node.get("acceptance_criteria") or "",
                     node.get("role") or "implementation",
                     node.get("suggested_model"),
                     "pending",
@@ -354,6 +355,10 @@ def init_db() -> None:
         db.execute(
             "update jobs set status='pending',error='Interrupted; queued for recovery',lease_owner=null,"
             "lease_expires_at=null,updated_at=? where status='running'",
+            (utcnow(),),
+        )
+        db.execute(
+            "update subtasks set status='pending',updated_at=? where status='running'",
             (utcnow(),),
         )
         db.execute(

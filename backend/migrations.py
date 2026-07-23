@@ -184,6 +184,10 @@ def _brain_memory(db: sqlite3.Connection) -> None:
     _add_columns(db, "subtasks", {"suggested_model": "text"})
 
 
+def _subtask_acceptance(db: sqlite3.Connection) -> None:
+    _add_columns(db, "subtasks", {"acceptance_criteria": "text not null default ''"})
+
+
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _snapshot_metadata),
     (2, _durable_jobs),
@@ -195,6 +199,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (8, _plan_history),
     (9, _task_dag),
     (10, _brain_memory),
+    (11, _subtask_acceptance),
 ]
 
 

@@ -621,6 +621,49 @@ label {
 .agent-card.error .agent-dot { background: var(--danger); animation: none; }
 .agent-card.idle { opacity: 0.6; }
 
+/* Subtask cards — per-node status in the run progress panel */
+.subtask-section { margin: 4px 0 8px; }
+.subtask-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 6px;
+}
+.subtask-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--muted);
+  border-radius: 6px;
+  padding: 7px 10px;
+  background: var(--surface-raised);
+}
+.subtask-card[data-status="running"] { border-left-color: #d9a520; }
+.subtask-card[data-status="done"] { border-left-color: #76c47c; opacity: 0.85; }
+.subtask-card[data-status="failed"] { border-left-color: var(--danger); }
+.subtask-head {
+  display: flex; align-items: center; gap: 6px;
+}
+.subtask-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--muted); flex: none;
+}
+.subtask-card[data-status="running"] .subtask-dot {
+  background: #d9a520;
+  box-shadow: 0 0 0 0 rgba(217, 165, 32, 0.6);
+  animation: agentPulse 1.3s infinite;
+}
+.subtask-card[data-status="done"] .subtask-dot { background: #76c47c; }
+.subtask-card[data-status="failed"] .subtask-dot { background: var(--danger); }
+.subtask-title {
+  font-size: 12px; font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  flex: 1;
+}
+.subtask-meta {
+  display: flex; gap: 8px; margin-top: 3px;
+  font-size: 11px; color: var(--muted);
+}
+.subtask-role { text-transform: capitalize; }
+.subtask-deps { font-style: italic; }
+
 /* -----------------------------------------------------------------------
    Terminal — under the chat
 ----------------------------------------------------------------------- */

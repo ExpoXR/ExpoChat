@@ -53,17 +53,23 @@ def _lease_heartbeat(job_id: int, lease_owner: str, stopped: threading.Event) ->
         )
 
 
-def enqueue_job(run_id: str, job_type: str) -> None:
+def enqueue_job(run_id: str, job_type: str, node_id: str | None = None) -> None:
     now = db.utcnow()
     with db.transaction() as conn:
-        active = conn.execute(
-            "select id from jobs where run_id=? and job_type=? and status in ('pending','running') limit 1",
-            (run_id, job_type),
-        ).fetchone()
+        if node_id:
+            active = conn.execute(
+                "select id from jobs where run_id=? and node_id=? and status in ('pending','running') limit 1",
+                (run_id, node_id),
+            ).fetchone()
+        else:
+            active = conn.execute(
+                "select id from jobs where run_id=? and job_type=? and status in ('pending','running') limit 1",
+                (run_id, job_type),
+            ).fetchone()
         if not active:
             conn.execute(
-                "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,?,'pending',?,?)",
-                (run_id, job_type, now, now),
+                "insert into jobs(run_id,job_type,node_id,status,created_at,updated_at) values(?,?,?,'pending',?,?)",
+                (run_id, job_type, node_id, now, now),
             )
     start_job_queue()
 
@@ -112,10 +118,12 @@ def _drain_jobs() -> None:
             )
             heartbeat.start()
             try:
-                # implementation jobs also drive the subtask DAG + merge inside implement_run;
-                # subtask/merge job_types are reserved for a future fully-durable per-node queue.
                 if job["job_type"] == "research":
                     research_run(job["run_id"])
+                elif job["job_type"] == "subtask":
+                    _run_durable_subtask(job["run_id"], job)
+                elif job["job_type"] == "merge":
+                    _merge_and_verify(job["run_id"])
                 else:
                     implement_run(job["run_id"])
                 now = db.utcnow()
@@ -756,6 +764,180 @@ def _run_subtask(run_id: str, node: dict[str, Any], base_stage: Path) -> dict[st
     return node
 
 
+def _enqueue_ready_subtasks(run_id: str) -> None:
+    """Check DAG progress and enqueue jobs for ready nodes, or merge if all done."""
+    nodes = db.subtasks(run_id)
+    if not nodes:
+        return
+    status_map = {n["node_id"]: n["status"] for n in nodes}
+    if all(s == "done" for s in status_map.values()):
+        enqueue_job(run_id, "merge")
+        return
+    if any(s == "failed" for s in status_map.values()):
+        return
+    for node in nodes:
+        if node["status"] != "pending":
+            continue
+        deps = json.loads(node.get("depends_on_json") or "[]")
+        if all(status_map.get(dep) == "done" for dep in deps):
+            enqueue_job(run_id, "subtask", node_id=node["node_id"])
+
+
+def _run_durable_subtask(run_id: str, job: dict[str, Any]) -> None:
+    """Execute one subtask node via the durable job queue, then chain next ready nodes."""
+    run_status = (db.one("select status from runs where id=?", (run_id,)) or {}).get("status")
+    if run_status in ("cancelled", "failed"):
+        return
+    node_id = job["node_id"]
+    nodes = db.subtasks(run_id)
+    node = next((n for n in nodes if n["node_id"] == node_id), None)
+    if not node:
+        raise RuntimeError(f"Subtask node {node_id} not found")
+    if node["status"] == "done":
+        _enqueue_ready_subtasks(run_id)
+        return
+    base_stage = settings.jobs_dir / run_id / "workspace"
+    try:
+        _run_subtask(run_id, node, base_stage)
+        _enqueue_ready_subtasks(run_id)
+    except Exception as exc:
+        log.exception("subtask_failed", extra={"run_id": run_id, "node_id": node_id})
+        update_run(run_id, status="failed", error=str(exc)[:4000])
+        now = db.utcnow()
+        db.execute(
+            "update jobs set status='cancelled',error='Run failed',updated_at=? "
+            "where run_id=? and status='pending'",
+            (now, run_id),
+        )
+        db.add_event(run_id, "run.failed", f"Subtask {node_id} failed", {"error": str(exc)[:1000], "node_id": node_id})
+        raise
+
+
+def _verify_and_apply(run_id: str, summary: str, implementer_ids: set[str], repair_agent: dict[str, Any]) -> None:
+    """Verification loop + apply + post-check. Shared by single-agent and multi-agent paths."""
+    update_run(run_id, status="verifying")
+    for repair in range(3):
+        run = db.one("select * from runs where id=?", (run_id,)) or {}
+        first = choose_agent("verification", set(implementer_ids))
+        try:
+            second = choose_agent("verification", implementer_ids | {first["id"]})
+        except RuntimeError:
+            second = first
+        reports = []
+        verifier_ids = []
+        for verifier in (first, second):
+            result = worker_call(run_id, verifier["model"], "verification", agent_task(verifier, verification_prompt(run, summary)), max_turns=18)
+            record_usage(run_id, result)
+            reports.append(result.get("content", ""))
+            verifier_ids.append(verifier["id"])
+            save_artifact(run_id, "verification", verifier["name"], result)
+            verifier_passed = bool(result.get("ok")) and result.get("content", "").lstrip().upper().startswith("PASS")
+            db.execute(
+                "insert into verification_results(run_id,agent_id,cycle,report,passed,created_at) values(?,?,?,?,?,?)",
+                (run_id, verifier["id"], repair, result.get("content", ""), int(verifier_passed), db.utcnow()),
+            )
+            if not result.get("ok"):
+                raise RuntimeError(result.get("error") or f"Verifier {verifier['name']} failed")
+        if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
+            return
+        update_run(run_id, verification_agent_ids_json=json.dumps(verifier_ids))
+        passed, verdict = brain_verdict(run, reports)
+        update_run(run_id, verdict=verdict)
+        db.add_event(run_id, "verification.completed", "Supervisor verdict", {"passed": passed, "repair": repair})
+        if passed:
+            break
+        try:
+            parsed = json.loads(verdict)
+        except json.JSONDecodeError:
+            parsed = {}
+        if parsed.get("scope_expansion"):
+            expansion = parsed.get("repair_task") or parsed.get("verdict") or "Verifier requested expanded scope."
+            revised_plan = (run.get("approved_plan") or "") + "\n\n## Requested Scope Expansion\n\n" + expansion
+            update_run(run_id, status="awaiting_approval", draft_plan=revised_plan, error="Scope expansion requires approval")
+            db.add_event(run_id, "scope.approval_required", "Repair exceeds approved scope")
+            return
+        if repair >= 2:
+            update_run(run_id, status="failed", error="Verification failed after two repair cycles")
+            return
+        repair_task = parsed.get("repair_task") or "Fix every defect in these verifier reports:\n" + "\n\n".join(reports)
+        update_run(run_id, status="implementing", repair_count=repair + 1)
+        repair_result = worker_call(run_id, repair_agent["model"], "implementation", agent_task(repair_agent, repair_task), max_turns=24)
+        record_usage(run_id, repair_result)
+        if not repair_result.get("ok"):
+            raise RuntimeError(repair_result.get("error") or "Repair agent failed")
+        summary = repair_result.get("content", "")
+        save_artifact(run_id, "repair", f"Repair cycle {repair + 1}", repair_result)
+        update_run(run_id, status="verifying")
+    if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
+        return
+    target = Path(run["target_path"])
+    if manifest_hash(target) != run["baseline_hash"]:
+        raise RuntimeError("Workspace changed during run; verified stage was not applied")
+    update_run(run_id, status="applying")
+    stage = settings.jobs_dir / run_id / "workspace"
+    changes = apply_stage(target, stage)
+    save_artifact(run_id, "changes", "Applied file manifest", changes)
+    db.add_event(run_id, "apply.completed", "Verified changes applied", changes)
+    update_run(run_id, status="post_check")
+    stage_workspace(run_id, target, "postcheck")
+    verifier = choose_agent("verification", set(implementer_ids))
+    post = worker_call(
+        run_id, verifier["model"], "verification",
+        agent_task(verifier, "Post-apply check. Verify copied final server state still satisfies approved plan. Start with PASS or FAIL.\n\n" + (run.get("approved_plan") or "")),
+        workspace="postcheck", max_turns=18,
+    )
+    record_usage(run_id, post)
+    save_artifact(run_id, "post_check", "Post-apply verification", post)
+    post_pass = post.get("ok") and post.get("content", "").lstrip().upper().startswith("PASS")
+    if not post_pass:
+        restore_snapshot(run["snapshot_id"])
+        update_run(run_id, status="rolled_back", error="Post-apply verification failed; snapshot restored", completed_at=db.utcnow())
+        db.add_event(run_id, "rollback.completed", "Post-check failed; snapshot restored")
+        return
+    completed = db.utcnow()
+    update_run(run_id, status="completed", completed_at=completed)
+    final_run = db.one("select verdict from runs where id=?", (run_id,)) or {}
+    db.execute("update history_snippets set final_verdict=?,completed_at=? where run_id=?", (final_run.get("verdict"), completed, run_id))
+    db.add_event(run_id, "run.completed", "Run completed successfully")
+    _subtask_assignment_counts.pop(run_id, None)
+
+
+def _merge_and_verify(run_id: str) -> None:
+    """Merge subtask worktrees then run verification+apply. Called by merge job."""
+    try:
+        run = db.one("select * from runs where id=?", (run_id,))
+        if not run or run["status"] in ("cancelled", "failed"):
+            return
+        base_stage = settings.jobs_dir / run_id / "workspace"
+        nodes = db.subtasks(run_id)
+        worktrees = [(n["node_id"], settings.jobs_dir / run_id / "subtasks" / n["node_id"] / "workspace") for n in nodes]
+        merged = merge_worktrees(base_stage, worktrees)
+        save_artifact(run_id, "merge", "Merged subtask manifest", merged)
+        db.add_event(run_id, "subtasks.merged", f"Merged {merged['subtasks']} subtask worktree(s)", merged)
+        implementer_ids = {n["agent_id"] for n in nodes if n.get("agent_id")}
+        summary = "\n\n".join(f"### {n['title']}\n{n.get('result_summary') or ''}" for n in nodes)
+        repair_agent = choose_agent("implementation")
+        _verify_and_apply(run_id, summary, implementer_ids, repair_agent)
+    except MergeConflict as exc:
+        log.warning("merge_conflict", extra={"run_id": run_id})
+        update_run(run_id, status="failed", error=str(exc)[:4000])
+        db.add_event(run_id, "subtasks.conflict", "Subtask worktrees conflict; re-plan with disjoint scopes", {"conflicts": exc.conflicts})
+    except Exception as exc:
+        log.exception("merge_verify_failed", extra={"run_id": run_id})
+        run = db.one("select * from runs where id=?", (run_id,))
+        if run and run.get("status") == "cancelled":
+            return
+        if run and run.get("snapshot_id") and run.get("status") in {"applying", "post_check"}:
+            try:
+                restore_snapshot(run["snapshot_id"])
+                update_run(run_id, status="rolled_back", error=str(exc)[:4000], completed_at=db.utcnow())
+            except Exception as rollback_error:
+                update_run(run_id, status="failed", error=f"{exc}; rollback failed: {rollback_error}"[:4000])
+        else:
+            update_run(run_id, status="failed", error=str(exc)[:4000])
+        db.add_event(run_id, "run.failed", "Merge/verification workflow failed", {"error": str(exc)[:1000]})
+
+
 def execute_dag(run_id: str, base_stage: Path) -> tuple[str, set[str]]:
     """Run a run's subtask DAG with a bounded worker pool, then merge into base_stage.
 
@@ -810,119 +992,29 @@ def implement_run(run_id: str) -> None:
         run = db.one("select * from runs where id=?", (run_id,))
         if not run or run["status"] == "cancelled":
             return
-        base_stage = settings.jobs_dir / run_id / "workspace"
         subtask_nodes = db.subtasks(run_id)
         if subtask_nodes:
-            # Multi-agent path: execute the approved task DAG, then merge into base_stage.
-            db.add_event(run_id, "implementation.started", f"Executing {len(subtask_nodes)} subtask(s) (pool {settings.worker_pool_size})")
-            summary, implementer_ids = execute_dag(run_id, base_stage)
-            repair_agent = choose_agent("implementation")
-        else:
-            # Single-agent path (backward compatible): one implementer runs the whole plan.
-            agent = db.one("select * from agent_profiles where id=?", (run["implementation_agent_id"],))
-            if not agent:
-                raise RuntimeError("Implementation agent missing")
-            db.add_event(run_id, "implementation.started", f"Implementation started with {agent['name']}")
-            task = "Implement this approved plan completely.\n\n" + (run["approved_plan"] or "")
-            implementation = worker_call(run_id, agent["model"], "implementation", agent_task(agent, task), max_turns=32)
-            record_usage(run_id, implementation)
-            summary = implementation.get("content", "")
-            save_artifact(run_id, "implementation", "Implementation transcript", implementation)
-            if not implementation.get("ok"):
-                raise RuntimeError(implementation.get("error") or "Implementation agent failed")
-            implementer_ids = {agent["id"]}
-            repair_agent = agent
+            # Multi-agent path: dispatch durable subtask jobs and return.
+            # Completion is driven by _run_durable_subtask chaining → merge job.
+            pending = [n for n in subtask_nodes if n["status"] not in ("done", "running")]
+            db.add_event(run_id, "implementation.started", f"Dispatching {len(pending)} subtask(s) via durable queue")
+            _enqueue_ready_subtasks(run_id)
+            return
+        # Single-agent path (backward compatible): one implementer runs the whole plan.
+        agent = db.one("select * from agent_profiles where id=?", (run["implementation_agent_id"],))
+        if not agent:
+            raise RuntimeError("Implementation agent missing")
+        db.add_event(run_id, "implementation.started", f"Implementation started with {agent['name']}")
+        task = "Implement this approved plan completely.\n\n" + (run["approved_plan"] or "")
+        implementation = worker_call(run_id, agent["model"], "implementation", agent_task(agent, task), max_turns=32)
+        record_usage(run_id, implementation)
+        summary = implementation.get("content", "")
+        save_artifact(run_id, "implementation", "Implementation transcript", implementation)
+        if not implementation.get("ok"):
+            raise RuntimeError(implementation.get("error") or "Implementation agent failed")
         if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
             return
-        update_run(run_id, status="verifying")
-        for repair in range(3):
-            run = db.one("select * from runs where id=?", (run_id,)) or run
-            first = choose_agent("verification", set(implementer_ids))
-            try:
-                second = choose_agent("verification", implementer_ids | {first["id"]})
-            except RuntimeError:
-                second = first
-            reports = []
-            verifier_ids = []
-            for verifier in (first, second):
-                result = worker_call(run_id, verifier["model"], "verification", agent_task(verifier, verification_prompt(run, summary)), max_turns=18)
-                record_usage(run_id, result)
-                reports.append(result.get("content", ""))
-                verifier_ids.append(verifier["id"])
-                save_artifact(run_id, "verification", verifier["name"], result)
-                verifier_passed = bool(result.get("ok")) and result.get("content", "").lstrip().upper().startswith("PASS")
-                db.execute(
-                    "insert into verification_results(run_id,agent_id,cycle,report,passed,created_at) values(?,?,?,?,?,?)",
-                    (run_id, verifier["id"], repair, result.get("content", ""), int(verifier_passed), db.utcnow()),
-                )
-                if not result.get("ok"):
-                    raise RuntimeError(result.get("error") or f"Verifier {verifier['name']} failed")
-            if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
-                return
-            update_run(run_id, verification_agent_ids_json=json.dumps(verifier_ids))
-            passed, verdict = brain_verdict(run, reports)
-            update_run(run_id, verdict=verdict)
-            db.add_event(run_id, "verification.completed", "Supervisor verdict", {"passed": passed, "repair": repair})
-            if passed:
-                break
-            try:
-                parsed = json.loads(verdict)
-            except json.JSONDecodeError:
-                parsed = {}
-            if parsed.get("scope_expansion"):
-                expansion = parsed.get("repair_task") or parsed.get("verdict") or "Verifier requested expanded scope."
-                revised_plan = (run["approved_plan"] or "") + "\n\n## Requested Scope Expansion\n\n" + expansion
-                update_run(run_id, status="awaiting_approval", draft_plan=revised_plan, error="Scope expansion requires approval")
-                db.add_event(run_id, "scope.approval_required", "Repair exceeds approved scope")
-                return
-            if repair >= 2:
-                update_run(run_id, status="failed", error="Verification failed after two repair cycles")
-                return
-            repair_task = parsed.get("repair_task") or "Fix every defect in these verifier reports:\n" + "\n\n".join(reports)
-            update_run(run_id, status="implementing", repair_count=repair + 1)
-            repair_result = worker_call(run_id, repair_agent["model"], "implementation", agent_task(repair_agent, repair_task), max_turns=24)
-            record_usage(run_id, repair_result)
-            if not repair_result.get("ok"):
-                raise RuntimeError(repair_result.get("error") or "Repair agent failed")
-            summary = repair_result.get("content", "")
-            save_artifact(run_id, "repair", f"Repair cycle {repair + 1}", repair_result)
-            update_run(run_id, status="verifying")
-        if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
-            return
-        target = Path(run["target_path"])
-        if manifest_hash(target) != run["baseline_hash"]:
-            raise RuntimeError("Workspace changed during run; verified stage was not applied")
-        update_run(run_id, status="applying")
-        stage = settings.jobs_dir / run_id / "workspace"
-        changes = apply_stage(target, stage)
-        save_artifact(run_id, "changes", "Applied file manifest", changes)
-        db.add_event(run_id, "apply.completed", "Verified changes applied", changes)
-        update_run(run_id, status="post_check")
-        stage_workspace(run_id, target, "postcheck")
-        verifier = choose_agent("verification", set(implementer_ids))
-        post = worker_call(
-            run_id, verifier["model"], "verification",
-            agent_task(verifier, "Post-apply check. Verify copied final server state still satisfies approved plan. Start with PASS or FAIL.\n\n" + (run["approved_plan"] or "")),
-            workspace="postcheck", max_turns=18,
-        )
-        record_usage(run_id, post)
-        save_artifact(run_id, "post_check", "Post-apply verification", post)
-        post_pass = post.get("ok") and post.get("content", "").lstrip().upper().startswith("PASS")
-        if not post_pass:
-            restore_snapshot(run["snapshot_id"])
-            update_run(run_id, status="rolled_back", error="Post-apply verification failed; snapshot restored", completed_at=db.utcnow())
-            db.add_event(run_id, "rollback.completed", "Post-check failed; snapshot restored")
-            return
-        completed = db.utcnow()
-        update_run(run_id, status="completed", completed_at=completed)
-        final_run = db.one("select verdict from runs where id=?", (run_id,)) or {}
-        db.execute("update history_snippets set final_verdict=?,completed_at=? where run_id=?", (final_run.get("verdict"), completed, run_id))
-        db.add_event(run_id, "run.completed", "Run completed successfully")
-        _subtask_assignment_counts.pop(run_id, None)
-    except MergeConflict as exc:
-        log.warning("merge_conflict", extra={"run_id": run_id})
-        update_run(run_id, status="failed", error=str(exc)[:4000])
-        db.add_event(run_id, "subtasks.conflict", "Subtask worktrees conflict; re-plan with disjoint scopes", {"conflicts": exc.conflicts})
+        _verify_and_apply(run_id, summary, {agent["id"]}, agent)
     except Exception as exc:
         log.exception("implementation_failed", extra={"run_id": run_id})
         run = db.one("select * from runs where id=?", (run_id,))

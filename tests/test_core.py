@@ -1212,3 +1212,131 @@ def test_migration_10_creates_brain_memory_table():
         assert "brain_memory" in tables
         cols = {row[1] for row in conn.execute("pragma table_info(subtasks)")}
         assert "suggested_model" in cols
+
+
+def test_migration_11_adds_acceptance_criteria():
+    """Migration 11 adds acceptance_criteria column to subtasks."""
+    with db.connect() as conn:
+        cols = {row[1] for row in conn.execute("pragma table_info(subtasks)")}
+        assert "acceptance_criteria" in cols
+
+
+def test_insert_subtasks_stores_acceptance_criteria():
+    clear_workflow_tables()
+    seed_agent("agent-ac", "model-ac", ["implementation"], ["tools"])
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)", ("run-ac", "t", "codex", "/tmp", "implementing", now, now),
+    )
+    nodes = [
+        {"node_id": "n1", "title": "Step 1", "spec": "do X", "depends_on": [],
+         "file_globs": [], "acceptance_criteria": "X works", "role": "implementation",
+         "suggested_model": None},
+    ]
+    db.insert_subtasks("run-ac", nodes)
+    stored = db.subtasks("run-ac")
+    assert len(stored) == 1
+    assert stored[0]["acceptance_criteria"] == "X works"
+
+
+def test_enqueue_job_with_node_id(monkeypatch):
+    clear_workflow_tables()
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)", ("run-nid", "t", "codex", "/tmp", "implementing", now, now),
+    )
+    orchestrator.enqueue_job("run-nid", "subtask", node_id="step-a")
+    jobs = db.all_rows("select * from jobs where run_id='run-nid'")
+    assert len(jobs) == 1
+    assert jobs[0]["job_type"] == "subtask"
+    assert jobs[0]["node_id"] == "step-a"
+    # Duplicate enqueue same node_id should not create second job
+    orchestrator.enqueue_job("run-nid", "subtask", node_id="step-a")
+    jobs = db.all_rows("select * from jobs where run_id='run-nid'")
+    assert len(jobs) == 1
+
+
+def test_enqueue_ready_subtasks_chains_dag(monkeypatch):
+    """_enqueue_ready_subtasks enqueues ready nodes and merge when all done."""
+    clear_workflow_tables()
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)", ("run-rdy", "t", "codex", "/tmp", "implementing", now, now),
+    )
+    nodes = [
+        {"node_id": "a", "title": "A", "spec": "do A", "depends_on": [],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+        {"node_id": "b", "title": "B", "spec": "do B", "depends_on": ["a"],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+    ]
+    db.insert_subtasks("run-rdy", nodes)
+    # Initially only "a" should be enqueued (no deps)
+    orchestrator._enqueue_ready_subtasks("run-rdy")
+    jobs = db.all_rows("select * from jobs where run_id='run-rdy' order by id")
+    assert len(jobs) == 1
+    assert jobs[0]["node_id"] == "a"
+    assert jobs[0]["job_type"] == "subtask"
+    # Mark "a" done, enqueue again — "b" should appear
+    db.update_subtask("sub-run-rdy-a", status="done")
+    orchestrator._enqueue_ready_subtasks("run-rdy")
+    jobs = db.all_rows("select * from jobs where run_id='run-rdy' and status='pending' order by id")
+    assert any(j["node_id"] == "b" for j in jobs)
+    # Mark "b" done — merge job should appear
+    db.update_subtask("sub-run-rdy-b", status="done")
+    orchestrator._enqueue_ready_subtasks("run-rdy")
+    merge_jobs = db.all_rows("select * from jobs where run_id='run-rdy' and job_type='merge'")
+    assert len(merge_jobs) == 1
+
+
+def test_subtask_recovery_on_init():
+    """init_db resets running subtasks to pending."""
+    clear_workflow_tables()
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)", ("run-rec", "t", "codex", "/tmp", "implementing", now, now),
+    )
+    nodes = [
+        {"node_id": "x", "title": "X", "spec": "do X", "depends_on": [],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+    ]
+    db.insert_subtasks("run-rec", nodes)
+    db.update_subtask("sub-run-rec-x", status="running")
+    assert db.subtasks("run-rec")[0]["status"] == "running"
+    db.init_db()
+    assert db.subtasks("run-rec")[0]["status"] == "pending"
+
+
+def test_implement_run_dispatches_subtask_jobs(monkeypatch):
+    """Multi-agent implement_run enqueues subtask jobs and returns without blocking."""
+    clear_workflow_tables()
+    seed_agent("impl-dur", "dur-model", ["implementation"], ["tools"])
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,approved_plan,baseline_hash,"
+        "implementation_agent_id,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?,?,?)",
+        ("run-dur", "t", "codex", "/tmp", "implementing", "plan", "abc", "impl-dur", now, now),
+    )
+    nodes = [
+        {"node_id": "s1", "title": "S1", "spec": "spec1", "depends_on": [],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+        {"node_id": "s2", "title": "S2", "spec": "spec2", "depends_on": ["s1"],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+    ]
+    db.insert_subtasks("run-dur", nodes)
+    # Prevent start_job_queue from actually draining
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+    orchestrator.implement_run("run-dur")
+    # Should have enqueued subtask job for s1 (ready), not s2 (blocked by s1)
+    jobs = db.all_rows("select * from jobs where run_id='run-dur' and job_type='subtask'")
+    assert len(jobs) == 1
+    assert jobs[0]["node_id"] == "s1"
+    # Run status should still be implementing (not verifying — didn't block)
+    run = db.one("select status from runs where id='run-dur'")
+    assert run["status"] == "implementing"
