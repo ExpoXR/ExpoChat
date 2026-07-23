@@ -15,9 +15,11 @@ from . import db
 from .brain_io import (
     build_decompose_prompt,
     build_plan_prompt,
+    build_subtask_verify_prompt,
     build_verdict_prompt,
     build_verification_prompt,
     extract_json,
+    parse_subtask_verdict,
     parse_verdict,
 )
 from .config import settings
@@ -275,7 +277,7 @@ def call_brain_with_memory(
     return result
 
 
-def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = "workspace", max_turns: int = 24) -> dict[str, Any]:
+def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = "workspace", max_turns: int = 24, node_id: str | None = None) -> dict[str, Any]:
     attempts = 1 if mode == "implementation" else 3
     for attempt in range(attempts):
         try:
@@ -284,7 +286,7 @@ def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = 
                     "POST",
                     settings.worker_url + "/execute/stream",
                     headers={"X-Worker-Token": settings.worker_token},
-                    json={"run_id": run_id, "workspace": workspace, "model": model, "mode": mode, "task": task, "max_turns": max_turns},
+                    json={"run_id": run_id, "workspace": workspace, "model": model, "mode": mode, "task": task, "max_turns": max_turns, **({"node_id": node_id} if node_id else {})},
                 ) as response:
                     response.raise_for_status()
                     for line in response.iter_lines():
@@ -295,7 +297,7 @@ def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = 
                             return item["result"]
                         if item.get("type") == "error":
                             raise RuntimeError(item.get("error") or "Worker failed")
-                        record_worker_activity(run_id, mode, item)
+                        record_worker_activity(run_id, mode, item, node_id=node_id)
         except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.HTTPStatusError):
             if attempt + 1 >= attempts:
                 raise
@@ -303,12 +305,15 @@ def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = 
     raise RuntimeError("Worker unavailable")
 
 
-def record_worker_activity(run_id: str, mode: str, item: dict[str, Any]) -> None:
+def record_worker_activity(run_id: str, mode: str, item: dict[str, Any], *, node_id: str | None = None) -> None:
     kind = str(item.get("type") or "")
     if kind == "message":
         content = " ".join(str(item.get("content") or "").split())[:1000]
         if content:
-            db.add_event(run_id, "agent.activity", content, {"phase": mode, "state": "message"})
+            data: dict[str, Any] = {"phase": mode, "state": "message"}
+            if node_id:
+                data["node_id"] = node_id
+            db.add_event(run_id, "agent.activity", content, data)
         return
     if kind not in {"tool.started", "tool.completed"}:
         return
@@ -324,12 +329,10 @@ def record_worker_activity(run_id: str, mode: str, item: dict[str, Any]) -> None
         state = "changed"
     verb = "Working" if kind == "tool.started" else "Finished"
     message = f"{verb}: {tool}{f' · {target}' if target else ''}"
-    db.add_event(
-        run_id,
-        "agent.activity",
-        message,
-        {"phase": mode, "state": state, "tool": tool, "path": path, "turn": item.get("turn")},
-    )
+    data = {"phase": mode, "state": state, "tool": tool, "path": path, "turn": item.get("turn")}
+    if node_id:
+        data["node_id"] = node_id
+    db.add_event(run_id, "agent.activity", message, data)
 
 
 def discover_agents() -> list[dict[str, Any]]:
@@ -753,15 +756,39 @@ def _run_subtask(run_id: str, node: dict[str, Any], base_stage: Path) -> dict[st
     result = worker_call(
         run_id, agent["model"], "implementation", agent_task(agent, task),
         workspace=f"subtasks/{node['node_id']}/workspace", max_turns=32,
+        node_id=node["node_id"],
     )
     record_usage(run_id, result)
     db.add_subtask_result(subtask_id, run_id, "implementation", result.get("content", ""))
     if not result.get("ok"):
         db.update_subtask(subtask_id, status="failed", result_summary=(result.get("error") or "failed")[:2000])
         raise RuntimeError(f"Subtask {node['node_id']} failed: {result.get('error') or 'worker error'}")
-    db.update_subtask(subtask_id, status="done", result_summary=result.get("content", "")[:4000])
+    impl_summary = result.get("content", "")[:4000]
+    criteria = node.get("acceptance_criteria") or ""
+    if criteria:
+        run = db.one("select * from runs where id=?", (run_id,)) or {}
+        provider = run.get("brain_provider") or "codex"
+        verify_prompt = build_subtask_verify_prompt(node["title"], criteria, impl_summary)
+        verify_result = call_brain_with_memory(run_id, provider, "subtask_verify", verify_prompt)
+        sv = parse_subtask_verdict(verify_result)
+        db.add_event(run_id, "subtask.verified", f"{node['title']}: {'passed' if sv.passed else 'FAILED'}", {"node_id": node["node_id"], "passed": sv.passed, "issues": sv.issues})
+        if not sv.passed:
+            db.update_subtask(subtask_id, status="failed", result_summary=f"Verification failed: {sv.issues}"[:2000])
+            raise RuntimeError(f"Subtask {node['node_id']} failed verification: {sv.issues}")
+    db.update_subtask(subtask_id, status="done", result_summary=impl_summary)
     db.add_event(run_id, "subtask.completed", f"{node['title']} complete", {"node_id": node["node_id"]})
     return node
+
+
+def _transitive_deps(node_id: str, dep_map: dict[str, list[str]], seen: set[str] | None = None) -> set[str]:
+    """Return all transitive dependencies for a node."""
+    if seen is None:
+        seen = set()
+    for dep in dep_map.get(node_id, []):
+        if dep not in seen:
+            seen.add(dep)
+            _transitive_deps(dep, dep_map, seen)
+    return seen
 
 
 def _enqueue_ready_subtasks(run_id: str) -> None:
@@ -770,15 +797,24 @@ def _enqueue_ready_subtasks(run_id: str) -> None:
     if not nodes:
         return
     status_map = {n["node_id"]: n["status"] for n in nodes}
-    if all(s == "done" for s in status_map.values()):
+    dep_map = {n["node_id"]: json.loads(n.get("depends_on_json") or "[]") for n in nodes}
+    failed_nodes = {nid for nid, s in status_map.items() if s == "failed"}
+    blocked_by_failure = set()
+    for nid in status_map:
+        if _transitive_deps(nid, dep_map) & failed_nodes:
+            blocked_by_failure.add(nid)
+    non_blocked = {nid for nid in status_map if nid not in failed_nodes and nid not in blocked_by_failure}
+    if non_blocked and all(status_map[nid] == "done" for nid in non_blocked) and not any(
+        status_map[nid] in ("pending", "running") for nid in blocked_by_failure
+    ):
         enqueue_job(run_id, "merge")
-        return
-    if any(s == "failed" for s in status_map.values()):
         return
     for node in nodes:
         if node["status"] != "pending":
             continue
-        deps = json.loads(node.get("depends_on_json") or "[]")
+        if node["node_id"] in blocked_by_failure:
+            continue
+        deps = dep_map[node["node_id"]]
         if all(status_map.get(dep) == "done" for dep in deps):
             enqueue_job(run_id, "subtask", node_id=node["node_id"])
 
@@ -797,20 +833,34 @@ def _run_durable_subtask(run_id: str, job: dict[str, Any]) -> None:
         _enqueue_ready_subtasks(run_id)
         return
     base_stage = settings.jobs_dir / run_id / "workspace"
+    max_attempts = db.get_setting_int("subtask_max_attempts") or 2
     try:
         _run_subtask(run_id, node, base_stage)
         _enqueue_ready_subtasks(run_id)
     except Exception as exc:
-        log.exception("subtask_failed", extra={"run_id": run_id, "node_id": node_id})
-        update_run(run_id, status="failed", error=str(exc)[:4000])
-        now = db.utcnow()
-        db.execute(
-            "update jobs set status='cancelled',error='Run failed',updated_at=? "
-            "where run_id=? and status='pending'",
-            (now, run_id),
-        )
-        db.add_event(run_id, "run.failed", f"Subtask {node_id} failed", {"error": str(exc)[:1000], "node_id": node_id})
-        raise
+        current_attempts = int(node.get("attempts") or 0) + 1
+        log.warning("subtask_failed", extra={"run_id": run_id, "node_id": node_id, "attempt": current_attempts, "max": max_attempts})
+        if current_attempts < max_attempts:
+            db.update_subtask(node["id"], status="pending")
+            db.add_event(run_id, "subtask.retry", f"{node['title']} retry {current_attempts}/{max_attempts}", {"node_id": node_id, "attempt": current_attempts, "error": str(exc)[:500]})
+            now = db.utcnow()
+            db.execute(
+                "insert into jobs(run_id,job_type,node_id,status,created_at,updated_at) values(?,?,?,'pending',?,?)",
+                (run_id, "subtask", node_id, now, now),
+            )
+            start_job_queue()
+            return
+        db.update_subtask(node["id"], status="failed", result_summary=str(exc)[:2000])
+        db.add_event(run_id, "subtask.failed", f"{node['title']} failed after {current_attempts} attempt(s)", {"node_id": node_id, "error": str(exc)[:1000]})
+        _enqueue_ready_subtasks(run_id)
+        all_nodes = db.subtasks(run_id)
+        status_map = {n["node_id"]: n["status"] for n in all_nodes}
+        if all(s in ("done", "failed") for s in status_map.values()):
+            if all(s == "failed" for s in status_map.values()):
+                update_run(run_id, status="failed", error=f"All subtasks failed (last: {exc})"[:4000])
+                db.add_event(run_id, "run.failed", "All subtasks failed")
+                raise
+            enqueue_job(run_id, "merge")
 
 
 def _verify_and_apply(run_id: str, summary: str, implementer_ids: set[str], repair_agent: dict[str, Any]) -> None:
@@ -910,12 +960,17 @@ def _merge_and_verify(run_id: str) -> None:
             return
         base_stage = settings.jobs_dir / run_id / "workspace"
         nodes = db.subtasks(run_id)
-        worktrees = [(n["node_id"], settings.jobs_dir / run_id / "subtasks" / n["node_id"] / "workspace") for n in nodes]
+        done_nodes = [n for n in nodes if n["status"] == "done"]
+        failed_nodes = [n for n in nodes if n["status"] == "failed"]
+        worktrees = [(n["node_id"], settings.jobs_dir / run_id / "subtasks" / n["node_id"] / "workspace") for n in done_nodes]
         merged = merge_worktrees(base_stage, worktrees)
         save_artifact(run_id, "merge", "Merged subtask manifest", merged)
-        db.add_event(run_id, "subtasks.merged", f"Merged {merged['subtasks']} subtask worktree(s)", merged)
-        implementer_ids = {n["agent_id"] for n in nodes if n.get("agent_id")}
-        summary = "\n\n".join(f"### {n['title']}\n{n.get('result_summary') or ''}" for n in nodes)
+        failed_info = f" ({len(failed_nodes)} subtask(s) failed)" if failed_nodes else ""
+        db.add_event(run_id, "subtasks.merged", f"Merged {merged['subtasks']} subtask worktree(s){failed_info}", merged)
+        implementer_ids = {n["agent_id"] for n in done_nodes if n.get("agent_id")}
+        summary = "\n\n".join(f"### {n['title']}\n{n.get('result_summary') or ''}" for n in done_nodes)
+        if failed_nodes:
+            summary += "\n\n## FAILED SUBTASKS (not merged)\n" + "\n".join(f"- {n['title']}: {n.get('result_summary') or 'failed'}" for n in failed_nodes)
         repair_agent = choose_agent("implementation")
         _verify_and_apply(run_id, summary, implementer_ids, repair_agent)
     except MergeConflict as exc:

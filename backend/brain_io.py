@@ -137,3 +137,29 @@ def build_verification_prompt(plan: str, implementation_summary: str) -> str:
         "Start final answer with PASS or FAIL. Cite exact files and test output.\n\nAPPROVED PLAN:\n"
         + plan + "\n\nIMPLEMENTER SUMMARY:\n" + implementation_summary
     )
+
+
+def build_subtask_verify_prompt(title: str, criteria: str, summary: str) -> str:
+    """Build a lightweight per-subtask verification prompt."""
+    return (
+        "You are supervisor brain. A subtask just completed. Check whether the implementation satisfies "
+        "the acceptance criteria. Return JSON ONLY: "
+        '{"passed":boolean,"issues":"string describing any issues or empty"}.\n\n'
+        f"SUBTASK: {title}\n\nACCEPTANCE CRITERIA:\n{criteria}\n\nIMPLEMENTATION SUMMARY:\n{summary}"
+    )
+
+
+@dataclass(frozen=True)
+class SubtaskVerdict:
+    passed: bool
+    issues: str
+
+
+def parse_subtask_verdict(text: str) -> SubtaskVerdict:
+    """Parse a per-subtask verification response."""
+    try:
+        value = extract_json(text)
+        return SubtaskVerdict(passed=bool(value.get("passed")), issues=str(value.get("issues") or ""))
+    except (ValueError, AttributeError):
+        passed = '"passed":true' in text.replace(" ", "").lower()
+        return SubtaskVerdict(passed=passed, issues="" if passed else text[:500])

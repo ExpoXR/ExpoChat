@@ -190,6 +190,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "run_artifacts_cap": "200",   # run-artifact retention (default 200)
     "timeline_cap": "5000",       # global timeline retention (default 5000)
     "brain_memory_budget": "4000", # per-run brain memory token budget (chars / 4)
+    "subtask_max_attempts": "2",   # per-subtask retry limit before failure
 }
 
 

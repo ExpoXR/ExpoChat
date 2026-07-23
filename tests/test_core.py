@@ -773,7 +773,7 @@ def test_execute_dag_runs_subtasks_and_merges(monkeypatch):
     ]})
     db.insert_subtasks(run_id, nodes)
 
-    def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24):
+    def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24, node_id=None):
         node = Path(workspace).parts[1] if workspace.startswith("subtasks/") else "main"
         (orchestrator.settings.jobs_dir / rid / workspace / f"{node}.txt").write_text(f"from {node}\n")
         return {"ok": True, "content": f"did {node}", "usage": {}}
@@ -1186,7 +1186,7 @@ def test_execute_dag_uses_subtask_role(monkeypatch):
         chosen_agents.append((node["node_id"], agent["id"]))
         return agent
 
-    def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24):
+    def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24, node_id=None):
         node = Path(workspace).parts[1] if workspace.startswith("subtasks/") else "main"
         (orchestrator.settings.jobs_dir / rid / workspace / f"{node}.txt").write_text(f"from {node}\n")
         return {"ok": True, "content": f"did {node}", "usage": {}}
@@ -1340,3 +1340,174 @@ def test_implement_run_dispatches_subtask_jobs(monkeypatch):
     # Run status should still be implementing (not verifying — didn't block)
     run = db.one("select status from runs where id='run-dur'")
     assert run["status"] == "implementing"
+
+
+# -- Phase 5: Subtask resilience tests --
+
+def test_transitive_deps():
+    """_transitive_deps returns all transitive dependencies."""
+    dep_map = {"a": [], "b": ["a"], "c": ["b"], "d": ["a"]}
+    assert orchestrator._transitive_deps("c", dep_map) == {"a", "b"}
+    assert orchestrator._transitive_deps("d", dep_map) == {"a"}
+    assert orchestrator._transitive_deps("a", dep_map) == set()
+
+
+def test_enqueue_ready_subtasks_partial_dag(monkeypatch):
+    """Independent branches continue past a failed sibling."""
+    clear_workflow_tables()
+    seed_agent("a1", "m1", ["implementation"], ["tools"])
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,approved_plan,baseline_hash,"
+        "implementation_agent_id,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+        ("run-partial", "t", "codex", "/tmp", "implementing", "plan", "abc", "a1", now, now),
+    )
+    nodes = [
+        {"node_id": "root", "title": "Root", "spec": "s", "depends_on": [],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+        {"node_id": "branch-a", "title": "Branch A", "spec": "s", "depends_on": ["root"],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+        {"node_id": "branch-b", "title": "Branch B", "spec": "s", "depends_on": ["root"],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+    ]
+    db.insert_subtasks("run-partial", nodes)
+    subs = db.subtasks("run-partial")
+    db.update_subtask(next(s["id"] for s in subs if s["node_id"] == "root"), status="done")
+    db.update_subtask(next(s["id"] for s in subs if s["node_id"] == "branch-a"), status="failed")
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+    orchestrator._enqueue_ready_subtasks("run-partial")
+    jobs = db.all_rows("select * from jobs where run_id='run-partial' and job_type='subtask'")
+    assert len(jobs) == 1
+    assert jobs[0]["node_id"] == "branch-b"
+
+
+def test_enqueue_ready_subtasks_partial_merge(monkeypatch):
+    """All non-failed branches done + failed branch → triggers merge."""
+    clear_workflow_tables()
+    seed_agent("a2", "m2", ["implementation"], ["tools"])
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,approved_plan,baseline_hash,"
+        "implementation_agent_id,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+        ("run-pm", "t", "codex", "/tmp", "implementing", "plan", "abc", "a2", now, now),
+    )
+    nodes = [
+        {"node_id": "ok-node", "title": "OK", "spec": "s", "depends_on": [],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+        {"node_id": "bad-node", "title": "Bad", "spec": "s", "depends_on": [],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+    ]
+    db.insert_subtasks("run-pm", nodes)
+    subs = db.subtasks("run-pm")
+    db.update_subtask(next(s["id"] for s in subs if s["node_id"] == "ok-node"), status="done")
+    db.update_subtask(next(s["id"] for s in subs if s["node_id"] == "bad-node"), status="failed")
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+    orchestrator._enqueue_ready_subtasks("run-pm")
+    merge_jobs = db.all_rows("select * from jobs where run_id='run-pm' and job_type='merge'")
+    assert len(merge_jobs) == 1
+
+
+def test_subtask_retry_on_failure(monkeypatch):
+    """Failed subtask with remaining attempts re-enqueues instead of failing run."""
+    clear_workflow_tables()
+    seed_agent("retry-agent", "retry-model", ["implementation"], ["tools"])
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,approved_plan,baseline_hash,"
+        "implementation_agent_id,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+        ("run-retry", "t", "codex", "/tmp", "implementing", "plan", "abc", "retry-agent", now, now),
+    )
+    nodes = [
+        {"node_id": "retry-node", "title": "Retry Me", "spec": "s", "depends_on": [],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+    ]
+    db.insert_subtasks("run-retry", nodes)
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+    monkeypatch.setattr(orchestrator, "_run_subtask", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("test fail")))
+    job = {"run_id": "run-retry", "node_id": "retry-node"}
+    orchestrator._run_durable_subtask("run-retry", job)
+    run = db.one("select status from runs where id='run-retry'")
+    assert run["status"] == "implementing"
+    sub = next(s for s in db.subtasks("run-retry") if s["node_id"] == "retry-node")
+    assert sub["status"] == "pending"
+    retry_jobs = db.all_rows("select * from jobs where run_id='run-retry' and job_type='subtask' and status='pending'")
+    assert len(retry_jobs) == 1
+    events = db.all_rows("select * from run_events where run_id='run-retry' and event_type='subtask.retry'")
+    assert len(events) == 1
+
+
+def test_subtask_fails_after_max_attempts(monkeypatch):
+    """Subtask that exhausted retries is marked failed, run stays implementing if others pending."""
+    clear_workflow_tables()
+    seed_agent("exhaust-agent", "m", ["implementation"], ["tools"])
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,approved_plan,baseline_hash,"
+        "implementation_agent_id,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+        ("run-exhaust", "t", "codex", "/tmp", "implementing", "plan", "abc", "exhaust-agent", now, now),
+    )
+    nodes = [
+        {"node_id": "exhaust-node", "title": "Exhaust", "spec": "s", "depends_on": [],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+        {"node_id": "other-node", "title": "Other", "spec": "s", "depends_on": [],
+         "file_globs": [], "acceptance_criteria": "", "role": "implementation", "suggested_model": None},
+    ]
+    db.insert_subtasks("run-exhaust", nodes)
+    sub_exhaust = next(s for s in db.subtasks("run-exhaust") if s["node_id"] == "exhaust-node")
+    db.update_subtask(sub_exhaust["id"], attempts=1)
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+    monkeypatch.setattr(orchestrator, "_run_subtask", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("final fail")))
+    job = {"run_id": "run-exhaust", "node_id": "exhaust-node"}
+    orchestrator._run_durable_subtask("run-exhaust", job)
+    sub = next(s for s in db.subtasks("run-exhaust") if s["node_id"] == "exhaust-node")
+    assert sub["status"] == "failed"
+    run = db.one("select status from runs where id='run-exhaust'")
+    assert run["status"] == "implementing"
+
+
+def test_record_worker_activity_includes_node_id():
+    """record_worker_activity includes node_id in event data when provided."""
+    clear_workflow_tables()
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        ("run-act", "t", "codex", "/tmp", "implementing", now, now),
+    )
+    orchestrator.record_worker_activity("run-act", "implementation", {"type": "tool.started", "name": "write_file", "args": {"path": "test.py"}}, node_id="node-x")
+    events = db.all_rows("select * from run_events where run_id='run-act' and event_type='agent.activity'")
+    assert len(events) == 1
+    data = json.loads(events[0]["data_json"])
+    assert data["node_id"] == "node-x"
+
+    orchestrator.record_worker_activity("run-act", "implementation", {"type": "tool.started", "name": "read_file", "args": {"path": "a.py"}})
+    events2 = db.all_rows("select * from run_events where run_id='run-act' and event_type='agent.activity'")
+    data2 = json.loads(events2[1]["data_json"])
+    assert "node_id" not in data2
+
+
+def test_worker_cancel_key():
+    """_cancel_key composes run_id and node_id correctly."""
+    assert worker._cancel_key("run-1") == "run-1"
+    assert worker._cancel_key("run-1", None) == "run-1"
+    assert worker._cancel_key("run-1", "node-a") == "run-1:node-a"
+
+
+def test_parse_subtask_verdict():
+    """parse_subtask_verdict handles structured and fallback responses."""
+    sv = brain_io.parse_subtask_verdict('{"passed": true, "issues": ""}')
+    assert sv.passed is True
+    assert sv.issues == ""
+    sv2 = brain_io.parse_subtask_verdict('{"passed": false, "issues": "missing error handling"}')
+    assert sv2.passed is False
+    assert sv2.issues == "missing error handling"
+    sv3 = brain_io.parse_subtask_verdict("Some unstructured text with no JSON")
+    assert sv3.passed is False
+
+
+def test_build_subtask_verify_prompt():
+    """build_subtask_verify_prompt includes title, criteria, and summary."""
+    prompt = brain_io.build_subtask_verify_prompt("Add auth", "Must use JWT tokens", "Added JWT middleware")
+    assert "Add auth" in prompt
+    assert "JWT tokens" in prompt
+    assert "JWT middleware" in prompt
+    assert "passed" in prompt

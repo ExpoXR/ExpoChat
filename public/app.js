@@ -1321,7 +1321,7 @@ function subscribeRun(id) {
   if (runEventSource) runEventSource.close();
   runEventSource = new EventSource(`/api/runs/${id}/events`);
   runEventSource.onmessage = () => loadRun(id).catch(() => {});
-  ["run.created", "research.started", "research.completed", "plan.ready", "plan.edited", "plan.redo", "plan.approved", "plan.decomposed", "scope.approved", "scope.approval_required", "implementation.started", "agent.activity", "subtask.started", "subtask.completed", "subtasks.merged", "subtasks.conflict", "verification.completed", "apply.completed", "rollback.completed", "run.completed", "run.failed", "run.cancelled", "plan.stale"].forEach((name) => {
+  ["run.created", "research.started", "research.completed", "plan.ready", "plan.edited", "plan.redo", "plan.approved", "plan.decomposed", "scope.approved", "scope.approval_required", "implementation.started", "agent.activity", "subtask.started", "subtask.completed", "subtask.verified", "subtask.retry", "subtask.failed", "subtasks.merged", "subtasks.conflict", "verification.completed", "apply.completed", "rollback.completed", "run.completed", "run.failed", "run.cancelled", "plan.stale"].forEach((name) => {
     runEventSource.addEventListener(name, () => {
       loadRun(id).then((run) => {
         loadRuns().catch(() => {});
