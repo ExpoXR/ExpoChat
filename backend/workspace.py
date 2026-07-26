@@ -327,7 +327,8 @@ def merge_worktrees(base_stage: Path, worktrees: list[tuple[str, Path]]) -> dict
 
 
 def cleanup_snapshots(days: int | None = None, dry_run: bool = False) -> int:
-    cutoff = (datetime.now(UTC) - timedelta(days=days or settings.snapshot_retention_days)).isoformat()
+    retention_days = db.get_setting_int("snapshot_retention_days") or settings.snapshot_retention_days
+    cutoff = (datetime.now(UTC) - timedelta(days=days or retention_days)).isoformat()
     rows = db.all_rows(
         "select * from snapshots where created_at < ? and archive_deleted_at is null "
         "and id not in (select snapshot_id from runs where snapshot_id is not null and status not in ('completed','failed','cancelled','rolled_back'))",
@@ -397,7 +398,7 @@ def storage_report() -> dict[str, Any]:
         "orphan_bytes": sum(item["bytes"] for item in orphans),
         "partials": partials,
         "limits": {
-            "snapshot_retention_days": settings.snapshot_retention_days,
+            "snapshot_retention_days": db.get_setting_int("snapshot_retention_days") or settings.snapshot_retention_days,
             "snapshot_max_bytes": settings.snapshot_max_bytes,
             "snapshot_reserve_bytes": settings.snapshot_reserve_bytes,
             "orphan_grace_hours": settings.orphan_grace_hours,

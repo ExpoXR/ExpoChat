@@ -86,6 +86,12 @@ class SettingsBody(BaseModel):
     max_output_tokens: int | None = Field(default=None, ge=0, le=1_000_000)
     theme: str | None = Field(default=None, pattern="^(dark|light|auto)$")
     agent_mode_default: bool | None = None
+    snapshot_retention_days: int | None = Field(default=None, ge=1, le=3650)
+    timeline_cap: int | None = Field(default=None, ge=100, le=50_000)
+    subtask_max_attempts: int | None = Field(default=None, ge=1, le=10)
+    brain_memory_budget: int | None = Field(default=None, ge=500, le=1_000_000)
+    run_events_cap: int | None = Field(default=None, ge=50, le=10_000)
+    run_artifacts_cap: int | None = Field(default=None, ge=20, le=5_000)
 
 
 class AgentBody(BaseModel):
@@ -422,6 +428,11 @@ def config(_: dict = Depends(require_user)):
         "gemini_model": brains.get("gemini", {}).get("model", settings.gemini_model),
         "ollama_url": settings.ollama_url,
         "allowed_roots": [str(root) for root in settings.allowed_roots],
+        "paths": {
+            "database": str(settings.db_path),
+            "snapshots": str(settings.snapshot_dir),
+            "jobs": str(settings.jobs_dir),
+        },
         "credential_storage_enabled": bool(settings.credential_key),
     }
 
@@ -434,6 +445,12 @@ def _public_settings() -> dict[str, Any]:
         "max_output_tokens": int(stored["max_output_tokens"]),
         "theme": stored["theme"],
         "agent_mode_default": stored["agent_mode_default"] in ("1", "true", "True"),
+        "snapshot_retention_days": int(stored["snapshot_retention_days"]),
+        "timeline_cap": int(stored["timeline_cap"]),
+        "subtask_max_attempts": int(stored["subtask_max_attempts"]),
+        "brain_memory_budget": int(stored["brain_memory_budget"]),
+        "run_events_cap": int(stored["run_events_cap"]),
+        "run_artifacts_cap": int(stored["run_artifacts_cap"]),
     }
 
 

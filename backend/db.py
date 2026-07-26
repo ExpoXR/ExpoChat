@@ -189,6 +189,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "run_events_cap": "500",      # live run-event feed retention (default 500; raise to keep more)
     "run_artifacts_cap": "200",   # run-artifact retention (default 200)
     "timeline_cap": "5000",       # global timeline retention (default 5000)
+    "snapshot_retention_days": "30", # tracked snapshot archive retention
     "brain_memory_budget": "4000", # per-run brain memory token budget (chars / 4)
     "subtask_max_attempts": "2",   # per-subtask retry limit before failure
 }

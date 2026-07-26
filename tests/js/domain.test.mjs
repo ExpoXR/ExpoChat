@@ -148,6 +148,10 @@ test("settings payload building and usage meter are pure and clamped", () => {
     { token_budget_daily: 0, max_output_tokens: 2048, agent_mode_default: true },
   );
   assert.deepEqual(buildSettingsPayload({ theme: "light" }), { theme: "light" });
+  assert.deepEqual(
+    buildSettingsPayload({ snapshot_retention_days: "60", timeline_cap: "999999", subtask_max_attempts: "3" }),
+    { snapshot_retention_days: 60, timeline_cap: 50000, subtask_max_attempts: 3 },
+  );
 
   const unlimited = usageMeter({ paid_today: { total: 1200 }, budgets: { daily: 0 } });
   assert.equal(unlimited.unlimited, true);

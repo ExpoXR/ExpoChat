@@ -20,14 +20,12 @@ let chats = [];
 let currentChat = null;
 let currentFile = null;
 let pinnedContextPaths = [];
-let allowedRoots = [];
 let csrfToken = "";
 let runs = [];
 let currentRun = null;
 let currentRunData = null;
 let runEventSource = null;
 let brains = [];
-let agents = [];
 let drawerReturnFocus = null;
 let searchCursor = null;
 let activeSearch = "";
@@ -158,7 +156,8 @@ function openContextMenu(anchorEl, items) {
 // ---------------------------------------------------------------------------
 
 function switchSidePane(name) {
-  ["chat", "runs", "files", "tools", "snaps", "timeline", "settings", "more"].forEach((pane) => {
+  setSettingsMode(false);
+  ["chat", "runs", "files", "tools", "snaps", "timeline", "more"].forEach((pane) => {
     const panEl = $(pane + "Pane");
     if (panEl) panEl.classList.toggle("hidden", pane !== name);
     const btn = $("activity" + pane[0].toUpperCase() + pane.slice(1));
@@ -167,6 +166,21 @@ function switchSidePane(name) {
   drawerReturnFocus = document.activeElement;
   document.querySelector(".sidebar").classList.add("open");
   syncDrawerState();
+}
+
+function setSettingsMode(active) {
+  const grid = document.querySelector(".main-grid");
+  const wasActive = grid.classList.contains("settings-active");
+  grid.classList.toggle("settings-active", active);
+  $("activitySettings").classList.toggle("active", active);
+  if (!active && wasActive && !$("settingsEditor").classList.contains("hidden")) switchEditor("chatEditor");
+}
+
+async function openSettingsPage() {
+  setSettingsMode(true);
+  switchEditor("settingsEditor");
+  closeDrawers();
+  await Promise.allSettled([loadBrains(), loadAgents(), loadSettings(), loadSettingsStorage()]);
 }
 
 function syncDrawerState() {
@@ -185,8 +199,60 @@ function closeDrawers() {
   drawerReturnFocus = null;
 }
 
+const PANEL_LAYOUT_KEY = "ollma_panel_layout";
+
+function clampPanelWidth(value, min, max) {
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function setPanelWidth(kind, value, persist = true) {
+  const grid = document.querySelector(".main-grid");
+  const isSidebar = kind === "sidebar";
+  const width = clampPanelWidth(value, isSidebar ? 220 : 260, isSidebar ? 520 : 600);
+  grid.style.setProperty(isSidebar ? "--sidebar-width" : "--panel-width", `${width}px`);
+  $(isSidebar ? "sidebarResize" : "panelResize").setAttribute("aria-valuenow", String(width));
+  if (persist) {
+    let layout = {};
+    try { layout = JSON.parse(localStorage.getItem(PANEL_LAYOUT_KEY) || "{}"); } catch (_) {}
+    layout[kind] = width;
+    localStorage.setItem(PANEL_LAYOUT_KEY, JSON.stringify(layout));
+  }
+}
+
+function setupPanelResizer(id, kind, fallback) {
+  const handle = $(id);
+  handle.setAttribute("aria-valuemin", kind === "sidebar" ? "220" : "260");
+  handle.setAttribute("aria-valuemax", kind === "sidebar" ? "520" : "600");
+  let layout = {};
+  try { layout = JSON.parse(localStorage.getItem(PANEL_LAYOUT_KEY) || "{}"); } catch (_) {}
+  setPanelWidth(kind, Number(layout[kind]) || fallback, false);
+
+  handle.addEventListener("pointerdown", (event) => {
+    if (window.matchMedia("(max-width: 767px)").matches) return;
+    event.preventDefault();
+    handle.classList.add("dragging");
+    handle.setPointerCapture(event.pointerId);
+  });
+  handle.addEventListener("pointermove", (event) => {
+    if (!handle.hasPointerCapture(event.pointerId)) return;
+    setPanelWidth(kind, kind === "sidebar" ? event.clientX - 48 : window.innerWidth - event.clientX);
+  });
+  handle.addEventListener("pointerup", (event) => {
+    handle.classList.remove("dragging");
+    if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+  });
+  handle.addEventListener("dblclick", () => setPanelWidth(kind, fallback));
+  handle.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+    event.preventDefault();
+    const current = Number(handle.getAttribute("aria-valuenow")) || fallback;
+    const direction = event.key === "ArrowRight" ? 1 : -1;
+    setPanelWidth(kind, current + direction * (kind === "sidebar" ? 16 : -16));
+  });
+}
+
 function switchEditor(id) {
-  ["chatEditor", "runEditor", "fileEditor", "diffEditor", "artifactEditor"].forEach((pane) =>
+  ["chatEditor", "runEditor", "fileEditor", "diffEditor", "artifactEditor", "settingsEditor"].forEach((pane) =>
     $(pane).classList.toggle("hidden", pane !== id)
   );
   document.querySelectorAll(".editor-tab").forEach((tab) =>
@@ -338,33 +404,42 @@ async function loadModels() {
 
 // Rebuild the chat engine picker: local Ollama models + linked cloud brains.
 function renderChatEngines() {
-  const sel = $("modelSelect");
-  const prev = sel.value || loadPrefs().model;
-  sel.innerHTML = "";
-  const localGroup = document.createElement("optgroup");
-  localGroup.label = "Local (Ollama)";
-  models.forEach((m) => {
-    const opt = document.createElement("option");
-    opt.value = m.name || m.model;
-    opt.textContent = m.name || m.model;
-    localGroup.appendChild(opt);
-  });
-  sel.appendChild(localGroup);
-
+  const selects = [$("modelSelect"), $("chatModelSelect")].filter(Boolean);
+  const prev = $("chatModelSelect")?.value || $("modelSelect").value || loadPrefs().model;
   const cloud = providerOptions(brains || []);
-  if (cloud.length) {
-    const cloudGroup = document.createElement("optgroup");
-    cloudGroup.label = "Cloud (API)";
-    cloud.forEach((provider) => {
+  selects.forEach((select) => {
+    select.innerHTML = "";
+    const localGroup = document.createElement("optgroup");
+    localGroup.label = "Local (Ollama)";
+    models.forEach((model) => {
       const opt = document.createElement("option");
-      opt.value = cloudEngineValue(provider.value);
-      opt.textContent = provider.label;
-      cloudGroup.appendChild(opt);
+      opt.value = model.name || model.model;
+      opt.textContent = model.name || model.model;
+      localGroup.appendChild(opt);
     });
-    sel.appendChild(cloudGroup);
-  }
-  if (prev && [...sel.options].some((opt) => opt.value === prev)) sel.value = prev;
-  $("ollamaStatus").textContent = (sel.value || "no model").replace(/^cloud:/, "");
+    select.appendChild(localGroup);
+    if (cloud.length) {
+      const cloudGroup = document.createElement("optgroup");
+      cloudGroup.label = "Cloud (API)";
+      cloud.forEach((provider) => {
+        const opt = document.createElement("option");
+        opt.value = cloudEngineValue(provider.value);
+        opt.textContent = provider.label;
+        cloudGroup.appendChild(opt);
+      });
+      select.appendChild(cloudGroup);
+    }
+    if (prev && [...select.options].some((opt) => opt.value === prev)) select.value = prev;
+  });
+  syncChatModel($("modelSelect").value || $("chatModelSelect")?.value || "");
+}
+
+function syncChatModel(value) {
+  [$("modelSelect"), $("chatModelSelect")].filter(Boolean).forEach((select) => {
+    if ([...select.options].some((option) => option.value === value)) select.value = value;
+  });
+  $("ollamaStatus").textContent = (value || "no model").replace(/^cloud:/, "");
+  savePrefs();
 }
 
 async function loadChats(append = false) {
@@ -388,8 +463,7 @@ async function loadChat(id) {
     setWorkspaceTag(chat.target_path || "");
     if (previousTarget !== (chat.target_path || "")) resetPinnedContext();
     if (chat.model && [...$("modelSelect").options].some((option) => option.value === chat.model)) {
-      $("modelSelect").value = chat.model;
-      $("ollamaStatus").textContent = chat.model;
+      syncChatModel(chat.model);
     }
   }
   (data.messages || []).forEach((m) => addMessage(m.role, m.content));
@@ -573,7 +647,7 @@ async function openPath(path) {
     const up = document.createElement("button");
     up.className = "item";
     up.innerHTML = '<span class="file-icon">↑</span>..';
-    const atAllowedRoot = allowedRoots.includes(data.path);
+    const atAllowedRoot = (data.roots || []).includes(data.path);
     const parent = atAllowedRoot
       ? ""
       : data.path.split("/").slice(0, -1).join("/") || "";
@@ -979,8 +1053,14 @@ async function loadTimeline(append = false) {
   if (!append) $("timelineList").innerHTML = "";
   (data.timeline || []).forEach((event) => {
     const item = document.createElement("button");
-    item.className = "item";
-    item.textContent = `${formatLocalDateTime(event.created_at)}  [${event.event_type}]  ${event.summary.slice(0, 60)}`;
+    item.className = "item timeline-item";
+    const summary = document.createElement("span");
+    summary.textContent = `${formatLocalDateTime(event.created_at)}  [${event.event_type}]  ${event.summary.slice(0, 90)}`;
+    const path = document.createElement("small");
+    path.className = "timeline-path";
+    path.textContent = event.path || "No workspace path";
+    item.append(summary, path);
+    item.title = event.path || event.summary;
     item.onclick = () => {
       renderDiff(event.diff || event.summary);
       switchEditor("diffEditor");
@@ -1470,6 +1550,12 @@ async function loadSettings() {
     $("maxOutputTokens").value = appSettings.max_output_tokens || 0;
     $("themeSelect").value = appSettings.theme || "dark";
     $("agentModeDefault").checked = Boolean(appSettings.agent_mode_default);
+    $("snapshotRetentionDays").value = appSettings.snapshot_retention_days || 30;
+    $("timelineCap").value = appSettings.timeline_cap || 5000;
+    $("subtaskMaxAttempts").value = appSettings.subtask_max_attempts || 2;
+    $("brainMemoryBudget").value = appSettings.brain_memory_budget || 4000;
+    $("runEventsCap").value = appSettings.run_events_cap || 500;
+    $("runArtifactsCap").value = appSettings.run_artifacts_cap || 200;
     applyTheme(appSettings.theme || "dark");
     if (!agentModeTouched) {
       $("agentModeToggle").checked = Boolean(appSettings.agent_mode_default);
@@ -1477,6 +1563,20 @@ async function loadSettings() {
     }
   } catch (_) {}
   await loadUsage();
+}
+
+async function loadSettingsStorage() {
+  try {
+    const [storage, config] = await Promise.all([api("/api/maintenance/storage"), api("/api/config")]);
+    $("settingsStorageSummary").textContent =
+      `${storage.tracked.count} active · ${formatBytes(storage.tracked.bytes)} used · ${formatBytes(storage.filesystem.free_bytes)} free`;
+    const paths = config.paths || {};
+    $("settingsBackupSummary").textContent =
+      `Database: ${paths.database || "configured data volume"} · Snapshots: ${paths.snapshots || "configured snapshot volume"}`;
+  } catch (err) {
+    $("settingsStorageSummary").textContent = "Storage details unavailable.";
+    $("settingsBackupSummary").textContent = err.message;
+  }
 }
 
 async function loadUsage() {
@@ -1504,7 +1604,7 @@ async function saveSettings(values, message) {
 
 async function loadAgents() {
   const data = await api("/api/agents");
-  agents = data.agents || [];
+  const agents = data.agents || [];
   $("agentList").innerHTML = "";
   agents.forEach((agent) => {
     const row = document.createElement("div");
@@ -1615,8 +1715,6 @@ async function boot() {
   // Config — know which AI providers are available
   try {
     const cfg = await api("/api/config");
-    allowedRoots  = cfg.allowed_roots || [];
-
     // Populate plan provider selector based on what's enabled (loadBrains re-syncs later)
     const providerList = [
       { key: "codex", enabled: cfg.openai_enabled, label: "Codex (OpenAI)", indicator: "openaiIndicator" },
@@ -1681,6 +1779,9 @@ async function boot() {
 document.addEventListener("DOMContentLoaded", () => {
   populateModelSelect("codex", "gpt-5.6-sol");
   populateModelSelect("claude", "claude-sonnet-5");
+  populateModelSelect("gemini", "gemini-2.5-pro");
+  setupPanelResizer("sidebarResize", "sidebar", 292);
+  setupPanelResizer("panelResize", "panel", 340);
   // Auth
   $("loginForm").onsubmit = login;
   $("logoutBtn").onclick  = async () => {
@@ -1697,10 +1798,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("newChatBtn").onclick      = newChat;
   $("saveNewChatBtn").onclick  = saveAndNewChat;
   $("applyCodeBtn").onclick = applyLastCodeBlock;
-  $("modelSelect").onchange = () => {
-    $("ollamaStatus").textContent = $("modelSelect").value || "no model";
-    savePrefs();
-  };
+  $("modelSelect").onchange = () => syncChatModel($("modelSelect").value);
+  $("chatModelSelect").onchange = () => syncChatModel($("chatModelSelect").value);
   $("targetPath").onchange = () => {
     hide("targetHint");
     setWorkspaceTag($("targetPath").value.trim());
@@ -1814,7 +1913,25 @@ document.addEventListener("DOMContentLoaded", () => {
     theme: $("themeSelect").value,
     agent_mode_default: $("agentModeDefault").checked,
   }, "Appearance saved");
+  $("saveRunBehaviorBtn").onclick = () => saveSettings({
+    brain_memory_budget: $("brainMemoryBudget").value,
+    subtask_max_attempts: $("subtaskMaxAttempts").value,
+  }, "Run behavior saved");
+  $("saveHistoryBtn").onclick = async () => {
+    await saveSettings({
+      snapshot_retention_days: $("snapshotRetentionDays").value,
+      timeline_cap: $("timelineCap").value,
+    }, "Snapshots and history saved");
+    await loadSettingsStorage();
+  };
+  $("saveRetentionBtn").onclick = () => saveSettings({
+    run_events_cap: $("runEventsCap").value,
+    run_artifacts_cap: $("runArtifactsCap").value,
+  }, "Evidence retention saved");
   $("discoverAgentsBtn").onclick = discoverAgentModels;
+  $("closeSettingsBtn").onclick = () => { setSettingsMode(false); switchEditor("chatEditor"); };
+  $("openSnapshotsSettingsBtn").onclick = () => { switchSidePane("snaps"); loadSnaps(); };
+  $("openTimelineSettingsBtn").onclick = () => { switchSidePane("timeline"); loadTimeline(); };
 
   // Activity bar — switches sidebar pane (plan button toggles the plan panel on mobile)
   $("activityChat").onclick     = () => switchSidePane("chat");
@@ -1824,16 +1941,16 @@ document.addEventListener("DOMContentLoaded", () => {
   $("activitySnaps").onclick    = () => { switchSidePane("snaps");    loadSnaps();    };
   $("activityTimeline").onclick = () => { switchSidePane("timeline"); loadTimeline(); };
   $("activityPlan").onclick     = () => { document.querySelector(".panel-area").classList.toggle("open"); syncDrawerState(); };
-  $("activitySettings").onclick = () => { switchSidePane("settings"); loadBrains(); loadAgents(); loadSettings(); };
+  $("activitySettings").onclick = openSettingsPage;
   $("activityMore").onclick = () => switchSidePane("more");
   $("moreToolsBtn").onclick = () => switchSidePane("tools");
   $("moreSnapsBtn").onclick = () => { switchSidePane("snaps"); loadSnaps(); };
   $("moreTimelineBtn").onclick = () => { switchSidePane("timeline"); loadTimeline(); };
-  $("moreSettingsBtn").onclick = () => { switchSidePane("settings"); loadBrains(); loadAgents(); loadSettings(); };
+  $("moreSettingsBtn").onclick = openSettingsPage;
 
   // Editor tabs
   document.querySelectorAll(".editor-tab").forEach((tab) => {
-    tab.onclick = () => switchEditor(tab.dataset.editor);
+    tab.onclick = () => { setSettingsMode(false); switchEditor(tab.dataset.editor); };
   });
 
   // Status bar toggles

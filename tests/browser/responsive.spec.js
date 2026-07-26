@@ -59,3 +59,25 @@ test("authenticated workspace chat", async ({ page }) => {
   await page.locator("#sendBtn").click();
   await expect(page.locator(".msg.assistant .msg-body").last()).toContainText("Workspace fixture answer");
 });
+
+test("desktop settings and panel resizing", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.use.viewport.width < 1200, "Desktop layout only");
+  test.skip(!process.env.E2E_USER || !process.env.E2E_PASSWORD, "E2E credentials not supplied");
+  await page.goto("/");
+  await page.locator("#username").fill(process.env.E2E_USER);
+  await page.locator("#password").fill(process.env.E2E_PASSWORD);
+  await page.locator("#loginForm button[type=submit]").click();
+  await expect(page.locator("#app")).toBeVisible();
+  await expect(page.locator("#chatModelSelect")).toHaveValue("test-model");
+
+  await page.locator("#activitySettings").click();
+  await expect(page.locator("#settingsEditor")).toBeVisible();
+  await expect(page.locator(".main-grid")).toHaveClass(/settings-active/);
+  await expect(page.locator(".sidebar")).toBeHidden();
+
+  await page.locator("#closeSettingsBtn").click();
+  const before = await page.locator(".sidebar").evaluate((element) => element.getBoundingClientRect().width);
+  await page.locator("#sidebarResize").press("ArrowRight");
+  const after = await page.locator(".sidebar").evaluate((element) => element.getBoundingClientRect().width);
+  expect(after).toBeGreaterThan(before);
+});

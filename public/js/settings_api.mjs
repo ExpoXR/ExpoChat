@@ -21,6 +21,19 @@ export function buildSettingsPayload(values = {}) {
   if (values.max_output_tokens !== undefined && values.max_output_tokens !== "") {
     payload.max_output_tokens = clampInt(values.max_output_tokens, 1_000_000);
   }
+  const boundedSettings = {
+    snapshot_retention_days: [1, 3650],
+    timeline_cap: [100, 50_000],
+    subtask_max_attempts: [1, 10],
+    brain_memory_budget: [500, 1_000_000],
+    run_events_cap: [50, 10_000],
+    run_artifacts_cap: [20, 5_000],
+  };
+  Object.entries(boundedSettings).forEach(([key, [min, max]]) => {
+    if (values[key] !== undefined && values[key] !== "") {
+      payload[key] = Math.max(min, clampInt(values[key], max));
+    }
+  });
   if (values.theme !== undefined && THEMES.has(values.theme)) {
     payload.theme = values.theme;
   }

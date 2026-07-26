@@ -137,55 +137,6 @@
             <button id="loadMoreTimelineBtn" class="hidden">More events</button>
           </section>
 
-          <section id="settingsPane" class="side-pane hidden">
-            <div class="section-title">BRAINS</div>
-            <label>ChatGPT model</label>
-            <select id="codexModel"></select>
-            <label>OpenAI API key</label>
-            <input id="codexKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
-            <div class="btn-row"><button id="saveCodexBtn">Link / Rotate</button><button id="testCodexBtn">Test</button><button id="disconnectCodexBtn">Disconnect</button></div>
-            <p id="codexState" class="field-hint"></p>
-            <label>Claude model</label>
-            <select id="claudeModel"></select>
-            <label>Anthropic API key</label>
-            <input id="claudeKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
-            <div class="btn-row"><button id="saveClaudeBtn">Link / Rotate</button><button id="testClaudeBtn">Test</button><button id="disconnectClaudeBtn">Disconnect</button></div>
-            <p id="claudeState" class="field-hint"></p>
-            <label>Gemini model</label>
-            <select id="geminiModel"></select>
-            <label>Google Gemini API key</label>
-            <input id="geminiKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
-            <div class="btn-row"><button id="saveGeminiBtn">Link / Rotate</button><button id="testGeminiBtn">Test</button><button id="disconnectGeminiBtn">Disconnect</button></div>
-            <p id="geminiState" class="field-hint"></p>
-            <div class="section-title with-gap">BUDGET &amp; LIMITS</div>
-            <div id="usageMeter" class="usage-meter">
-              <div class="usage-meter-label"><span id="usageMeterText">—</span></div>
-              <div class="usage-meter-track"><div id="usageMeterFill" class="usage-meter-fill"></div></div>
-              <p id="usageMeterBreakdown" class="field-hint"></p>
-            </div>
-            <label>Daily API token budget <span class="label-hint">(0 = unlimited)</span></label>
-            <input id="budgetDaily" type="number" min="0" step="1000" placeholder="0">
-            <label>Per-run API token budget <span class="label-hint">(0 = unlimited)</span></label>
-            <input id="budgetRun" type="number" min="0" step="1000" placeholder="0">
-            <label>Max output tokens per response <span class="label-hint">(0 = provider default)</span></label>
-            <input id="maxOutputTokens" type="number" min="0" step="256" placeholder="0">
-            <div class="btn-row"><button id="saveBudgetBtn">Save Limits</button><button id="refreshUsageBtn">Refresh Usage</button></div>
-
-            <div class="section-title with-gap">APPEARANCE</div>
-            <label>Theme</label>
-            <select id="themeSelect">
-              <option value="dark">Dark</option>
-              <option value="light">Light</option>
-              <option value="auto">Match system</option>
-            </select>
-            <label class="check-label"><input id="agentModeDefault" type="checkbox"> Default new chats to Agent Mode</label>
-            <div class="btn-row"><button id="saveAppearanceBtn">Save Appearance</button></div>
-
-            <div class="section-title with-gap">OLLAMA AGENTS</div>
-            <button id="discoverAgentsBtn">Discover Models</button>
-            <div id="agentList" class="tree"></div>
-          </section>
-
           <section id="morePane" class="side-pane hidden">
             <div class="section-title">MORE</div>
             <div class="more-menu">
@@ -196,6 +147,8 @@
             </div>
           </section>
         </aside>
+
+        <div id="sidebarResize" class="panel-resizer" role="separator" aria-label="Resize navigation panel" aria-orientation="vertical" tabindex="0"></div>
 
         <!-- Editor area -->
         <section class="editor-area">
@@ -211,6 +164,8 @@
           <section id="chatEditor" class="editor-pane">
             <div class="editor-toolbar">
               <span class="toolbar-label">Chat — <span id="ollamaStatus">connecting…</span></span>
+              <label class="toolbar-model-label" for="chatModelSelect">Model</label>
+              <select id="chatModelSelect" class="toolbar-model" title="Change model for this chat"></select>
               <span id="workspaceTag" class="workspace-tag hidden" title="Active workspace folder sent to Ollama"></span>
               <span id="contextTag" class="workspace-tag hidden" title="Pinned files sent to Ollama"></span>
               <button id="applyCodeBtn" title="Apply last code block to the active file">Apply to File</button>
@@ -301,7 +256,132 @@
             <div class="editor-toolbar"><span id="artifactTitle">Evidence</span></div>
             <div id="artifactView" class="plan-proof"></div>
           </section>
+
+          <section id="settingsEditor" class="editor-pane settings-page hidden">
+            <header class="settings-header">
+              <div>
+                <span class="settings-kicker">OLLMA CONTROL CENTER</span>
+                <h1>Settings</h1>
+                <p>Brains, local models, safety limits, history, snapshots, and run behavior.</p>
+              </div>
+              <button id="closeSettingsBtn">Back to Chat</button>
+            </header>
+
+            <div class="settings-scroll">
+              <section class="settings-section">
+                <div class="settings-section-heading">
+                  <div><h2>Brains</h2><p>Cloud brains plan and supervise work. Local Ollama models execute chat and agent tasks on your machine.</p></div>
+                </div>
+                <div class="settings-grid settings-grid-three">
+                  <article class="settings-card">
+                    <div class="settings-card-title"><span class="provider-mark openai-mark">O</span><div><h3>ChatGPT / OpenAI</h3><p>Strong planning, coding, and verification.</p></div></div>
+                    <label for="codexModel">Model</label><select id="codexModel"></select>
+                    <label for="codexKey">API key</label><input id="codexKey" type="password" autocomplete="off" placeholder="Blank keeps current key">
+                    <div class="btn-row"><button id="saveCodexBtn">Link / Rotate</button><button id="testCodexBtn">Test</button><button id="disconnectCodexBtn">Disconnect</button></div>
+                    <p id="codexState" class="field-hint"></p>
+                  </article>
+                  <article class="settings-card">
+                    <div class="settings-card-title"><span class="provider-mark claude-mark">C</span><div><h3>Claude / Anthropic</h3><p>Long-context analysis and careful implementation.</p></div></div>
+                    <label for="claudeModel">Model</label><select id="claudeModel"></select>
+                    <label for="claudeKey">API key</label><input id="claudeKey" type="password" autocomplete="off" placeholder="Blank keeps current key">
+                    <div class="btn-row"><button id="saveClaudeBtn">Link / Rotate</button><button id="testClaudeBtn">Test</button><button id="disconnectClaudeBtn">Disconnect</button></div>
+                    <p id="claudeState" class="field-hint"></p>
+                  </article>
+                  <article class="settings-card">
+                    <div class="settings-card-title"><span class="provider-mark gemini-mark">G</span><div><h3>Gemini / Google</h3><p>Fast research, large context, and multimodal work.</p></div></div>
+                    <label for="geminiModel">Model</label><select id="geminiModel"></select>
+                    <label for="geminiKey">API key</label><input id="geminiKey" type="password" autocomplete="off" placeholder="Blank keeps current key">
+                    <div class="btn-row"><button id="saveGeminiBtn">Link / Rotate</button><button id="testGeminiBtn">Test</button><button id="disconnectGeminiBtn">Disconnect</button></div>
+                    <p id="geminiState" class="field-hint"></p>
+                  </article>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-heading"><div><h2>Budget &amp; context</h2><p>Caps prevent unexpected cloud usage and oversized responses. Zero means provider default or unlimited.</p></div></div>
+                <div class="settings-grid settings-grid-two">
+                  <article class="settings-card">
+                    <h3>Today’s paid API usage</h3>
+                    <div id="usageMeter" class="usage-meter">
+                      <div class="usage-meter-label"><span id="usageMeterText">—</span></div>
+                      <div class="usage-meter-track"><div id="usageMeterFill" class="usage-meter-fill"></div></div>
+                      <p id="usageMeterBreakdown" class="field-hint"></p>
+                    </div>
+                    <label for="budgetDaily">Daily token budget</label><input id="budgetDaily" type="number" min="0" step="1000">
+                    <label for="budgetRun">Per-run token budget</label><input id="budgetRun" type="number" min="0" step="1000">
+                    <label for="maxOutputTokens">Max output tokens per response</label><input id="maxOutputTokens" type="number" min="0" step="256">
+                    <div class="btn-row"><button id="saveBudgetBtn">Save limits</button><button id="refreshUsageBtn">Refresh usage</button></div>
+                  </article>
+                  <article class="settings-card">
+                    <h3>Agent memory &amp; retries</h3>
+                    <p class="settings-help">Memory budget controls how much run history the brain receives. Retry count applies per failed subtask.</p>
+                    <label for="brainMemoryBudget">Brain memory budget (tokens)</label><input id="brainMemoryBudget" type="number" min="500" max="1000000" step="500">
+                    <label for="subtaskMaxAttempts">Subtask attempts</label><input id="subtaskMaxAttempts" type="number" min="1" max="10">
+                    <button id="saveRunBehaviorBtn">Save run behavior</button>
+                  </article>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-heading"><div><h2>Snapshots, backups &amp; history</h2><p>Snapshots restore workspace files. Database backups preserve chats, plans, settings, and metadata. They are separate safety layers.</p></div></div>
+                <div class="settings-grid settings-grid-three">
+                  <article class="settings-card info-card">
+                    <h3>Snapshots</h3>
+                    <p>Created before destructive file actions and selected run stages. Active-run snapshots stay protected.</p>
+                    <label for="snapshotRetentionDays">Archive retention (days)</label><input id="snapshotRetentionDays" type="number" min="1" max="3650">
+                    <p id="settingsStorageSummary" class="settings-stat">Loading storage…</p>
+                    <button id="openSnapshotsSettingsBtn">Open snapshots</button>
+                  </article>
+                  <article class="settings-card info-card">
+                    <h3>Backups</h3>
+                    <p>Database backups are operator-managed. Use <code>make backup</code> or volume-level backup scheduling. Snapshot archives do not replace database backups.</p>
+                    <p id="settingsBackupSummary" class="settings-stat">Database and snapshot volumes should be backed up together.</p>
+                  </article>
+                  <article class="settings-card info-card">
+                    <h3>Timeline &amp; rescheduling</h3>
+                    <p>Timeline tracks file paths and diffs. Failed or cancelled runs can resume; completed work can clone into a new run. Automatic calendar scheduling is not enabled.</p>
+                    <label for="timelineCap">Timeline entries kept</label><input id="timelineCap" type="number" min="100" max="50000" step="100">
+                    <button id="openTimelineSettingsBtn">Open timeline</button>
+                  </article>
+                </div>
+                <div class="settings-actions"><button id="saveHistoryBtn">Save snapshots &amp; history</button></div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-heading"><div><h2>Evidence retention</h2><p>Controls bounded live telemetry. Durable plan versions and verification results remain preserved.</p></div></div>
+                <div class="settings-grid settings-grid-two">
+                  <article class="settings-card">
+                    <label for="runEventsCap">Events kept per run</label><input id="runEventsCap" type="number" min="50" max="10000" step="50">
+                  </article>
+                  <article class="settings-card">
+                    <label for="runArtifactsCap">Artifacts kept per run</label><input id="runArtifactsCap" type="number" min="20" max="5000" step="20">
+                  </article>
+                </div>
+                <div class="settings-actions"><button id="saveRetentionBtn">Save evidence retention</button></div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-heading"><div><h2>Appearance &amp; defaults</h2><p>Stored server-side and applied on every signed-in browser.</p></div></div>
+                <div class="settings-grid settings-grid-two">
+                  <article class="settings-card">
+                    <label for="themeSelect">Theme</label>
+                    <select id="themeSelect"><option value="dark">Dark</option><option value="light">Light</option><option value="auto">Match system</option></select>
+                    <label class="check-label"><input id="agentModeDefault" type="checkbox"> Default new chats to Agent Mode</label>
+                    <button id="saveAppearanceBtn">Save appearance</button>
+                  </article>
+                  <article class="settings-card">
+                    <h3>Local Ollama agents</h3>
+                    <p class="settings-help">Discover installed models, then assign roles, priority, and optional system prompts.</p>
+                    <button id="discoverAgentsBtn">Discover models</button>
+                  </article>
+                </div>
+                <div id="agentList" class="settings-agent-grid"></div>
+              </section>
+            </div>
+          </section>
         </section>
+
+        <div id="panelResize" class="panel-resizer" role="separator" aria-label="Resize supervisor panel" aria-orientation="vertical" tabindex="0"></div>
 
         <!-- Right panel — Supervisor run launcher + controls -->
         <aside class="panel-area plan-panel" aria-label="Supervisor run panel">

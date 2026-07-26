@@ -247,6 +247,7 @@ def test_record_chat_usage_writes_paid_ledger():
 def test_settings_round_trip_and_defaults():
     db.init_db()
     db.execute("delete from app_settings where key='token_budget_daily'")
+    db.execute("delete from app_settings where key='snapshot_retention_days'")
     assert db.get_setting_int("token_budget_daily") == 0  # falls back to default
     db.set_setting("token_budget_daily", 5000)
     db.set_setting("theme", "light")
@@ -254,6 +255,7 @@ def test_settings_round_trip_and_defaults():
     settings_map = db.all_settings()
     assert settings_map["theme"] == "light"
     assert settings_map["token_budget_daily"] == "5000"
+    assert settings_map["snapshot_retention_days"] == "30"
 
 
 def test_record_usage_writes_paid_and_local_ledger_rows():
@@ -1445,6 +1447,7 @@ def test_subtask_retry_on_failure(monkeypatch):
 def test_subtask_fails_after_max_attempts(monkeypatch):
     """Subtask that exhausted retries is marked failed, run stays implementing if others pending."""
     clear_workflow_tables()
+    db.set_setting("subtask_max_attempts", 2)
     seed_agent("exhaust-agent", "m", ["implementation"], ["tools"])
     now = db.utcnow()
     db.execute(

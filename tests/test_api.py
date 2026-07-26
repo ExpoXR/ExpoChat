@@ -153,10 +153,23 @@ def test_settings_usage_and_cloud_chat_wiring():
                 h = {"X-CSRF-Token": csrf}
 
                 # settings round-trip
-                saved = await client.put("/api/settings", headers=h, json={"token_budget_daily": 1234, "theme": "light"})
+                saved = await client.put(
+                    "/api/settings",
+                    headers=h,
+                    json={
+                        "token_budget_daily": 1234,
+                        "theme": "light",
+                        "snapshot_retention_days": 45,
+                        "timeline_cap": 4000,
+                        "subtask_max_attempts": 3,
+                    },
+                )
                 assert saved.status_code == 200
                 assert saved.json()["token_budget_daily"] == 1234
                 assert saved.json()["theme"] == "light"
+                assert saved.json()["snapshot_retention_days"] == 45
+                assert saved.json()["timeline_cap"] == 4000
+                assert saved.json()["subtask_max_attempts"] == 3
                 assert (await client.get("/api/settings")).json()["token_budget_daily"] == 1234
 
                 usage = await client.get("/api/usage")
