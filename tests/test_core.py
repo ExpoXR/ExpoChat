@@ -21,6 +21,12 @@ from backend.migrations import MIGRATIONS  # noqa: E402
 from backend.prompts import CAVEMAN_OUTPUT_INSTRUCTIONS  # noqa: E402
 from backend.run_state import validate_transition  # noqa: E402
 from backend.security import decrypt_secret, encrypt_secret  # noqa: E402
+from backend.verification_policy import (  # noqa: E402
+    PolicyDecision,
+    evaluate_apply_gate,
+    get_check_evidence,
+    record_check_evidence,
+)
 from backend.workspace import (  # noqa: E402
     allowed_path,
     create_snapshot,
@@ -37,9 +43,9 @@ def setup_module():
 
 def clear_workflow_tables():
     for table in (
-        "brain_memory", "jobs", "subtask_results", "subtasks", "verification_results",
-        "run_approvals", "history_snippets", "plan_versions", "run_artifacts", "run_events",
-        "runs", "agent_profiles", "snapshots",
+        "check_evidence", "brain_memory", "jobs", "subtask_results", "subtasks",
+        "verification_results", "run_approvals", "history_snippets", "plan_versions",
+        "run_artifacts", "run_events", "runs", "agent_profiles", "snapshots",
     ):
         db.execute(f"delete from {table}")
 
@@ -1511,3 +1517,156 @@ def test_build_subtask_verify_prompt():
     assert "JWT tokens" in prompt
     assert "JWT middleware" in prompt
     assert "passed" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Phase 0A — Deterministic verification evidence & apply gate
+# ---------------------------------------------------------------------------
+
+def test_check_evidence_migration():
+    """Migration 12 creates check_evidence table."""
+    db.init_db()
+    cols = {row[1] for row in db.connect().execute("pragma table_info(check_evidence)")}
+    assert "run_id" in cols
+    assert "exit_code" in cols
+    assert "command" in cols
+    assert "workspace_hash" in cols
+    assert "duration_ms" in cols
+
+
+def test_record_and_get_check_evidence():
+    """record_check_evidence persists and get_check_evidence retrieves."""
+    clear_workflow_tables()
+    run_id = _seed_run()
+    row_id = record_check_evidence(
+        run_id=run_id, cycle=0, command="pytest",
+        args=["--tb=short"], exit_code=0, output="exit=0\n2 passed",
+        duration_ms=1234, workspace_hash="abc123",
+    )
+    assert row_id > 0
+    rows = get_check_evidence(run_id)
+    assert len(rows) == 1
+    assert rows[0]["exit_code"] == 0
+    assert rows[0]["command"] == "pytest"
+    assert rows[0]["workspace_hash"] == "abc123"
+
+    record_check_evidence(
+        run_id=run_id, cycle=1, command="ruff",
+        args=["check", "."], exit_code=1, output="exit=1\nerror",
+        duration_ms=500, workspace_hash="def456",
+    )
+    all_rows = get_check_evidence(run_id)
+    assert len(all_rows) == 2
+    cycle_1 = get_check_evidence(run_id, cycle=1)
+    assert len(cycle_1) == 1
+    assert cycle_1[0]["exit_code"] == 1
+
+
+def test_apply_gate_no_evidence_blocks():
+    """Gate blocks when no check evidence exists, even if brain says PASS."""
+    clear_workflow_tables()
+    run_id = _seed_run()
+    gate = evaluate_apply_gate(run_id, brain_passed=True)
+    assert not gate.allowed
+    assert "no_check_evidence" in gate.reasons
+    assert gate.evidence_passed is False
+    assert gate.brain_passed is True
+
+
+def test_apply_gate_pass_with_evidence():
+    """Gate allows when evidence passes and brain passes."""
+    clear_workflow_tables()
+    run_id = _seed_run()
+    record_check_evidence(
+        run_id=run_id, cycle=0, command="pytest",
+        args=[], exit_code=0, output="exit=0\nok",
+        duration_ms=100, workspace_hash="h1",
+    )
+    gate = evaluate_apply_gate(run_id, brain_passed=True)
+    assert gate.allowed
+    assert gate.evidence_passed is True
+    assert gate.reasons == ["all_gates_passed"]
+
+
+def test_apply_gate_blocks_on_check_failure():
+    """Gate blocks when a check exited non-zero, even with a passing check."""
+    clear_workflow_tables()
+    run_id = _seed_run()
+    record_check_evidence(
+        run_id=run_id, cycle=0, command="ruff",
+        args=["check", "."], exit_code=0, output="exit=0\nok",
+        duration_ms=100, workspace_hash="h1",
+    )
+    record_check_evidence(
+        run_id=run_id, cycle=0, command="pytest",
+        args=[], exit_code=1, output="exit=1\n1 failed",
+        duration_ms=200, workspace_hash="h1",
+    )
+    gate = evaluate_apply_gate(run_id, brain_passed=True)
+    assert not gate.allowed
+    assert "check_failures_present" in gate.reasons
+    assert gate.pass_count == 1
+    assert gate.fail_after_edit_count == 1
+
+
+def test_apply_gate_blocks_brain_fail():
+    """Gate blocks when brain verdict failed, even with passing checks."""
+    clear_workflow_tables()
+    run_id = _seed_run()
+    record_check_evidence(
+        run_id=run_id, cycle=0, command="pytest",
+        args=[], exit_code=0, output="exit=0\nok",
+        duration_ms=100, workspace_hash="h1",
+    )
+    gate = evaluate_apply_gate(run_id, brain_passed=False)
+    assert not gate.allowed
+    assert "brain_verdict_failed" in gate.reasons
+    assert gate.evidence_passed is True
+
+
+def test_apply_gate_blocks_no_passing_check():
+    """Gate blocks when all checks failed (no exit=0)."""
+    clear_workflow_tables()
+    run_id = _seed_run()
+    record_check_evidence(
+        run_id=run_id, cycle=0, command="ruff",
+        args=["check", "."], exit_code=1, output="exit=1\nerror",
+        duration_ms=100, workspace_hash="h1",
+    )
+    gate = evaluate_apply_gate(run_id, brain_passed=True)
+    assert not gate.allowed
+    assert "no_passing_check" in gate.reasons
+    assert "check_failures_present" in gate.reasons
+
+
+def test_policy_decision_to_dict():
+    """PolicyDecision.to_dict returns all fields."""
+    d = PolicyDecision(
+        allowed=True, reasons=["all_gates_passed"],
+        evidence_passed=True, brain_passed=True,
+        check_count=2, pass_count=2, fail_after_edit_count=0,
+    )
+    result = d.to_dict()
+    assert result["allowed"] is True
+    assert result["check_count"] == 2
+
+
+def _seed_run() -> str:
+    """Insert a minimal run row and return its id."""
+    run_id = secrets.token_hex(12)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,brain_model,target_path,web_research,"
+        "status,baseline_hash,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+        (run_id, "test task", "codex", "test-model", str(WORKSPACES), 0,
+         "verifying", "testhash", now, now),
+    )
+    return run_id
+
+
+def test_qualifying_checks_list_structure():
+    """QUALIFYING_CHECKS has expected shape."""
+    for check in orchestrator.QUALIFYING_CHECKS:
+        assert "command" in check
+        assert "args" in check
+        assert isinstance(check["args"], list)

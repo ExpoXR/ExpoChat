@@ -188,6 +188,19 @@ def _subtask_acceptance(db: sqlite3.Connection) -> None:
     _add_columns(db, "subtasks", {"acceptance_criteria": "text not null default ''"})
 
 
+def _check_evidence(db: sqlite3.Connection) -> None:
+    db.execute(
+        "create table if not exists check_evidence ("
+        " id integer primary key autoincrement, run_id text not null,"
+        " cycle integer not null, command text not null, args_json text not null default '[]',"
+        " exit_code integer not null, output text not null default '',"
+        " duration_ms integer not null default 0, workspace_hash text not null default '',"
+        " node_id text, created_at text not null,"
+        " foreign key(run_id) references runs(id) on delete cascade)"
+    )
+    db.execute("create index if not exists idx_check_evidence_run on check_evidence(run_id,cycle)")
+
+
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _snapshot_metadata),
     (2, _durable_jobs),
@@ -200,6 +213,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (9, _task_dag),
     (10, _brain_memory),
     (11, _subtask_acceptance),
+    (12, _check_evidence),
 ]
 
 

@@ -27,6 +27,10 @@ from .plan_graph import GraphError, independent_pairs_sharing_globs, validate_gr
 from .prompts import with_caveman
 from .run_state import validate_transition
 from .security import decrypt_secret
+from .verification_policy import (
+    evaluate_apply_gate,
+    record_check_evidence,
+)
 from .workspace import (
     MergeConflict,
     apply_stage,
@@ -737,6 +741,71 @@ def brain_verdict(run: dict[str, Any], reports: list[str]) -> tuple[bool, str]:
     return verdict.passed, verdict.to_json()
 
 
+QUALIFYING_CHECKS: list[dict[str, Any]] = [
+    {"command": "ruff", "args": ["check", "."], "label": "ruff-lint"},
+    {"command": "pytest", "args": ["--tb=short", "-q"], "label": "pytest"},
+    {"command": "python3", "args": ["-m", "py_compile"], "label": "py-compile", "skip": True},
+]
+
+
+def _run_qualifying_checks(
+    run_id: str, cycle: int, workspace: str = "workspace", node_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Run deterministic qualifying checks on the staged workspace via the worker.
+
+    Records each result as structured check_evidence. Returns the list of evidence
+    records. The checks use the /check endpoint which returns exit codes directly.
+    """
+    stage = settings.jobs_dir / run_id / workspace
+    workspace_hash = manifest_hash(stage) if stage.exists() else ""
+    results: list[dict[str, Any]] = []
+    for check in QUALIFYING_CHECKS:
+        if check.get("skip"):
+            continue
+        command = check["command"]
+        args = check["args"]
+        started = time.monotonic()
+        try:
+            with httpx.Client(timeout=300) as client:
+                response = client.post(
+                    settings.worker_url + "/check",
+                    headers={"X-Worker-Token": settings.worker_token},
+                    json={"run_id": run_id, "workspace": workspace, "command": command, "args": args, "timeout": 120},
+                )
+                response.raise_for_status()
+                data = response.json()
+        except (httpx.HTTPError, Exception) as exc:
+            data = {"ok": False, "content": f"Check unavailable: {exc}"}
+        duration_ms = int((time.monotonic() - started) * 1000)
+        output = data.get("content", "")
+        exit_code = 0 if data.get("ok") else 1
+        if output.startswith("exit="):
+            try:
+                exit_code = int(output.split("\n", 1)[0].split("=", 1)[1])
+            except (ValueError, IndexError):
+                pass
+        row_id = record_check_evidence(
+            run_id=run_id,
+            cycle=cycle,
+            command=command,
+            args=args,
+            exit_code=exit_code,
+            output=output,
+            duration_ms=duration_ms,
+            workspace_hash=workspace_hash,
+            node_id=node_id,
+        )
+        evidence = {"id": row_id, "command": command, "args": args, "exit_code": exit_code, "duration_ms": duration_ms, "label": check.get("label", command)}
+        results.append(evidence)
+        db.add_event(
+            run_id,
+            "check.completed",
+            f"Check {check.get('label', command)}: exit={exit_code} ({duration_ms}ms)",
+            {"check": evidence, "node_id": node_id},
+        )
+    return results
+
+
 def _run_subtask(run_id: str, node: dict[str, Any], base_stage: Path) -> dict[str, Any]:
     """Execute one subtask in its own isolated worktree. Runs on a pool thread."""
     subtask_id = node["id"]
@@ -920,6 +989,23 @@ def _verify_and_apply(run_id: str, summary: str, implementer_ids: set[str], repa
         update_run(run_id, status="verifying")
     if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
         return
+    # --- Deterministic evidence gate (Phase 0A) ---
+    _run_qualifying_checks(run_id, cycle=repair)
+    run = db.one("select * from runs where id=?", (run_id,)) or {}
+    last_verdict = run.get("verdict") or "{}"
+    try:
+        brain_passed = json.loads(last_verdict).get("passed", False)
+    except (json.JSONDecodeError, AttributeError):
+        brain_passed = False
+    gate = evaluate_apply_gate(run_id, brain_passed)
+    save_artifact(run_id, "apply_gate", "Verification policy decision", gate.to_dict())
+    db.add_event(run_id, "gate.evaluated", f"Apply gate: {'ALLOWED' if gate.allowed else 'BLOCKED'}", gate.to_dict())
+    if not gate.allowed:
+        reasons = ", ".join(gate.reasons)
+        update_run(run_id, status="failed", error=f"Apply gate blocked: {reasons}")
+        db.add_event(run_id, "run.failed", f"Deterministic verification gate blocked apply: {reasons}", gate.to_dict())
+        return
+    # --- End evidence gate ---
     target = Path(run["target_path"])
     if manifest_hash(target) != run["baseline_hash"]:
         raise RuntimeError("Workspace changed during run; verified stage was not applied")
