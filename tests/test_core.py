@@ -687,6 +687,59 @@ def test_insert_subtasks_persists_and_replaces_graph():
     assert db.subtasks(run_id)[0]["status"] == "done"
     assert db.all_rows("select * from subtask_results where run_id=?", (run_id,))[0]["content"] == "transcript a"
 
+
+def test_validate_graph_normalizes_complexity():
+    nodes = plan_graph.validate_graph({"subtasks": [
+        {"node_id": "a", "spec": "x", "complexity": "COMPLEX"},
+        {"node_id": "b", "spec": "y", "depends_on": ["a"], "complexity": "weird"},
+        {"node_id": "c", "spec": "z", "depends_on": ["b"]},
+    ]})
+    by_id = {n["node_id"]: n for n in nodes}
+    assert by_id["a"]["complexity"] == "complex"
+    assert by_id["b"]["complexity"] == "simple"  # unknown token → simple
+    assert by_id["c"]["complexity"] == "simple"  # missing → simple
+
+
+def test_choose_subtask_agent_honors_user_assignment():
+    clear_workflow_tables()
+    seed_agent("pinned", "pinned-model", ["implementation"], ["tools"], 10)
+    seed_agent("top", "top-model", ["implementation"], ["tools"], 100)
+    # A valid pin wins over the higher-priority agent the scheduler would otherwise pick.
+    node = {"node_id": "a", "role": "implementation", "assigned_agent_id": "pinned"}
+    assert orchestrator.choose_subtask_agent(node)["id"] == "pinned"
+    # An unknown/ineligible pin falls back to normal scoring (top priority wins).
+    node_bad = {"node_id": "b", "role": "implementation", "assigned_agent_id": "ghost"}
+    assert orchestrator.choose_subtask_agent(node_bad)["id"] == "top"
+
+
+def test_edit_task_graph_assigns_agent_rejects_cycle_and_guards_state():
+    clear_workflow_tables()
+    run_id = "e" * 24
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "graph edit", "codex", str(WORKSPACES), "awaiting_approval", now, now),
+    )
+    seed_agent("worker1", "worker1-model", ["implementation"], ["tools"], 50)
+    nodes = plan_graph.validate_graph({"subtasks": [
+        {"node_id": "a", "spec": "a"},
+        {"node_id": "b", "spec": "b", "depends_on": ["a"]},
+    ]})
+    db.insert_subtasks(run_id, nodes)
+
+    result = orchestrator.edit_task_graph(run_id, [{"node_id": "b", "assigned_agent_id": "worker1"}])
+    assert {n["node_id"]: n for n in result["subtasks"]}["b"]["assigned_agent_id"] == "worker1"
+
+    # Rewiring a→b while b→a already exists is a cycle → rejected, assignment preserved.
+    with pytest.raises(RuntimeError):
+        orchestrator.edit_task_graph(run_id, [{"node_id": "a", "depends_on": ["b"]}])
+    assert {n["node_id"]: n for n in db.subtasks(run_id)}["b"]["assigned_agent_id"] == "worker1"
+
+    # Not editable once the graph is executing.
+    db.execute("update runs set status='implementing' where id=?", (run_id,))
+    with pytest.raises(RuntimeError):
+        orchestrator.edit_task_graph(run_id, [{"node_id": "b", "assigned_agent_id": "worker1"}])
+
     # Re-decomposition replaces the prior graph rather than duplicating node_ids.
     db.insert_subtasks(run_id, plan_graph.validate_graph({"subtasks": [{"node_id": "a", "spec": "only a"}]}))
     assert [row["node_id"] for row in db.subtasks(run_id)] == ["a"]

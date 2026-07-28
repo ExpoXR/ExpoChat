@@ -201,6 +201,15 @@ def _check_evidence(db: sqlite3.Connection) -> None:
     db.execute("create index if not exists idx_check_evidence_run on check_evidence(run_id,cycle)")
 
 
+def _subtask_graph_ui(db: sqlite3.Connection) -> None:
+    # Visual task-graph: brain-marked task difficulty + user's per-task agent override.
+    _add_columns(
+        db,
+        "subtasks",
+        {"complexity": "text not null default 'simple'", "assigned_agent_id": "text"},
+    )
+
+
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _snapshot_metadata),
     (2, _durable_jobs),
@@ -214,6 +223,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (10, _brain_memory),
     (11, _subtask_acceptance),
     (12, _check_evidence),
+    (13, _subtask_graph_ui),
 ]
 
 

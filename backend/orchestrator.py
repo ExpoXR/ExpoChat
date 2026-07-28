@@ -421,12 +421,18 @@ def choose_subtask_agent(
 ) -> dict[str, Any]:
     """Choose an agent for a specific subtask, honoring role and optional model hint.
 
+    0. If the user pinned assigned_agent_id and that agent is enabled+eligible -> use it.
     1. If node has suggested_model and that model is enabled+eligible -> use it.
     2. Else choose_agent(node.role, exclude) — now honoring the subtask's role.
     3. Round-robin tiebreak: when multiple agents have equal scores, rotate.
     """
     exclude = exclude or set()
     role = node.get("role") or "implementation"
+    assigned_id = node.get("assigned_agent_id") or ""
+    if assigned_id and assigned_id not in exclude:
+        agent = db.one("select * from agent_profiles where id=? and enabled=1", (assigned_id,))
+        if agent and _agent_is_eligible(agent, role, exclude):
+            return agent
     suggested = node.get("suggested_model") or ""
     if suggested:
         agent = db.one("select * from agent_profiles where model=? and enabled=1", (suggested,))
@@ -705,6 +711,74 @@ def edit_plan(run_id: str, plan: str) -> dict[str, Any]:
     db.add_plan_version(run_id, "edit", plan, run["brain_provider"])
     db.add_event(run_id, "plan.edited", "Plan changes saved")
     return db.one("select * from runs where id=?", (run_id,)) or {}
+
+
+def _validated_agent_id(agent_id: Any, role: str) -> str | None:
+    """Resolve a user-picked agent id, or None to clear. Rejects a missing/disabled/
+    role-ineligible agent so the graph never pins an agent that cannot run the task."""
+    value = str(agent_id or "").strip()
+    if not value:
+        return None
+    agent = db.one("select * from agent_profiles where id=? and enabled=1", (value,))
+    if not agent or not _agent_is_eligible(agent, role):
+        raise RuntimeError(f"Agent {value} is not available for role '{role}'")
+    return value
+
+
+def edit_task_graph(run_id: str, edits: list[dict[str, Any]]) -> dict[str, Any]:
+    """Apply user edits (per-node agent assignment and/or dependency rewiring) to a
+    drafted task graph, re-validating the DAG (cycles/unknown deps) before persisting.
+
+    Only allowed while the run is awaiting approval — once implementation starts the graph
+    is being executed. Returns the fresh subtasks plus any file-glob overlap warnings.
+    """
+    with _run_lock:
+        run = db.one("select * from runs where id=?", (run_id,))
+        if not run or run["status"] != "awaiting_approval":
+            raise RuntimeError("Task graph can only be edited while awaiting approval")
+        rows = db.subtasks(run_id)
+        if not rows:
+            raise RuntimeError("Run has no task graph to edit")
+        # Reconstruct the brain-graph node shape from persisted rows.
+        by_id: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            by_id[row["node_id"]] = {
+                "node_id": row["node_id"],
+                "title": row["title"],
+                "spec": row["spec"],
+                "depends_on": json.loads(row.get("depends_on_json") or "[]"),
+                "file_globs": json.loads(row.get("file_globs_json") or "[]"),
+                "acceptance_criteria": row.get("acceptance_criteria") or "",
+                "role": row.get("role") or "implementation",
+                "suggested_model": row.get("suggested_model"),
+                "complexity": row.get("complexity") or "simple",
+                "assigned_agent_id": row.get("assigned_agent_id"),
+            }
+        for edit in edits or []:
+            node_id = str(edit.get("node_id") or "").strip()
+            node = by_id.get(node_id)
+            if not node:
+                raise RuntimeError(f"Unknown subtask node: {node_id}")
+            if "depends_on" in edit:
+                node["depends_on"] = [str(dep).strip() for dep in (edit.get("depends_on") or []) if str(dep).strip()]
+            if "assigned_agent_id" in edit:
+                node["assigned_agent_id"] = _validated_agent_id(edit.get("assigned_agent_id"), node["role"])
+        # validate_graph rejects cycles/unknown deps and normalizes; it drops assigned_agent_id,
+        # so overlay the user's assignment back onto each validated node before persisting.
+        try:
+            validated = validate_graph({"subtasks": list(by_id.values())})
+        except GraphError as exc:
+            raise RuntimeError(str(exc)) from exc
+        for node in validated:
+            node["assigned_agent_id"] = by_id[node["node_id"]].get("assigned_agent_id")
+        db.insert_subtasks(run_id, validated)
+        warnings = [list(pair) for pair in independent_pairs_sharing_globs(validated)]
+        db.add_event(
+            run_id, "plan.graph_edited",
+            f"Task graph updated ({len(validated)} subtask(s))",
+            {"overlap_warnings": warnings},
+        )
+        return {"subtasks": db.subtasks(run_id), "overlap_warnings": warnings}
 
 
 def redo_plan(run_id: str) -> dict[str, Any]:
