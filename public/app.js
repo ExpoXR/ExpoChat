@@ -2,6 +2,7 @@ import { createApi } from "/js/api.mjs";
 import { buildChatPayload, chatAgentStep, chatEventStatus, cloudEngineValue } from "/js/chat.mjs";
 import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMarkdown } from "/js/render.mjs";
 import { artifactPresentation, explorerActivityState, fileActivity, runChoreography, runStatusLabel, subtaskCards, tokenCounts } from "/js/runs.mjs";
+import { assignableAgents, buildGraphModel, computeLayout, edgeList, wouldCycle } from "/js/graph.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
 import { buildSettingsPayload, usageMeter } from "/js/settings_api.mjs";
 import { consumeSse } from "/js/sse.mjs";
@@ -37,6 +38,7 @@ let planEditing = false;
 let snapshotRetentionDays = 30;
 let runFileActivity = new Map();
 let clipboard = null; // { mode: "copy" | "cut", path }
+let agentsCache = null; // [{id,name,roles,enabled,...}] for the task-graph LLM pickers
 
 // ---------------------------------------------------------------------------
 // Core API helper
@@ -1259,6 +1261,7 @@ function renderCurrentRun(run) {
   } else {
     hide("planResultArea");
   }
+  renderTaskGraph(run);
   const usage = tokenCounts(run.usage_json || {});
   const formatTokens = (value) => new Intl.NumberFormat().format(value);
   $("brainTokenCount").textContent = formatTokens(usage.brain.total);
@@ -1310,6 +1313,203 @@ function renderSubtasks(run) {
       `</div></div>`
     );
   }).join("");
+}
+
+// ---------------------------------------------------------------------------
+// Visual task graph (Cline-style linked boxes)
+// ---------------------------------------------------------------------------
+
+const TG_NODE_W = 170;
+const TG_NODE_H = 64;
+
+async function loadAgentsCache() {
+  if (agentsCache) return agentsCache;
+  try {
+    const data = await api("/api/agents");
+    agentsCache = data.agents || [];
+  } catch (_) { agentsCache = agentsCache || []; }
+  return agentsCache;
+}
+
+// Render the drafted DAG as linked boxes. Gated on subtasks existing — which the backend
+// creates the moment a plan is drafted (awaiting_approval). Editable (LLM pickers +
+// drag-to-rewire) only while awaiting approval; read-only + live status afterwards.
+function renderTaskGraph(run) {
+  const section = $("taskGraphSection");
+  const host = $("taskGraph");
+  if (!section || !host) return;
+  const subs = run?.subtasks || [];
+  if (!subs.length) { section.classList.add("hidden"); return; }
+  section.classList.remove("hidden");
+  const editable = run.status === "awaiting_approval";
+  $("taskGraphHint").textContent = editable
+    ? " · assign an LLM per task · drag ▸ onto another task to order it"
+    : " · live";
+  drawTaskGraph(run, subs, agentsCache || [], editable);
+  if (!agentsCache) {
+    loadAgentsCache().then(() => {
+      // Redraw with real agents if this run is still the one on screen and still shown.
+      if (currentRun === run.id && !section.classList.contains("hidden")) {
+        drawTaskGraph(run, currentRunData?.subtasks || subs, agentsCache || [], editable);
+      }
+    });
+  }
+}
+
+function drawTaskGraph(run, subs, agents, editable) {
+  const host = $("taskGraph");
+  const model = buildGraphModel(subs, agents);
+  const layout = computeLayout(model, { nodeW: TG_NODE_W, nodeH: TG_NODE_H });
+  const edges = edgeList(model);
+  const pos = new Map(layout.nodes.map((node) => [node.node_id, node]));
+  const statusById = new Map(model.map((node) => [node.node_id, node.status]));
+  // A pending node whose deps are all done is the "next task" the brain just released.
+  const isReady = (node) =>
+    node.status === "pending" && (node.deps || []).length > 0 &&
+    (node.deps || []).every((dep) => statusById.get(dep) === "done");
+
+  host.style.width = `${layout.width}px`;
+  host.style.height = `${layout.height}px`;
+  host.textContent = "";
+
+  const svgNS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(svgNS, "svg");
+  svg.setAttribute("class", "tg-edges");
+  svg.setAttribute("width", String(layout.width));
+  svg.setAttribute("height", String(layout.height));
+  for (const edge of edges) {
+    const a = pos.get(edge.from);
+    const b = pos.get(edge.to);
+    if (!a || !b) continue;
+    const x1 = a.x + TG_NODE_W;
+    const y1 = a.y + TG_NODE_H / 2;
+    const x2 = b.x;
+    const y2 = b.y + TG_NODE_H / 2;
+    const midX = (x1 + x2) / 2;
+    const path = document.createElementNS(svgNS, "path");
+    path.setAttribute("d", `M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`);
+    let cls = "tg-edge";
+    if (statusById.get(edge.from) === "done") cls += " done";
+    if (isReady(pos.get(edge.to))) cls += " ready";
+    path.setAttribute("class", cls);
+    svg.appendChild(path);
+  }
+  host.appendChild(svg);
+
+  for (const node of layout.nodes) {
+    const box = document.createElement("div");
+    box.className = "tg-node";
+    box.dataset.status = node.status;
+    box.dataset.complexity = node.complexity;
+    box.dataset.node = node.node_id;
+    if (isReady(node)) box.dataset.ready = "1";
+    box.style.left = `${node.x}px`;
+    box.style.top = `${node.y}px`;
+    box.style.width = `${TG_NODE_W}px`;
+
+    const head = document.createElement("div");
+    head.className = "tg-node-head";
+    head.innerHTML =
+      `<span class="tg-dot"></span><span class="tg-title" title="${escapeHtml(node.title)}">${escapeHtml(node.title)}</span>` +
+      (node.complexity === "complex" ? `<span class="tg-complex" title="complex task">🔴</span>` : "");
+    box.appendChild(head);
+
+    const meta = document.createElement("div");
+    meta.className = "tg-node-meta";
+    meta.innerHTML = `<span class="tg-role">${escapeHtml(node.role)}</span><span class="tg-state">${escapeHtml(node.status)}</span>`;
+    box.appendChild(meta);
+
+    if (editable) {
+      const sel = document.createElement("select");
+      sel.className = "tg-node-picker";
+      const auto = document.createElement("option");
+      auto.value = "";
+      auto.textContent = "⚙ auto (scheduler)";
+      sel.appendChild(auto);
+      for (const agent of assignableAgents(agents, node.role)) {
+        const opt = document.createElement("option");
+        opt.value = agent.id;
+        opt.textContent = agent.name;
+        if (agent.id === node.assigned_agent_id) opt.selected = true;
+        sel.appendChild(opt);
+      }
+      sel.onchange = () => saveGraphEdit(run.id, { node_id: node.node_id, assigned_agent_id: sel.value });
+      box.appendChild(sel);
+
+      const handle = document.createElement("div");
+      handle.className = "tg-handle";
+      handle.title = "drag onto another task to make this one run first";
+      handle.textContent = "▸";
+      attachLinkDrag(handle, node.node_id, run, model);
+      box.appendChild(handle);
+    } else {
+      const who = document.createElement("div");
+      who.className = "tg-node-agent";
+      who.textContent = node.agent_name || "unassigned";
+      box.appendChild(who);
+    }
+    host.appendChild(box);
+  }
+}
+
+async function saveGraphEdit(runId, node) {
+  try {
+    await api(`/api/runs/${runId}/graph`, { method: "PUT", body: JSON.stringify({ nodes: [node] }) });
+  } catch (err) {
+    showToast(err.message, "error");
+  }
+  await loadRun(runId);
+}
+
+// Toggle a dependency edge: source must run before target (target depends on source).
+// Dragging an existing link again removes it.
+function linkTasks(run, model, sourceId, targetId) {
+  const target = model.find((node) => node.node_id === targetId);
+  if (!target) return;
+  const deps = new Set(target.deps || []);
+  if (deps.has(sourceId)) {
+    deps.delete(sourceId);
+  } else if (wouldCycle(model, sourceId, targetId)) {
+    showToast("That link would create a cycle", "error");
+    return;
+  } else {
+    deps.add(sourceId);
+  }
+  saveGraphEdit(run.id, { node_id: targetId, depends_on: [...deps] });
+}
+
+// Pointer-based drag from a node's ▸ handle onto another node. Mirrors the pointer-capture
+// pattern used by setupPanelResizer.
+function attachLinkDrag(handle, sourceId, run, model) {
+  handle.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const host = $("taskGraph");
+    const ghost = document.createElement("div");
+    ghost.className = "tg-drag-ghost";
+    ghost.textContent = "link →";
+    document.body.appendChild(ghost);
+    const clearDrop = () => host.querySelectorAll(".tg-node.tg-drop").forEach((el) => el.classList.remove("tg-drop"));
+    const move = (ev) => {
+      ghost.style.left = `${ev.clientX + 8}px`;
+      ghost.style.top = `${ev.clientY + 8}px`;
+      clearDrop();
+      const over = document.elementFromPoint(ev.clientX, ev.clientY)?.closest?.(".tg-node");
+      if (over && over.dataset.node !== sourceId) over.classList.add("tg-drop");
+    };
+    const up = (ev) => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+      ghost.remove();
+      clearDrop();
+      const over = document.elementFromPoint(ev.clientX, ev.clientY)?.closest?.(".tg-node");
+      if (over && over.dataset.node && over.dataset.node !== sourceId) {
+        linkTasks(run, model, sourceId, over.dataset.node);
+      }
+    };
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
+  });
 }
 
 function renderRunEvents(events) {

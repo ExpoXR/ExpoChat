@@ -8,7 +8,7 @@ Graph shape (what the brain is asked to emit):
     {"subtasks": [
         {"node_id": "a", "title": "...", "spec": "...", "depends_on": [],
          "file_globs": ["src/x/**"], "acceptance_criteria": "...",
-         "role": "implementation", "suggested_model": null}
+         "role": "implementation", "complexity": "simple", "suggested_model": null}
     ]}
 """
 from __future__ import annotations
@@ -52,7 +52,7 @@ def validate_graph(graph: dict[str, Any]) -> list[dict[str, Any]]:
     Enforces: non-empty, unique node_ids, dependency references resolve, and the graph
     is acyclic. Returns nodes in a topological order (dependencies before dependants),
     each normalized to: node_id, title, spec, depends_on, file_globs, acceptance_criteria,
-    role, suggested_model. Raises GraphError on any violation.
+    role, suggested_model, complexity. Raises GraphError on any violation.
     """
     raw = graph.get("subtasks") if isinstance(graph, dict) else None
     if not isinstance(raw, list) or not raw:
@@ -80,6 +80,7 @@ def validate_graph(graph: dict[str, Any]) -> list[dict[str, Any]]:
         if role not in VALID_ROLES:
             role = "implementation"
         suggested_model = str(item["suggested_model"]).strip() if item.get("suggested_model") else None
+        complexity = "complex" if str(item.get("complexity") or "").strip().lower() == "complex" else "simple"
         nodes[node_id] = {
             "node_id": node_id,
             "title": title[:200],
@@ -89,6 +90,7 @@ def validate_graph(graph: dict[str, Any]) -> list[dict[str, Any]]:
             "acceptance_criteria": str(item.get("acceptance_criteria") or "").strip(),
             "role": role,
             "suggested_model": suggested_model,
+            "complexity": complexity,
         }
         order.append(node_id)
 

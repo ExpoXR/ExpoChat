@@ -738,6 +738,81 @@ label {
 .subtask-deps { font-style: italic; }
 
 /* -----------------------------------------------------------------------
+   Visual task graph (Cline-style linked boxes)
+----------------------------------------------------------------------- */
+.task-graph-section { margin: 4px 0 12px; }
+.task-graph-hint { color: var(--muted); font-weight: 400; text-transform: none; letter-spacing: 0; }
+.task-graph {
+  position: relative;
+  overflow: auto;
+  max-height: 460px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background:
+    radial-gradient(circle, var(--line-soft) 1px, transparent 1px) 0 0 / 22px 22px,
+    var(--panel);
+}
+.tg-edges { position: absolute; top: 0; left: 0; pointer-events: none; overflow: visible; }
+.tg-edge { fill: none; stroke: var(--muted); stroke-width: 1.5; opacity: 0.55; }
+.tg-edge.done { stroke: #76c47c; opacity: 0.8; }
+.tg-edge.ready { stroke: var(--accent); stroke-width: 2; opacity: 1; stroke-dasharray: 5 4; animation: tgFlow 0.8s linear infinite; }
+@keyframes tgFlow { to { stroke-dashoffset: -18; } }
+
+.tg-node {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--muted);
+  border-radius: 7px;
+  padding: 7px 9px;
+  background: var(--surface-raised);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+.tg-node[data-status="running"] { border-left-color: #d9a520; }
+.tg-node[data-status="done"] { border-left-color: #76c47c; }
+.tg-node[data-status="failed"] { border-left-color: var(--danger); }
+.tg-node[data-complexity="complex"] { border-color: var(--danger); }
+.tg-node[data-ready="1"] { box-shadow: 0 0 0 2px var(--accent); }
+.tg-node.tg-drop { box-shadow: 0 0 0 2px var(--accent); border-color: var(--accent); }
+
+.tg-node-head { display: flex; align-items: center; gap: 5px; }
+.tg-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+.tg-node[data-status="running"] .tg-dot {
+  background: #d9a520;
+  box-shadow: 0 0 0 0 rgba(217, 165, 32, 0.6);
+  animation: agentPulse 1.3s infinite;
+}
+.tg-node[data-status="done"] .tg-dot { background: #76c47c; }
+.tg-node[data-status="failed"] .tg-dot { background: var(--danger); }
+.tg-title {
+  font-size: 12px; font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1;
+}
+.tg-complex { font-size: 10px; flex: none; }
+.tg-node-meta { display: flex; justify-content: space-between; gap: 6px; margin-top: 3px; font-size: 10px; color: var(--muted); }
+.tg-role { text-transform: capitalize; }
+.tg-node-picker {
+  width: 100%; margin-top: 6px;
+  font-size: 11px; padding: 2px 4px;
+  color: var(--text); background: var(--input);
+  border: 1px solid var(--line); border-radius: 4px;
+}
+.tg-node-agent { margin-top: 5px; font-size: 11px; color: var(--muted); font-style: italic; }
+.tg-handle {
+  position: absolute; right: -9px; top: 50%; transform: translateY(-50%);
+  width: 18px; height: 18px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: #fff; background: var(--accent);
+  cursor: grab; touch-action: none; user-select: none;
+}
+.tg-handle:active { cursor: grabbing; }
+.tg-drag-ghost {
+  position: fixed; z-index: 9999; pointer-events: none;
+  font-size: 11px; padding: 2px 6px; border-radius: 4px;
+  color: #fff; background: var(--accent-strong);
+}
+
+/* -----------------------------------------------------------------------
    Terminal — under the chat
 ----------------------------------------------------------------------- */
 

@@ -111,10 +111,13 @@ def build_decompose_prompt(plan: str) -> str:
         '{"subtasks":[{"node_id":"kebab-id","title":"...","spec":"decision-complete instructions",'
         '"depends_on":["other-node-id"],"file_globs":["path/glob/**"],"acceptance_criteria":"...",'
         '"role":"implementation|research|verification",'
+        '"complexity":"simple|complex",'
         '"suggested_model":"optional-ollama-model-name-or-null"}]}\n'
         "Rules: keep each subtask independently verifiable; give every subtask a disjoint file_globs "
         "scope; if two subtasks must touch the same files, serialize them with depends_on instead of "
         "running them in parallel; use a single subtask if the plan is not decomposable; "
+        "set complexity to \"complex\" for subtasks that touch many files, carry real risk, or need "
+        "careful review, else \"simple\"; "
         "suggested_model is optional — omit or set null to let the scheduler choose. No prose.\n\nPLAN:\n"
         + plan
     )

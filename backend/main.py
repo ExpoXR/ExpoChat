@@ -33,6 +33,7 @@ from .orchestrator import (
     create_run,
     discover_agents,
     edit_plan,
+    edit_task_graph,
     provider_config,
     record_chat_usage,
     redo_plan,
@@ -124,6 +125,16 @@ class RunBody(BaseModel):
 
 class ApprovalBody(BaseModel):
     plan: str = Field(min_length=3, max_length=200_000)
+
+
+class GraphEditNode(BaseModel):
+    node_id: str = Field(min_length=1, max_length=64)
+    assigned_agent_id: str | None = Field(default=None, max_length=64)
+    depends_on: list[str] | None = Field(default=None, max_length=40)
+
+
+class GraphEditBody(BaseModel):
+    nodes: list[GraphEditNode] = Field(default_factory=list, max_length=40)
 
 
 class ChatBody(BaseModel):
@@ -714,6 +725,19 @@ def run_plan_edit(run_id: str, body: ApprovalBody, _: dict = Depends(require_use
         return edit_plan(run_id, body.plan.strip())
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@run_router.put("/api/runs/{run_id}/graph")
+def run_graph_edit(run_id: str, body: GraphEditBody, _: dict = Depends(require_user)):
+    # exclude_unset preserves the "field was provided" distinction so editing one property
+    # (e.g. a dependency) does not clear another (e.g. the pinned agent).
+    edits = [node.model_dump(exclude_unset=True) for node in body.nodes]
+    try:
+        return edit_task_graph(run_id, edits)
+    except Exception as exc:
+        message = str(exc)
+        status = 409 if "awaiting approval" in message else 400
+        raise HTTPException(status, message) from exc
 
 
 @run_router.post("/api/runs/{run_id}/redo")

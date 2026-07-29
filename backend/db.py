@@ -117,7 +117,8 @@ def insert_subtasks(run_id: str, nodes: list[dict[str, Any]]) -> None:
         for node in nodes:
             conn.execute(
                 "insert into subtasks(id,run_id,node_id,title,spec,depends_on_json,file_globs_json,"
-                "acceptance_criteria,role,suggested_model,status,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "acceptance_criteria,role,suggested_model,complexity,assigned_agent_id,status,created_at,updated_at) "
+                "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     f"sub-{run_id}-{node['node_id']}",
                     run_id,
@@ -129,6 +130,8 @@ def insert_subtasks(run_id: str, nodes: list[dict[str, Any]]) -> None:
                     node.get("acceptance_criteria") or "",
                     node.get("role") or "implementation",
                     node.get("suggested_model"),
+                    "complex" if node.get("complexity") == "complex" else "simple",
+                    node.get("assigned_agent_id") or None,
                     "pending",
                     now,
                     now,
