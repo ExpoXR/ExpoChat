@@ -39,7 +39,6 @@ let snapshotRetentionDays = 30;
 let runFileActivity = new Map();
 let clipboard = null; // { mode: "copy" | "cut", path }
 let agentsCache = null; // [{id,name,roles,enabled,...}] for the task-graph LLM pickers
-let graphLinkDrag = null; // in-flight drag-to-rewire state
 
 // ---------------------------------------------------------------------------
 // Core API helper
@@ -1323,8 +1322,8 @@ function renderSubtasks(run) {
 const TG_NODE_W = 170;
 const TG_NODE_H = 64;
 
-async function loadAgentsCache(force = false) {
-  if (agentsCache && !force) return agentsCache;
+async function loadAgentsCache() {
+  if (agentsCache) return agentsCache;
   try {
     const data = await api("/api/agents");
     agentsCache = data.agents || [];
@@ -1486,7 +1485,6 @@ function attachLinkDrag(handle, sourceId, run, model) {
     event.preventDefault();
     event.stopPropagation();
     const host = $("taskGraph");
-    graphLinkDrag = { source: sourceId };
     const ghost = document.createElement("div");
     ghost.className = "tg-drag-ghost";
     ghost.textContent = "link →";
@@ -1504,7 +1502,6 @@ function attachLinkDrag(handle, sourceId, run, model) {
       document.removeEventListener("pointerup", up);
       ghost.remove();
       clearDrop();
-      graphLinkDrag = null;
       const over = document.elementFromPoint(ev.clientX, ev.clientY)?.closest?.(".tg-node");
       if (over && over.dataset.node && over.dataset.node !== sourceId) {
         linkTasks(run, model, sourceId, over.dataset.node);
