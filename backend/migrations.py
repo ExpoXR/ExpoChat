@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from collections.abc import Callable
 
@@ -210,6 +211,82 @@ def _subtask_graph_ui(db: sqlite3.Connection) -> None:
     )
 
 
+def _offline_safe_graph(db: sqlite3.Connection) -> None:
+    _add_columns(
+        db,
+        "runs",
+        {
+            "graph_plan_hash": "text",
+            "plan_state": "text not null default 'none'",
+            "wait_reason": "text",
+            "next_retry_at": "text",
+            "resume_status": "text",
+        },
+    )
+    _add_columns(
+        db,
+        "subtasks",
+        {
+            "handoff_json": "text",
+            "blocked_reason": "text",
+            "input_manifest_json": "text",
+            "output_manifest_json": "text",
+            "delta_manifest_json": "text",
+        },
+    )
+    legacy_runs = list(
+        db.execute("select id,status,draft_plan,approved_plan from runs where plan_state='none'")
+    )
+    for run_id, status, draft_plan, approved_plan in legacy_runs:
+        plan = draft_plan or approved_plan
+        if not plan:
+            continue
+        has_graph = db.execute("select 1 from subtasks where run_id=? limit 1", (run_id,)).fetchone()
+        graph_hash = hashlib.sha256(str(plan).strip().encode()).hexdigest() if has_graph else None
+        state = "refined" if status in {
+            "plan_ready", "awaiting_approval", "implementing", "verifying", "applying",
+            "post_check", "completed", "failed", "rolled_back",
+        } else "none"
+        db.execute(
+            "update runs set plan_state=?,graph_plan_hash=coalesce(graph_plan_hash,?) where id=?",
+            (state, graph_hash, run_id),
+        )
+    current = db.execute("select sql from sqlite_master where type='table' and name='jobs'").fetchone()
+    if current and "'provisional'" not in (current[0] or ""):
+        db.execute(
+            "create table jobs_offline_new ("
+            " id integer primary key autoincrement, run_id text not null,"
+            " job_type text not null check(job_type in "
+            "('provisional','decompose','research','implementation','subtask','merge')),"
+            " node_id text, status text not null default 'pending', attempts integer not null default 0,"
+            " error text, created_at text not null, updated_at text not null,"
+            " started_at text, completed_at text, lease_owner text, lease_expires_at text,"
+            " cancel_requested_at text, next_attempt_at text, wait_reason text,"
+            " foreign key(run_id) references runs(id) on delete cascade)"
+        )
+        db.execute(
+            "insert into jobs_offline_new(id,run_id,job_type,node_id,status,attempts,error,created_at,updated_at,"
+            "started_at,completed_at,lease_owner,lease_expires_at,cancel_requested_at) "
+            "select id,run_id,job_type,node_id,status,attempts,error,created_at,updated_at,"
+            "started_at,completed_at,lease_owner,lease_expires_at,cancel_requested_at from jobs"
+        )
+        db.execute("drop table jobs")
+        db.execute("alter table jobs_offline_new rename to jobs")
+    else:
+        _add_columns(db, "jobs", {"next_attempt_at": "text", "wait_reason": "text"})
+    db.execute("create index if not exists idx_jobs_status_id on jobs(status,id)")
+    db.execute("create index if not exists idx_jobs_run_type_status on jobs(run_id,job_type,status)")
+    db.execute(
+        "create unique index if not exists idx_jobs_one_active_type on jobs(run_id,job_type) "
+        "where status in ('pending','running','waiting_ollama') "
+        "and job_type in ('provisional','decompose','research','implementation','merge')"
+    )
+    db.execute(
+        "create unique index if not exists idx_jobs_one_active_node on jobs(run_id,node_id) "
+        "where status in ('pending','running','waiting_ollama') and node_id is not null"
+    )
+
+
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _snapshot_metadata),
     (2, _durable_jobs),
@@ -224,6 +301,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (11, _subtask_acceptance),
     (12, _check_evidence),
     (13, _subtask_graph_ui),
+    (14, _offline_safe_graph),
 ]
 
 

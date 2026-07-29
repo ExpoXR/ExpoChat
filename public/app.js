@@ -39,6 +39,8 @@ let snapshotRetentionDays = 30;
 let runFileActivity = new Map();
 let clipboard = null; // { mode: "copy" | "cut", path }
 let agentsCache = null; // [{id,name,roles,enabled,...}] for the task-graph LLM pickers
+let ollamaOnline = null;
+let ollamaPollTimer = null;
 
 // ---------------------------------------------------------------------------
 // Core API helper
@@ -55,6 +57,29 @@ function hide(id) { $(id).classList.add("hidden"); }
 
 function setStatus(text) {
   $("status").textContent = text;
+}
+
+function renderOllamaStatus() {
+  if (ollamaOnline === false) {
+    $("ollamaStatus").textContent = "Offline";
+    return;
+  }
+  const value = $("modelSelect")?.value || $("chatModelSelect")?.value || "";
+  $("ollamaStatus").textContent = (value || (ollamaOnline ? "Online" : "connecting…")).replace(/^cloud:/, "");
+}
+
+async function refreshOllamaState() {
+  try {
+    const data = await api("/api/status");
+    ollamaOnline = Boolean(data.ollama_available);
+  } catch (_) {
+    ollamaOnline = false;
+  }
+  renderOllamaStatus();
+  const current = $("status").textContent;
+  if (/^Ready(?: · Ollama offline)?$/.test(current)) {
+    setStatus(ollamaOnline ? "Ready" : "Ready · Ollama offline");
+  }
 }
 
 function setBusy(ids, busy) {
@@ -440,7 +465,7 @@ function syncChatModel(value) {
   [$("modelSelect"), $("chatModelSelect")].filter(Boolean).forEach((select) => {
     if ([...select.options].some((option) => option.value === value)) select.value = value;
   });
-  $("ollamaStatus").textContent = (value || "no model").replace(/^cloud:/, "");
+  renderOllamaStatus();
   savePrefs();
 }
 
@@ -1237,20 +1262,23 @@ function renderCurrentRun(run) {
   show("currentRunBadge");
   show("runProgress");
   show("runActions");
-  $("planStatus").textContent = run.error ? `${runStatusLabel(run)} — ${run.error}` : runStatusLabel(run);
+  const runDetail = run.error || run.wait_reason || "";
+  $("planStatus").textContent = runDetail ? `${runStatusLabel(run)} — ${runDetail}` : runStatusLabel(run);
   const awaitingApproval = run.status === "awaiting_approval";
-  if (!awaitingApproval) planEditing = false;
+  const provisionalEditable = run.status === "waiting_for_ollama" && run.plan_state === "provisional";
+  const planEditable = awaitingApproval || provisionalEditable;
+  if (!planEditable) planEditing = false;
   const visiblePlan = awaitingApproval
     ? (run.draft_plan || run.approved_plan)
     : (run.approved_plan || run.draft_plan);
-  $("planActions").classList.toggle("hidden", !(visiblePlan && awaitingApproval));
+  $("planActions").classList.toggle("hidden", !(visiblePlan && planEditable));
   if (visiblePlan) {
     $("planProof").innerHTML = renderMarkdown(visiblePlan);
     if (!planEditing) $("planEditorContent").value = visiblePlan;
     $("approvePlanBtn").classList.toggle("hidden", !awaitingApproval);
-    $("editPlanBtn").classList.toggle("hidden", !awaitingApproval || planEditing);
-    $("savePlanBtn").classList.toggle("hidden", !awaitingApproval || !planEditing);
-    $("cancelPlanEditBtn").classList.toggle("hidden", !awaitingApproval || !planEditing);
+    $("editPlanBtn").classList.toggle("hidden", !planEditable || planEditing);
+    $("savePlanBtn").classList.toggle("hidden", !planEditable || !planEditing);
+    $("cancelPlanEditBtn").classList.toggle("hidden", !planEditable || !planEditing);
     $("redoPlanBtn").classList.toggle("hidden", !awaitingApproval);
     $("rejectPlanBtn").classList.toggle("hidden", !awaitingApproval);
     $("planProof").classList.toggle("hidden", planEditing);
@@ -1342,9 +1370,11 @@ function renderTaskGraph(run) {
   if (!subs.length) { section.classList.add("hidden"); return; }
   section.classList.remove("hidden");
   const editable = run.status === "awaiting_approval";
-  $("taskGraphHint").textContent = editable
-    ? " · assign an LLM per task · drag ▸ onto another task to order it"
-    : " · live";
+  $("taskGraphHint").textContent = run.status === "waiting_for_ollama"
+    ? " · Ollama offline · saved"
+    : editable
+      ? " · assign an LLM · drag ▸ to add dependency · click edge to remove"
+      : " · live";
   drawTaskGraph(run, subs, agentsCache || [], editable);
   if (!agentsCache) {
     loadAgentsCache().then(() => {
@@ -1365,7 +1395,7 @@ function drawTaskGraph(run, subs, agents, editable) {
   const statusById = new Map(model.map((node) => [node.node_id, node.status]));
   // A pending node whose deps are all done is the "next task" the brain just released.
   const isReady = (node) =>
-    node.status === "pending" && (node.deps || []).length > 0 &&
+    run.status === "implementing" && node.status === "pending" &&
     (node.deps || []).every((dep) => statusById.get(dep) === "done");
 
   host.style.width = `${layout.width}px`;
@@ -1374,9 +1404,24 @@ function drawTaskGraph(run, subs, agents, editable) {
 
   const svgNS = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(svgNS, "svg");
-  svg.setAttribute("class", "tg-edges");
+  svg.setAttribute("class", `tg-edges${editable ? " editable" : ""}`);
   svg.setAttribute("width", String(layout.width));
   svg.setAttribute("height", String(layout.height));
+  const defs = document.createElementNS(svgNS, "defs");
+  const marker = document.createElementNS(svgNS, "marker");
+  marker.setAttribute("id", "tg-arrow");
+  marker.setAttribute("viewBox", "0 0 10 10");
+  marker.setAttribute("refX", "9");
+  marker.setAttribute("refY", "5");
+  marker.setAttribute("markerWidth", "6");
+  marker.setAttribute("markerHeight", "6");
+  marker.setAttribute("orient", "auto-start-reverse");
+  const arrow = document.createElementNS(svgNS, "path");
+  arrow.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
+  arrow.setAttribute("fill", "context-stroke");
+  marker.appendChild(arrow);
+  defs.appendChild(marker);
+  svg.appendChild(defs);
   for (const edge of edges) {
     const a = pos.get(edge.from);
     const b = pos.get(edge.to);
@@ -1388,10 +1433,23 @@ function drawTaskGraph(run, subs, agents, editable) {
     const midX = (x1 + x2) / 2;
     const path = document.createElementNS(svgNS, "path");
     path.setAttribute("d", `M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`);
+    path.setAttribute("marker-end", "url(#tg-arrow)");
     let cls = "tg-edge";
     if (statusById.get(edge.from) === "done") cls += " done";
     if (isReady(pos.get(edge.to))) cls += " ready";
     path.setAttribute("class", cls);
+    if (editable) {
+      path.setAttribute("tabindex", "0");
+      path.setAttribute("aria-label", `Remove dependency ${edge.from} before ${edge.to}`);
+      const remove = () => removeTaskLink(run, model, edge.from, edge.to);
+      path.addEventListener("click", remove);
+      path.addEventListener("keydown", (event) => {
+        if (["Enter", " ", "Delete", "Backspace"].includes(event.key)) {
+          event.preventDefault();
+          remove();
+        }
+      });
+    }
     svg.appendChild(path);
   }
   host.appendChild(svg);
@@ -1402,6 +1460,7 @@ function drawTaskGraph(run, subs, agents, editable) {
     box.dataset.status = node.status;
     box.dataset.complexity = node.complexity;
     box.dataset.node = node.node_id;
+    box.title = node.blocked_reason || node.handoff?.summary || node.title;
     if (isReady(node)) box.dataset.ready = "1";
     box.style.left = `${node.x}px`;
     box.style.top = `${node.y}px`;
@@ -1468,13 +1527,22 @@ function linkTasks(run, model, sourceId, targetId) {
   if (!target) return;
   const deps = new Set(target.deps || []);
   if (deps.has(sourceId)) {
-    deps.delete(sourceId);
-  } else if (wouldCycle(model, sourceId, targetId)) {
+    showToast("Tasks are already linked", "info");
+    return;
+  }
+  if (wouldCycle(model, sourceId, targetId)) {
     showToast("That link would create a cycle", "error");
     return;
-  } else {
-    deps.add(sourceId);
   }
+  deps.add(sourceId);
+  saveGraphEdit(run.id, { node_id: targetId, depends_on: [...deps] });
+}
+
+function removeTaskLink(run, model, sourceId, targetId) {
+  const target = model.find((node) => node.node_id === targetId);
+  if (!target) return;
+  const deps = new Set(target.deps || []);
+  if (!deps.delete(sourceId)) return;
   saveGraphEdit(run.id, { node_id: targetId, depends_on: [...deps] });
 }
 
@@ -1489,6 +1557,7 @@ function attachLinkDrag(handle, sourceId, run, model) {
     ghost.className = "tg-drag-ghost";
     ghost.textContent = "link →";
     document.body.appendChild(ghost);
+    handle.setPointerCapture?.(event.pointerId);
     const clearDrop = () => host.querySelectorAll(".tg-node.tg-drop").forEach((el) => el.classList.remove("tg-drop"));
     const move = (ev) => {
       ghost.style.left = `${ev.clientX + 8}px`;
@@ -1497,18 +1566,31 @@ function attachLinkDrag(handle, sourceId, run, model) {
       const over = document.elementFromPoint(ev.clientX, ev.clientY)?.closest?.(".tg-node");
       if (over && over.dataset.node !== sourceId) over.classList.add("tg-drop");
     };
-    const up = (ev) => {
+    const cleanup = () => {
       document.removeEventListener("pointermove", move);
       document.removeEventListener("pointerup", up);
+      document.removeEventListener("pointercancel", cancel);
+      document.removeEventListener("keydown", keydown);
+      window.removeEventListener("blur", cancel);
       ghost.remove();
       clearDrop();
+    };
+    const up = (ev) => {
+      cleanup();
       const over = document.elementFromPoint(ev.clientX, ev.clientY)?.closest?.(".tg-node");
       if (over && over.dataset.node && over.dataset.node !== sourceId) {
         linkTasks(run, model, sourceId, over.dataset.node);
       }
     };
+    const cancel = () => cleanup();
+    const keydown = (ev) => {
+      if (ev.key === "Escape") cleanup();
+    };
     document.addEventListener("pointermove", move);
     document.addEventListener("pointerup", up);
+    document.addEventListener("pointercancel", cancel);
+    document.addEventListener("keydown", keydown);
+    window.addEventListener("blur", cancel);
   });
 }
 
@@ -1601,7 +1683,7 @@ function subscribeRun(id) {
   if (runEventSource) runEventSource.close();
   runEventSource = new EventSource(`/api/runs/${id}/events`);
   runEventSource.onmessage = () => loadRun(id).catch(() => {});
-  ["run.created", "research.started", "research.completed", "plan.ready", "plan.edited", "plan.redo", "plan.approved", "plan.decomposed", "scope.approved", "scope.approval_required", "implementation.started", "agent.activity", "subtask.started", "subtask.completed", "subtask.verified", "subtask.retry", "subtask.failed", "subtasks.merged", "subtasks.conflict", "verification.completed", "apply.completed", "rollback.completed", "run.completed", "run.failed", "run.cancelled", "plan.stale"].forEach((name) => {
+  ["run.created", "ollama.waiting", "ollama.reconnected", "plan.provisional", "plan.refining", "research.started", "research.completed", "plan.ready", "plan.edited", "plan.graph_ready", "plan.redo", "plan.approved", "plan.decomposed", "plan.graph_edited", "scope.approved", "scope.approval_required", "implementation.started", "agent.activity", "subtask.started", "subtask.completed", "subtask.verified", "subtask.retry", "subtask.failed", "subtask.blocked", "subtasks.merged", "subtasks.conflict", "check.completed", "gate.evaluated", "verification.completed", "apply.completed", "rollback.completed", "run.completed", "run.failed", "run.cancelled", "plan.stale"].forEach((name) => {
     runEventSource.addEventListener(name, () => {
       loadRun(id).then((run) => {
         loadRuns().catch(() => {});
@@ -1805,6 +1887,7 @@ async function saveSettings(values, message) {
 async function loadAgents() {
   const data = await api("/api/agents");
   const agents = data.agents || [];
+  agentsCache = agents;
   $("agentList").innerHTML = "";
   agents.forEach((agent) => {
     const row = document.createElement("div");
@@ -1909,7 +1992,8 @@ async function boot() {
   }
   csrfToken = me.csrf || "";
   hide("login");
-  show("app");
+  hide("app");
+  clearInterval(ollamaPollTimer);
   setStatus("Loading…");
 
   // Config — know which AI providers are available
@@ -1950,10 +2034,12 @@ async function boot() {
     setWorkspaceTag(prefs.target);
   }
 
+  await refreshOllamaState();
   try {
-    await loadModels();
+    if (ollamaOnline) await loadModels();
   } catch (err) {
-    $("ollamaStatus").textContent = "offline";
+    ollamaOnline = false;
+    renderOllamaStatus();
     showToast("Ollama models unavailable: " + err.message, "error");
   }
   await loadChats();
@@ -1969,7 +2055,9 @@ async function boot() {
     try { await openFile(prefs.file); } catch (_) {}
   }
 
-  setStatus("Ready");
+  setStatus(ollamaOnline ? "Ready" : "Ready · Ollama offline");
+  show("app");
+  ollamaPollTimer = setInterval(refreshOllamaState, 15_000);
 }
 
 // ---------------------------------------------------------------------------

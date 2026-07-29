@@ -142,13 +142,23 @@ def build_verification_prompt(plan: str, implementation_summary: str) -> str:
     )
 
 
-def build_subtask_verify_prompt(title: str, criteria: str, summary: str) -> str:
-    """Build a lightweight per-subtask verification prompt."""
+def build_subtask_verify_prompt(
+    title: str,
+    criteria: str,
+    summary: str,
+    changed_files: list[str] | None = None,
+    checks: list[dict[str, Any]] | None = None,
+) -> str:
+    """Build per-subtask acceptance verdict and downstream handoff prompt."""
     return (
         "You are supervisor brain. A subtask just completed. Check whether the implementation satisfies "
-        "the acceptance criteria. Return JSON ONLY: "
-        '{"passed":boolean,"issues":"string describing any issues or empty"}.\n\n'
-        f"SUBTASK: {title}\n\nACCEPTANCE CRITERIA:\n{criteria}\n\nIMPLEMENTATION SUMMARY:\n{summary}"
+        "the acceptance criteria and create a concise handoff for dependent agents. Return JSON ONLY: "
+        '{"passed":boolean,"issues":"string","handoff":{"summary":"string","interfaces":["string"],'
+        '"files":["string"],"risks":["string"],"next_steps":["string"]}}.\n\n'
+        f"SUBTASK: {title}\n\nACCEPTANCE CRITERIA:\n{criteria or 'Completion summary must be internally consistent.'}"
+        f"\n\nCHANGED FILES:\n{json.dumps(changed_files or [], ensure_ascii=False)}"
+        f"\n\nCHECKS:\n{json.dumps(checks or [], ensure_ascii=False)}"
+        f"\n\nIMPLEMENTATION SUMMARY:\n{summary}"
     )
 
 
@@ -156,13 +166,44 @@ def build_subtask_verify_prompt(title: str, criteria: str, summary: str) -> str:
 class SubtaskVerdict:
     passed: bool
     issues: str
+    handoff: dict[str, Any] | None = None
 
 
-def parse_subtask_verdict(text: str) -> SubtaskVerdict:
+def parse_subtask_verdict(text: str | dict[str, Any]) -> SubtaskVerdict:
     """Parse a per-subtask verification response."""
+    if isinstance(text, dict):
+        text = str(text.get("content") or "")
     try:
         value = extract_json(text)
-        return SubtaskVerdict(passed=bool(value.get("passed")), issues=str(value.get("issues") or ""))
-    except (ValueError, AttributeError):
+        handoff = value.get("handoff") if isinstance(value.get("handoff"), dict) else {}
+        return SubtaskVerdict(
+            passed=bool(value.get("passed")),
+            issues=str(value.get("issues") or ""),
+            handoff={
+                "summary": str(handoff.get("summary") or "")[:4000],
+                "interfaces": [str(v)[:500] for v in handoff.get("interfaces", [])[:40]] if isinstance(handoff.get("interfaces"), list) else [],
+                "files": [str(v)[:1000] for v in handoff.get("files", [])[:100]] if isinstance(handoff.get("files"), list) else [],
+                "risks": [str(v)[:1000] for v in handoff.get("risks", [])[:40]] if isinstance(handoff.get("risks"), list) else [],
+                "next_steps": [str(v)[:1000] for v in handoff.get("next_steps", [])[:40]] if isinstance(handoff.get("next_steps"), list) else [],
+            },
+        )
+    except (TypeError, ValueError, AttributeError):
         passed = '"passed":true' in text.replace(" ", "").lower()
-        return SubtaskVerdict(passed=passed, issues="" if passed else text[:500])
+        return SubtaskVerdict(passed=passed, issues="" if passed else text[:500], handoff={})
+
+
+def build_provisional_plan_prompt(task: str, workspace_inventory: str) -> str:
+    return (
+        "Ollama workers are temporarily offline. Create a provisional implementation plan from the "
+        "request and bounded workspace inventory. Mark uncertain assumptions. The plan will be refined "
+        "after an Ollama research agent becomes available. Return decision-complete Markdown only.\n\n"
+        f"USER TASK:\n{task}\n\nWORKSPACE INVENTORY:\n{workspace_inventory}"
+    )
+
+
+def build_refine_plan_prompt(task: str, provisional_plan: str, dossier: str) -> str:
+    return (
+        "Refine the saved provisional plan using completed Ollama workspace research. Resolve assumptions, "
+        "correct file and interface details, and return one decision-complete Markdown plan. No commentary.\n\n"
+        f"USER TASK:\n{task}\n\nPROVISIONAL PLAN:\n{provisional_plan}\n\nOLLAMA RESEARCH:\n{dossier}"
+    )

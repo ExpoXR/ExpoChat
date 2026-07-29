@@ -165,7 +165,7 @@ def add_subtask_result(subtask_id: str, run_id: str, kind: str, content: str) ->
 
 def add_brain_memory(run_id: str, step: str, role: str, content: str) -> int:
     """Append a brain memory entry. seq auto-increments per run. Never pruned."""
-    with closing(connect()) as db:
+    with transaction() as db:
         seq = int(
             (db.execute("select coalesce(max(seq),0)+1 as s from brain_memory where run_id=?", (run_id,)).fetchone() or {"s": 1})["s"]
         )
@@ -174,7 +174,6 @@ def add_brain_memory(run_id: str, step: str, role: str, content: str) -> int:
             "insert into brain_memory(run_id,seq,step,role,content,tokens_estimate,created_at) values(?,?,?,?,?,?,?)",
             (run_id, seq, step, role, content, tokens_estimate, utcnow()),
         )
-        db.commit()
         return int(cursor.lastrowid)
 
 

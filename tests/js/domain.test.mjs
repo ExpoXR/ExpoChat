@@ -89,6 +89,14 @@ test("run choreography reflects brain, worker, verifier progress", () => {
 
   const rolledBack = runChoreography({ status: "rolled_back" }, [{ event_type: "plan.ready" }]);
   assert.equal(rolledBack[2].state, "error");
+
+  const offlinePlan = runChoreography(
+    { status: "waiting_for_ollama", plan_state: "provisional", resume_status: "researching" },
+    [{ event_type: "plan.provisional" }],
+  );
+  assert.equal(offlinePlan[0].state, "working");
+  assert.equal(offlinePlan[0].label, "saved · Ollama offline");
+  assert.equal(offlinePlan[1].state, "idle");
 });
 
 test("token counters split Brain and Ollama usage", () => {

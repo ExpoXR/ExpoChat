@@ -13,6 +13,7 @@ Graph shape (what the brain is asked to emit):
 """
 from __future__ import annotations
 
+import fnmatch
 import re
 from typing import Any
 
@@ -43,7 +44,16 @@ def parse_task_graph(text: str) -> dict[str, Any]:
 def _as_str_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
-    return [str(item) for item in value if isinstance(item, (str, int, float)) and str(item).strip()]
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, (str, int, float)):
+            continue
+        text = str(item).strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
 
 
 def validate_graph(graph: dict[str, Any]) -> list[dict[str, Any]]:
@@ -92,6 +102,9 @@ def validate_graph(graph: dict[str, Any]) -> list[dict[str, Any]]:
             "suggested_model": suggested_model,
             "complexity": complexity,
         }
+        for pattern in nodes[node_id]["file_globs"]:
+            if pattern.startswith(("/", "\\")) or ".." in pattern.replace("\\", "/").split("/"):
+                raise GraphError(f"Unsafe file scope for subtask {node_id}: {pattern!r}")
         order.append(node_id)
 
     for node_id, node in nodes.items():
@@ -134,9 +147,44 @@ def independent_pairs_sharing_globs(nodes: list[dict[str, Any]]) -> list[tuple[s
             a, b = left["node_id"], right["node_id"]
             if b in reachable[a] or a in reachable[b]:
                 continue  # one depends (transitively) on the other → serialized
-            if set(left["file_globs"]) & set(right["file_globs"]):
+            if any(
+                _globs_overlap(left_glob, right_glob)
+                for left_glob in left["file_globs"]
+                for right_glob in right["file_globs"]
+            ):
                 conflicts.append((a, b))
     return conflicts
+
+
+def _globs_overlap(left: str, right: str) -> bool:
+    """Conservatively detect whether two file scopes can select the same path."""
+    left = left.replace("\\", "/").removeprefix("./")
+    right = right.replace("\\", "/").removeprefix("./")
+    if left == right:
+        return True
+    left_wild = any(char in left for char in "*?[")
+    right_wild = any(char in right for char in "*?[")
+    if not left_wild:
+        return fnmatch.fnmatchcase(left, right) if right_wild else False
+    if not right_wild:
+        return fnmatch.fnmatchcase(right, left)
+
+    def literal_edges(pattern: str) -> tuple[str, str]:
+        first = min((pattern.find(char) for char in "*?[" if char in pattern), default=len(pattern))
+        last = max(pattern.rfind("*"), pattern.rfind("?"), pattern.rfind("]"))
+        return pattern[:first], pattern[last + 1 :]
+
+    left_prefix, left_suffix = literal_edges(left)
+    right_prefix, right_suffix = literal_edges(right)
+    if left_prefix and right_prefix and not (
+        left_prefix.startswith(right_prefix) or right_prefix.startswith(left_prefix)
+    ):
+        return False
+    if left_suffix and right_suffix and not (
+        left_suffix.endswith(right_suffix) or right_suffix.endswith(left_suffix)
+    ):
+        return False
+    return True
 
 
 def _reachability(nodes: list[dict[str, Any]]) -> dict[str, set[str]]:

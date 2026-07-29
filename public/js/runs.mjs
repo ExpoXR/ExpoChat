@@ -88,19 +88,29 @@ export function runChoreography(run = {}, events = []) {
 
   // Subtask progress label
   const subs = run.subtasks || [];
+  const waiting = status === "waiting_for_ollama";
+  const brainWaiting = waiting && (run.plan_state === "provisional" || run.resume_status === "researching");
+  const workerWaiting = waiting && (subs.length > 0 || run.resume_status === "implementing");
+  const verifierWaiting = waiting && ["verifying", "post_check"].includes(run.resume_status);
   let workerLabel = "implementing…";
-  if (subs.length > 0 && status === "implementing") {
+  if (subs.length > 0 && ["implementing", "waiting_for_ollama"].includes(status)) {
     const done = subs.filter((s) => s.status === "done").length;
-    workerLabel = `subtasks ${done}/${subs.length}`;
+    workerLabel = status === "waiting_for_ollama" ? `saved ${done}/${subs.length} · offline` : `subtasks ${done}/${subs.length}`;
   }
 
   return [
     { role: "brain", title: `Brain · ${run.brain_provider || "supervisor"}`,
-      ...step(status === "researching", brainDone, bad && !brainDone, "planning…", "planned") },
+      ...step(
+        ["planning_provisional", "researching", "decomposing"].includes(status) || brainWaiting,
+        brainDone, bad && !brainDone, brainWaiting ? "saved · Ollama offline" : "planning…", "planned",
+      ) },
     { role: "worker", title: `Worker · ${worker.name || "Ollama"}`,
-      ...step(status === "implementing", implDone, false, workerLabel, "implemented") },
+      ...step(status === "implementing" || workerWaiting, implDone, false, workerLabel, "implemented") },
     { role: "verifier", title: "Verifier",
-      ...step(["verifying", "post_check"].includes(status), verifyDone, status === "rolled_back", "verifying…", "passed") },
+      ...step(
+        ["verifying", "post_check"].includes(status) || verifierWaiting,
+        verifyDone, status === "rolled_back", verifierWaiting ? "saved · Ollama offline" : "verifying…", "passed",
+      ) },
   ];
 }
 

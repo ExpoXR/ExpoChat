@@ -31,7 +31,7 @@ os.environ.update(
     }
 )
 
-from backend import db  # noqa: E402
+from backend import db, plan_graph  # noqa: E402
 from backend.main import app as ollma_app  # noqa: E402
 
 app = FastAPI()
@@ -72,6 +72,30 @@ def fake_brain():
 
 
 db.init_db()
+now = db.utcnow()
+db.execute(
+    "insert into runs(id,task,brain_provider,target_path,status,draft_plan,plan_state,graph_plan_hash,"
+    "created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+    (
+        "e2e-graph-run", "Graph fixture", "codex", str(workspace), "awaiting_approval",
+        "Fixture plan", "refined", "fixture-hash", now, now,
+    ),
+)
+db.insert_subtasks("e2e-graph-run", plan_graph.validate_graph({"subtasks": [
+    {"node_id": "inventory", "title": "Inventory", "spec": "Inventory", "role": "research"},
+    {
+        "node_id": "backend", "title": "Backend", "spec": "Backend", "depends_on": ["inventory"],
+        "file_globs": ["backend/**"], "complexity": "complex",
+    },
+    {
+        "node_id": "frontend", "title": "Frontend", "spec": "Frontend", "depends_on": ["inventory"],
+        "file_globs": ["public/**"],
+    },
+    {
+        "node_id": "verify", "title": "Verify", "spec": "Verify",
+        "depends_on": ["backend", "frontend"], "role": "verification",
+    },
+]}))
 app.mount("/", ollma_app)
 
 

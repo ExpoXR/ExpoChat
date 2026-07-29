@@ -17,6 +17,9 @@ export function buildGraphModel(subtasks = [], agents = []) {
       complexity: node.complexity === "complex" ? "complex" : "simple",
       deps: Array.isArray(node.depends_on) ? node.depends_on.slice() : [],
       assigned_agent_id: node.assigned_agent_id || "",
+      blocked_reason: node.blocked_reason || "",
+      handoff: node.handoff && typeof node.handoff === "object" ? node.handoff : {},
+      changed_files: Array.isArray(node.changed_files) ? node.changed_files.slice() : [],
       // Prefer the user-pinned agent name; fall back to the scheduler-chosen one.
       agent_name: (assigned && assigned.name) || node.agent_name || "",
     };
@@ -113,6 +116,7 @@ export function assignableAgents(agents = [], role = "implementation") {
   return (agents || []).filter((agent) => {
     if (!agent || !agent.enabled) return false;
     const roles = Array.isArray(agent.roles) ? agent.roles : [];
-    return roles.includes(role);
+    const capabilities = Array.isArray(agent.capabilities) ? agent.capabilities : [];
+    return roles.includes(role) && (role !== "implementation" || capabilities.includes("tools"));
   });
 }

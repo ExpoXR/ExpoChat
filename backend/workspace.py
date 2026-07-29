@@ -274,6 +274,101 @@ def stage_subtask(run_id: str, node_id: str, base_stage: Path) -> Path:
     return dest
 
 
+def workspace_delta(
+    before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]],
+) -> dict[str, list[str]]:
+    return {
+        "changed": sorted(path for path, value in after.items() if before.get(path) != value),
+        "deleted": sorted(set(before) - set(after)),
+    }
+
+
+def apply_worktree_delta(
+    target: Path,
+    worktree: Path,
+    input_manifest: dict[str, dict[str, Any]],
+    *,
+    node_id: str,
+) -> dict[str, list[str]]:
+    """Replay one node's delta, allowing dependency-ordered edits and rejecting parallel conflicts."""
+    output_manifest = workspace_manifest(worktree)
+    current_manifest = workspace_manifest(target)
+    delta = workspace_delta(input_manifest, output_manifest)
+    conflicts: list[dict[str, Any]] = []
+    for rel in delta["changed"]:
+        expected = input_manifest.get(rel)
+        current = current_manifest.get(rel)
+        output = output_manifest[rel]
+        if current != expected and current != output:
+            conflicts.append({"path": rel, "nodes": ["integrated", node_id]})
+    for rel in delta["deleted"]:
+        expected = input_manifest.get(rel)
+        current = current_manifest.get(rel)
+        if current is not None and current != expected:
+            conflicts.append({"path": rel, "nodes": ["integrated", node_id]})
+    if conflicts:
+        raise MergeConflict(conflicts)
+    for rel in delta["changed"]:
+        src = worktree / rel
+        dst = target / rel
+        resolved = dst.resolve(strict=False)
+        if target.resolve() not in resolved.parents and resolved != target.resolve():
+            raise RuntimeError("Unsafe task delta path")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        temp = dst.with_name(f".{dst.name}.ollma-tmp")
+        shutil.copy2(src, temp)
+        os.replace(temp, dst)
+    for rel in delta["deleted"]:
+        item = target / rel
+        if item.is_file() or item.is_symlink():
+            item.unlink(missing_ok=True)
+    return delta
+
+
+def stage_subtask_with_ancestors(
+    run_id: str,
+    node_id: str,
+    base_stage: Path,
+    ancestors: list[dict[str, Any]],
+) -> tuple[Path, dict[str, dict[str, Any]]]:
+    """Create immutable input plus mutable workspace containing all ancestor outputs."""
+    node_root = settings.jobs_dir / run_id / "subtasks" / node_id
+    input_dir = node_root / "input"
+    worktree = node_root / "workspace"
+    for path in (input_dir, worktree):
+        if path.exists():
+            shutil.rmtree(path)
+    node_root.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(base_stage, input_dir, symlinks=False, ignore=_copy_ignore)
+    for ancestor in ancestors:
+        ancestor_tree = settings.jobs_dir / run_id / "subtasks" / ancestor["node_id"] / "workspace"
+        raw_manifest = ancestor.get("input_manifest_json")
+        manifest = json.loads(raw_manifest or "{}")
+        if not ancestor_tree.exists() or raw_manifest is None:
+            raise RuntimeError(f"Missing durable output for dependency {ancestor['node_id']}")
+        apply_worktree_delta(input_dir, ancestor_tree, manifest, node_id=ancestor["node_id"])
+    input_manifest = workspace_manifest(input_dir)
+    shutil.copytree(input_dir, worktree, symlinks=False, ignore=_copy_ignore)
+    return worktree, input_manifest
+
+
+def merge_task_lineage(base_stage: Path, run_id: str, nodes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Replay node deltas topologically into the staged workspace."""
+    changed: set[str] = set()
+    deleted: set[str] = set()
+    for node in nodes:
+        worktree = settings.jobs_dir / run_id / "subtasks" / node["node_id"] / "workspace"
+        raw_manifest = node.get("input_manifest_json")
+        manifest = json.loads(raw_manifest or "{}")
+        if not worktree.exists() or raw_manifest is None:
+            raise RuntimeError(f"Missing durable output for subtask {node['node_id']}")
+        delta = apply_worktree_delta(base_stage, worktree, manifest, node_id=node["node_id"])
+        changed.update(delta["changed"])
+        deleted.update(delta["deleted"])
+        deleted.difference_update(delta["changed"])
+    return {"changed": sorted(changed), "deleted": sorted(deleted), "subtasks": len(nodes)}
+
+
 def merge_worktrees(base_stage: Path, worktrees: list[tuple[str, Path]]) -> dict[str, Any]:
     """Integrate per-subtask worktrees onto the run's base stage in dependency order.
 

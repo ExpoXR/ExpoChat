@@ -16,7 +16,7 @@ WORKSPACES = TEST_ROOT / "workspaces"
 from fastapi import HTTPException  # noqa: E402
 
 from backend import brain_io, brain_runner, db, orchestrator, plan_graph, worker, workspace  # noqa: E402
-from backend.main import pinned_context  # noqa: E402
+from backend.main import pinned_context, readyz  # noqa: E402
 from backend.migrations import MIGRATIONS  # noqa: E402
 from backend.prompts import CAVEMAN_OUTPUT_INSTRUCTIONS  # noqa: E402
 from backend.run_state import validate_transition  # noqa: E402
@@ -69,6 +69,76 @@ def test_migrations_are_idempotent():
     db.init_db()
     versions = db.all_rows("select version from schema_migrations order by version")
     assert [row["version"] for row in versions] == [version for version, _ in MIGRATIONS]
+
+
+def test_migration_14_adds_offline_and_lineage_state():
+    with db.connect() as conn:
+        run_cols = {row[1] for row in conn.execute("pragma table_info(runs)")}
+        task_cols = {row[1] for row in conn.execute("pragma table_info(subtasks)")}
+        job_cols = {row[1] for row in conn.execute("pragma table_info(jobs)")}
+        assert {"graph_plan_hash", "plan_state", "wait_reason", "next_retry_at", "resume_status"} <= run_cols
+        assert {
+            "handoff_json", "blocked_reason", "input_manifest_json", "output_manifest_json",
+            "delta_manifest_json",
+        } <= task_cols
+        assert {"wait_reason", "next_attempt_at"} <= job_cols
+
+
+def test_migration_14_backfills_existing_graph_hash_and_refined_state():
+    clear_workflow_tables()
+    now = db.utcnow()
+    run_id = "migration-backfill"
+    plan = "Existing approved graph plan"
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,draft_plan,plan_state,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?,?)",
+        (run_id, "Existing", "codex", "/tmp", "awaiting_approval", plan, "none", now, now),
+    )
+    db.insert_subtasks(run_id, plan_graph.validate_graph({"subtasks": [
+        {"node_id": "existing", "spec": "Existing node"},
+    ]}))
+    with db.connect() as conn:
+        MIGRATIONS[-1][1](conn)
+    run = db.one("select plan_state,graph_plan_hash from runs where id=?", (run_id,))
+    assert run["plan_state"] == "refined"
+    assert run["graph_plan_hash"] == orchestrator._plan_hash(plan)
+
+
+def test_readyz_is_degraded_but_ready_when_only_ollama_is_offline(monkeypatch):
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get(self, url):
+            if url.startswith(orchestrator.settings.ollama_url):
+                raise RuntimeError("workstation offline")
+            return FakeResponse({"ok": True})
+
+    from backend import main
+
+    monkeypatch.setattr(main.httpx, "Client", FakeClient)
+    response = readyz()
+    payload = json.loads(response.body)
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["degraded"] is True
+    assert payload["checks"]["ollama"] is False
 
 
 def test_credential_round_trip():
@@ -535,20 +605,167 @@ def test_router_prefers_role_score_before_global_priority(monkeypatch):
     assert orchestrator.choose_agent("research")["id"] == "specialist"
 
 
-def test_run_preflight_rejects_missing_agents_before_staging(monkeypatch):
+def test_offline_run_queues_provisional_plan_without_agents(monkeypatch):
     clear_workflow_tables()
     target = WORKSPACES / "preflight-target"
     target.mkdir(exist_ok=True)
     (target / "app.py").write_text("print('safe')\n")
     monkeypatch.setattr(orchestrator, "provider_config", lambda _: ("key", "model"))
+    monkeypatch.setattr(orchestrator, "ollama_available", lambda *a, **k: False)
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+    run = orchestrator.create_run("Offline plan", "codex", target, False)
+    assert run["status"] == "planning_provisional"
+    assert db.one("select job_type from jobs where run_id=?", (run["id"],))["job_type"] == "provisional"
+    assert (orchestrator.settings.jobs_dir / run["id"] / "workspace").is_dir()
+
+
+def test_provisional_plan_is_saved_until_ollama_recovers(monkeypatch):
+    clear_workflow_tables()
+    target = WORKSPACES / "provisional-target"
+    target.mkdir(exist_ok=True)
+    (target / "app.py").write_text("print('offline')\n")
+    run_id = "offline-plan-run"
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,plan_state,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?)",
+        (run_id, "Plan offline work", "codex", str(target), "planning_provisional", "none", now, now),
+    )
     monkeypatch.setattr(
         orchestrator,
-        "choose_agent",
-        lambda *_: (_ for _ in ()).throw(RuntimeError("No enabled research agent available")),
+        "call_brain_with_memory",
+        lambda *a, **k: {"content": "# Saved provisional plan", "usage": {}},
     )
-    with pytest.raises(RuntimeError, match="No enabled research agent"):
-        orchestrator.create_run("Preflight failure", "codex", target, False)
-    assert not db.one("select id from runs where task='Preflight failure'")
+    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
+    orchestrator.provisional_plan_run(run_id)
+    run = db.one("select * from runs where id=?", (run_id,))
+    assert run["status"] == "waiting_for_ollama"
+    assert run["plan_state"] == "provisional"
+    assert run["draft_plan"] == "# Saved provisional plan"
+    assert db.one("select kind from plan_versions where run_id=?", (run_id,))["kind"] == "provisional"
+    assert db.one("select status from jobs where run_id=? and job_type='research'", (run_id,))["status"] == "waiting_ollama"
+
+
+def test_ollama_recovery_resumes_waiting_job_once(monkeypatch):
+    clear_workflow_tables()
+    run_id = "offline-recovery"
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,resume_status,plan_state,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?,?)",
+        (run_id, "Resume", "codex", "/tmp", "waiting_for_ollama", "researching", "provisional", now, now),
+    )
+    db.execute(
+        "insert into jobs(run_id,job_type,status,attempts,created_at,updated_at) "
+        "values(?,'research','waiting_ollama',0,?,?)",
+        (run_id, now, now),
+    )
+    monkeypatch.setattr(orchestrator, "ollama_available", lambda *a, **k: True)
+    monkeypatch.setattr(orchestrator, "discover_agents", lambda: [])
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+    assert orchestrator.recover_waiting_ollama() == 1
+    assert db.one("select status from runs where id=?", (run_id,))["status"] == "researching"
+    assert db.one("select status from jobs where run_id=?", (run_id,))["status"] == "pending"
+    assert orchestrator.recover_waiting_ollama() == 0
+    events = db.all_rows("select * from run_events where run_id=? and event_type='ollama.reconnected'", (run_id,))
+    assert len(events) == 1
+
+
+def test_restart_preserves_waiting_ollama_state():
+    clear_workflow_tables()
+    run_id = "offline-restart"
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,resume_status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?)",
+        (run_id, "Resume after restart", "codex", "/tmp", "waiting_for_ollama", "researching", now, now),
+    )
+    db.execute(
+        "insert into jobs(run_id,job_type,status,created_at,updated_at) "
+        "values(?,'research','waiting_ollama',?,?)",
+        (run_id, now, now),
+    )
+
+    db.init_db()
+
+    assert db.one("select status from runs where id=?", (run_id,))["status"] == "waiting_for_ollama"
+    assert db.one("select status from jobs where run_id=?", (run_id,))["status"] == "waiting_ollama"
+
+
+def test_research_after_offline_wait_refreshes_workspace_baseline(monkeypatch):
+    clear_workflow_tables()
+    target = WORKSPACES / ("offline-refresh-" + secrets.token_hex(4))
+    target.mkdir()
+    source = target / "app.py"
+    source.write_text("old\n")
+    run_id = "offline-refresh"
+    stage_workspace(run_id, target)
+    old_hash = manifest_hash(target)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,baseline_hash,draft_plan,plan_state,"
+        "created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+        (
+            run_id, "Refresh", "codex", str(target), "researching", old_hash,
+            "Provisional", "provisional", now, now,
+        ),
+    )
+    seed_agent("refresh-research", "research-model", ["research"], [])
+    seed_agent("refresh-impl", "impl-model", ["implementation"], ["tools"])
+    source.write_text("new while waiting\n")
+    monkeypatch.setattr(orchestrator, "ollama_available", lambda *a, **k: True)
+    monkeypatch.setattr(
+        orchestrator,
+        "worker_call",
+        lambda *a, **k: {"ok": True, "content": "fresh dossier", "events": [], "usage": {}},
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "call_brain_with_memory",
+        lambda *a, **k: {"content": "Refined plan", "usage": {}},
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "decompose_plan",
+        lambda *a, **k: [{"node_id": "apply"}],
+    )
+
+    orchestrator.research_run(run_id)
+
+    run = db.one("select * from runs where id=?", (run_id,))
+    assert run["status"] == "awaiting_approval"
+    assert run["plan_state"] == "refined"
+    assert run["baseline_hash"] == manifest_hash(target)
+    assert run["baseline_hash"] != old_hash
+    assert (orchestrator.settings.jobs_dir / run_id / "workspace" / "app.py").read_text() == "new while waiting\n"
+
+
+def test_ollama_pause_preserves_subtask_attempt(monkeypatch):
+    clear_workflow_tables()
+    run_id = "offline-subtask"
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "Pause", "codex", "/tmp", "implementing", now, now),
+    )
+    db.insert_subtasks(run_id, plan_graph.validate_graph({"subtasks": [
+        {"node_id": "step", "spec": "Do work", "file_globs": ["app.py"]},
+    ]}))
+    db.update_subtask(f"sub-{run_id}-step", status="running", attempts=1)
+    db.execute(
+        "insert into jobs(run_id,job_type,node_id,status,attempts,created_at,updated_at) "
+        "values(?,'subtask','step','running',1,?,?)",
+        (run_id, now, now),
+    )
+    job = db.one("select * from jobs where run_id=?", (run_id,))
+    orchestrator._pause_job_for_ollama(job, "Ollama offline")
+    assert db.one("select status from runs where id=?", (run_id,))["status"] == "waiting_for_ollama"
+    subtask = db.subtasks(run_id)[0]
+    assert subtask["status"] == "waiting_ollama"
+    assert subtask["attempts"] == 0
+    paused_job = db.one("select * from jobs where run_id=?", (run_id,))
+    assert paused_job["status"] == "waiting_ollama"
+    assert paused_job["attempts"] == 0
 
 
 def test_active_job_uniqueness():
@@ -655,14 +872,16 @@ def test_validate_graph_rejects_cycles_and_bad_refs():
 
 def test_independent_pairs_sharing_globs_flags_parallel_overlap():
     nodes = plan_graph.validate_graph({"subtasks": [
-        {"node_id": "a", "spec": "x", "file_globs": ["src/shared.py"]},
+        {"node_id": "a", "spec": "x", "file_globs": ["src/**"]},
         {"node_id": "b", "spec": "y", "file_globs": ["src/shared.py"]},
-        {"node_id": "c", "spec": "z", "depends_on": ["a"], "file_globs": ["src/shared.py"]},
+        {"node_id": "c", "spec": "z", "depends_on": ["a"], "file_globs": ["src/*.py"]},
+        {"node_id": "d", "spec": "other", "file_globs": ["tests/**"]},
     ]})
     conflicts = plan_graph.independent_pairs_sharing_globs(nodes)
     # a and b are independent and share a glob → conflict; c depends on a so a-c is serialized.
     assert ("a", "b") in conflicts
     assert ("a", "c") not in conflicts
+    assert ("a", "d") not in conflicts
 
 
 def test_insert_subtasks_persists_and_replaces_graph():
@@ -707,9 +926,10 @@ def test_choose_subtask_agent_honors_user_assignment():
     # A valid pin wins over the higher-priority agent the scheduler would otherwise pick.
     node = {"node_id": "a", "role": "implementation", "assigned_agent_id": "pinned"}
     assert orchestrator.choose_subtask_agent(node)["id"] == "pinned"
-    # An unknown/ineligible pin falls back to normal scoring (top priority wins).
+    # Unknown pin blocks instead of silently substituting another model.
     node_bad = {"node_id": "b", "role": "implementation", "assigned_agent_id": "ghost"}
-    assert orchestrator.choose_subtask_agent(node_bad)["id"] == "top"
+    with pytest.raises(RuntimeError, match="Pinned agent ghost"):
+        orchestrator.choose_subtask_agent(node_bad)
 
 
 def test_edit_task_graph_assigns_agent_rejects_cycle_and_guards_state():
@@ -743,6 +963,26 @@ def test_edit_task_graph_assigns_agent_rejects_cycle_and_guards_state():
     # Re-decomposition replaces the prior graph rather than duplicating node_ids.
     db.insert_subtasks(run_id, plan_graph.validate_graph({"subtasks": [{"node_id": "a", "spec": "only a"}]}))
     assert [row["node_id"] for row in db.subtasks(run_id)] == ["a"]
+
+
+def test_edit_task_graph_rejects_new_parallel_file_overlap():
+    clear_workflow_tables()
+    run_id = "graph-overlap"
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
+        (run_id, "graph edit", "codex", str(WORKSPACES), "awaiting_approval", now, now),
+    )
+    db.insert_subtasks(run_id, plan_graph.validate_graph({"subtasks": [
+        {"node_id": "a", "spec": "a", "file_globs": ["src/shared.py"]},
+        {"node_id": "b", "spec": "b", "file_globs": ["src/shared.py"], "depends_on": ["a"]},
+    ]}))
+
+    with pytest.raises(RuntimeError, match="share file scopes"):
+        orchestrator.edit_task_graph(run_id, [{"node_id": "b", "depends_on": []}])
+
+    persisted = {row["node_id"]: row for row in db.subtasks(run_id)}
+    assert json.loads(persisted["b"]["depends_on_json"]) == ["a"]
 
 
 def test_two_subtask_jobs_can_be_active_but_types_stay_singleton():
@@ -819,6 +1059,33 @@ def test_merge_worktrees_raises_on_conflict_without_writing():
     assert not (base / "shared.txt").exists()  # nothing written on conflict
 
 
+def test_lineage_accepts_an_empty_workspace_manifest():
+    run_id = "empty-" + secrets.token_hex(6)
+    target = WORKSPACES / run_id
+    target.mkdir()
+    base = stage_workspace(run_id, target)
+    first, first_input = workspace.stage_subtask_with_ancestors(run_id, "a", base, [])
+    assert first_input == {}
+    (first / "created.txt").write_text("created\n")
+    second, second_input = workspace.stage_subtask_with_ancestors(
+        run_id,
+        "b",
+        base,
+        [{"node_id": "a", "input_manifest_json": "{}"}],
+    )
+    assert (second / "created.txt").read_text() == "created\n"
+    assert "created.txt" in second_input
+    (second / "partial.txt").write_text("interrupted\n")
+    resumed, _ = workspace.stage_subtask_with_ancestors(
+        run_id,
+        "b",
+        base,
+        [{"node_id": "a", "input_manifest_json": "{}"}],
+    )
+    assert not (resumed / "partial.txt").exists()
+    assert (resumed / "created.txt").read_text() == "created\n"
+
+
 def test_execute_dag_runs_subtasks_and_merges(monkeypatch):
     clear_workflow_tables()
     run_id = "k" * 24
@@ -833,21 +1100,32 @@ def test_execute_dag_runs_subtasks_and_merges(monkeypatch):
         {"node_id": "b", "spec": "make b", "depends_on": ["a"], "file_globs": ["b.txt"]},
     ]})
     db.insert_subtasks(run_id, nodes)
+    worker_prompts = {}
 
     def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24, node_id=None):
         node = Path(workspace).parts[1] if workspace.startswith("subtasks/") else "main"
+        worker_prompts[node] = task
+        if node == "b":
+            assert (orchestrator.settings.jobs_dir / rid / workspace / "a.txt").read_text() == "from a\n"
         (orchestrator.settings.jobs_dir / rid / workspace / f"{node}.txt").write_text(f"from {node}\n")
         return {"ok": True, "content": f"did {node}", "usage": {}}
 
     monkeypatch.setattr(orchestrator, "worker_call", fake_worker_call)
     monkeypatch.setattr(orchestrator, "choose_agent", lambda *a, **k: {"id": "impl", "model": "m", "name": "Impl"})
     monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "call_brain_with_memory",
+        lambda *a, **k: {"content": '{"passed":true,"issues":"","handoff":{"summary":"done"}}', "usage": {}},
+    )
 
     summary, implementer_ids = orchestrator.execute_dag(run_id, base)
     assert (base / "a.txt").read_text() == "from a\n"
     assert (base / "b.txt").read_text() == "from b\n"
     assert implementer_ids == {"impl"}
     assert "did a" in summary and "did b" in summary
+    assert "DEPENDENCY a" in worker_prompts["b"]
+    assert '"summary": "done"' in worker_prompts["b"]
     assert all(row["status"] == "done" for row in db.subtasks(run_id))
 
 
@@ -929,9 +1207,16 @@ def test_approval_creates_history_snapshot_and_approval_atomically(monkeypatch):
     stage_workspace(run_id, target)
     now = db.utcnow()
     db.execute(
-        "insert into runs(id,task,brain_provider,brain_model,target_path,status,baseline_hash,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)",
-        (run_id, "Change output", "codex", "gpt-test", str(target), "awaiting_approval", manifest_hash(target), now, now),
+        "insert into runs(id,task,brain_provider,brain_model,target_path,status,baseline_hash,draft_plan,"
+        "plan_state,graph_plan_hash,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            run_id, "Change output", "codex", "gpt-test", str(target), "awaiting_approval",
+            manifest_hash(target), "Approved plan", "refined", orchestrator._plan_hash("Approved plan"), now, now,
+        ),
     )
+    db.insert_subtasks(run_id, plan_graph.validate_graph({"subtasks": [
+        {"node_id": "apply", "spec": "Apply approved plan", "file_globs": ["main.py"]},
+    ]}))
     monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
     result = orchestrator.approve_run(run_id, "Approved plan")
     assert result["status"] == "implementing"
@@ -1203,6 +1488,35 @@ def test_round_robin_distributes_across_equal_agents(monkeypatch):
     orchestrator._subtask_assignment_counts.clear()
 
 
+def test_complex_tasks_choose_strongest_but_simple_tasks_distribute(monkeypatch):
+    clear_workflow_tables()
+    orchestrator._subtask_assignment_counts.clear()
+    seed_agent("strong", "strong-model", ["implementation"], ["tools"], 100)
+    seed_agent("idle", "idle-model", ["implementation"], ["tools"], 10)
+    monkeypatch.setattr(orchestrator, "discover_agents", lambda: [])
+
+    complex_agent = orchestrator.choose_subtask_agent(
+        {
+            "role": "implementation",
+            "node_id": "complex",
+            "complexity": "complex",
+            "suggested_model": "idle-model",
+        },
+        run_id="distribution-run",
+    )
+    simple_agents = [
+        orchestrator.choose_subtask_agent(
+            {"role": "implementation", "node_id": f"simple-{index}", "complexity": "simple"},
+            run_id="distribution-run",
+        )["id"]
+        for index in range(2)
+    ]
+
+    assert complex_agent["id"] == "strong"
+    assert set(simple_agents) == {"strong", "idle"}
+    orchestrator._subtask_assignment_counts.clear()
+
+
 def test_validate_graph_passes_through_suggested_model():
     graph = {
         "subtasks": [
@@ -1255,6 +1569,11 @@ def test_execute_dag_uses_subtask_role(monkeypatch):
     monkeypatch.setattr(orchestrator, "choose_subtask_agent", fake_choose_subtask)
     monkeypatch.setattr(orchestrator, "worker_call", fake_worker_call)
     monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "call_brain_with_memory",
+        lambda *a, **k: {"content": '{"passed":true,"issues":"","handoff":{"summary":"done"}}', "usage": {}},
+    )
 
     summary, implementer_ids = orchestrator.execute_dag(run_id, base)
     # Research subtask should have been assigned res-agent
@@ -1323,6 +1642,7 @@ def test_enqueue_job_with_node_id(monkeypatch):
 def test_enqueue_ready_subtasks_chains_dag(monkeypatch):
     """_enqueue_ready_subtasks enqueues ready nodes and merge when all done."""
     clear_workflow_tables()
+    seed_agent("ready-agent", "ready-model", ["implementation"], ["tools"])
     monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
     now = db.utcnow()
     db.execute(
@@ -1344,6 +1664,7 @@ def test_enqueue_ready_subtasks_chains_dag(monkeypatch):
     assert jobs[0]["job_type"] == "subtask"
     # Mark "a" done, enqueue again — "b" should appear
     db.update_subtask("sub-run-rdy-a", status="done")
+    db.execute("update jobs set status='done' where run_id='run-rdy' and node_id='a'")
     orchestrator._enqueue_ready_subtasks("run-rdy")
     jobs = db.all_rows("select * from jobs where run_id='run-rdy' and status='pending' order by id")
     assert any(j["node_id"] == "b" for j in jobs)
@@ -1352,6 +1673,37 @@ def test_enqueue_ready_subtasks_chains_dag(monkeypatch):
     orchestrator._enqueue_ready_subtasks("run-rdy")
     merge_jobs = db.all_rows("select * from jobs where run_id='run-rdy' and job_type='merge'")
     assert len(merge_jobs) == 1
+
+
+def test_scheduler_honors_worker_pool_and_one_task_per_llm(monkeypatch):
+    clear_workflow_tables()
+    for index in range(3):
+        seed_agent(f"pool-{index}", f"pool-model-{index}", ["implementation"], ["tools"])
+    now = db.utcnow()
+    run_id = "run-pool"
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)",
+        (run_id, "Pool", "codex", "/tmp", "implementing", now, now),
+    )
+    db.insert_subtasks(run_id, plan_graph.validate_graph({"subtasks": [
+        {"node_id": "a", "spec": "a"},
+        {"node_id": "b", "spec": "b"},
+        {"node_id": "c", "spec": "c"},
+    ]}))
+    monkeypatch.setattr(orchestrator, "settings", replace(orchestrator.settings, worker_pool_size=2))
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+
+    orchestrator._enqueue_ready_subtasks(run_id)
+
+    jobs = db.all_rows(
+        "select * from jobs where run_id=? and job_type='subtask' and status='pending'",
+        (run_id,),
+    )
+    assigned = [row["agent_id"] for row in db.subtasks(run_id) if row["agent_id"]]
+    assert len(jobs) == 2
+    assert len(assigned) == 2
+    assert len(set(assigned)) == 2
 
 
 def test_subtask_recovery_on_init():
@@ -1393,6 +1745,7 @@ def test_implement_run_dispatches_subtask_jobs(monkeypatch):
     db.insert_subtasks("run-dur", nodes)
     # Prevent start_job_queue from actually draining
     monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+    monkeypatch.setattr(orchestrator, "ollama_available", lambda *a, **k: True)
     orchestrator.implement_run("run-dur")
     # Should have enqueued subtask job for s1 (ready), not s2 (blocked by s1)
     jobs = db.all_rows("select * from jobs where run_id='run-dur' and job_type='subtask'")
@@ -1442,8 +1795,8 @@ def test_enqueue_ready_subtasks_partial_dag(monkeypatch):
     assert jobs[0]["node_id"] == "branch-b"
 
 
-def test_enqueue_ready_subtasks_partial_merge(monkeypatch):
-    """All non-failed branches done + failed branch → triggers merge."""
+def test_enqueue_ready_subtasks_fails_closed(monkeypatch):
+    """Any failed required branch prevents merge/apply."""
     clear_workflow_tables()
     seed_agent("a2", "m2", ["implementation"], ["tools"])
     now = db.utcnow()
@@ -1465,7 +1818,36 @@ def test_enqueue_ready_subtasks_partial_merge(monkeypatch):
     monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
     orchestrator._enqueue_ready_subtasks("run-pm")
     merge_jobs = db.all_rows("select * from jobs where run_id='run-pm' and job_type='merge'")
-    assert len(merge_jobs) == 1
+    assert not merge_jobs
+    assert db.one("select status from runs where id='run-pm'")["status"] == "failed"
+
+
+def test_failed_task_blocks_all_descendants_and_never_merges(monkeypatch):
+    clear_workflow_tables()
+    seed_agent("block-agent", "m", ["implementation"], ["tools"])
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)",
+        ("run-block", "t", "codex", "/tmp", "implementing", now, now),
+    )
+    db.insert_subtasks("run-block", plan_graph.validate_graph({"subtasks": [
+        {"node_id": "a", "spec": "a"},
+        {"node_id": "b", "spec": "b", "depends_on": ["a"]},
+        {"node_id": "c", "spec": "c", "depends_on": ["b"]},
+    ]}))
+    first = next(row for row in db.subtasks("run-block") if row["node_id"] == "a")
+    db.update_subtask(first["id"], status="failed", result_summary="broken")
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda: None)
+
+    orchestrator._enqueue_ready_subtasks("run-block")
+
+    by_node = {row["node_id"]: row for row in db.subtasks("run-block")}
+    assert by_node["b"]["status"] == "blocked"
+    assert by_node["c"]["status"] == "blocked"
+    assert "a" in by_node["b"]["blocked_reason"]
+    assert db.one("select status from runs where id='run-block'")["status"] == "failed"
+    assert not db.all_rows("select id from jobs where run_id='run-block' and job_type='merge'")
 
 
 def test_subtask_retry_on_failure(monkeypatch):
@@ -1568,10 +1950,18 @@ def test_parse_subtask_verdict():
 
 def test_build_subtask_verify_prompt():
     """build_subtask_verify_prompt includes title, criteria, and summary."""
-    prompt = brain_io.build_subtask_verify_prompt("Add auth", "Must use JWT tokens", "Added JWT middleware")
+    prompt = brain_io.build_subtask_verify_prompt(
+        "Add auth",
+        "Must use JWT tokens",
+        "Added JWT middleware",
+        ["auth.py"],
+        [{"command": "pytest", "result": "exit=0"}],
+    )
     assert "Add auth" in prompt
     assert "JWT tokens" in prompt
     assert "JWT middleware" in prompt
+    assert "auth.py" in prompt
+    assert "exit=0" in prompt
     assert "passed" in prompt
 
 

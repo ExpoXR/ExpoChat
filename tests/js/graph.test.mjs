@@ -66,8 +66,8 @@ test("wouldCycle blocks back-edges and self-links but allows forward links", () 
 
 test("assignableAgents filters by enabled flag and role membership", () => {
   const agents = [
-    { id: "1", name: "coder", roles: ["implementation"], enabled: 1 },
-    { id: "2", name: "off", roles: ["implementation"], enabled: 0 },
+    { id: "1", name: "coder", roles: ["implementation"], capabilities: ["tools"], enabled: 1 },
+    { id: "2", name: "off", roles: ["implementation"], capabilities: ["tools"], enabled: 0 },
     { id: "3", name: "researcher", roles: ["research"], enabled: 1 },
   ];
   const impl = assignableAgents(agents, "implementation").map((agent) => agent.id);

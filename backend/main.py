@@ -40,6 +40,8 @@ from .orchestrator import (
     resume_run,
     rollback_run,
     start_job_queue,
+    start_ollama_monitor,
+    stop_ollama_monitor,
 )
 from .prompts import CAVEMAN_OUTPUT_INSTRUCTIONS
 from .security import (
@@ -308,7 +310,11 @@ async def lifespan(_: FastAPI):
         cleanup_partial_snapshots()
         cleanup_snapshots()
     start_job_queue()
-    yield
+    start_ollama_monitor()
+    try:
+        yield
+    finally:
+        stop_ollama_monitor()
 
 
 system_router = APIRouter()
@@ -387,13 +393,21 @@ def readyz() -> JSONResponse:
             brain_response = client.get(settings.brain_url + "/healthz")
             brain_response.raise_for_status()
             checks["brain"] = bool(brain_response.json().get("ok"))
+    except Exception as exc:
+        checks["error"] = str(exc)
+    try:
+        with httpx.Client(timeout=3) as client:
             ollama_response = client.get(settings.ollama_url + "/api/version")
             ollama_response.raise_for_status()
             checks["ollama"] = bool(ollama_response.json().get("version"))
     except Exception as exc:
-        checks["error"] = str(exc)
-    ready = all(checks.get(name) is True for name in ("database", "storage", "worker", "brain", "ollama"))
-    return JSONResponse({"ok": ready, "checks": checks}, 200 if ready else 503)
+        checks["ollama"] = False
+        checks["ollama_error"] = str(exc)
+    ready = all(checks.get(name) is True for name in ("database", "storage", "worker", "brain"))
+    return JSONResponse(
+        {"ok": ready, "degraded": ready and not checks["ollama"], "checks": checks},
+        200 if ready else 503,
+    )
 
 
 @auth_router.post("/api/auth/login")
@@ -628,7 +642,8 @@ def run_create(body: RunBody, session: dict = Depends(require_user)):
 def runs(cursor: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100), _: dict = Depends(require_user)):
     fields = (
         "id,task,brain_provider,brain_model,target_path,status,research_agent_id,implementation_agent_id,"
-        "repair_count,error,created_at,updated_at,approved_at,completed_at,snapshot_id,usage_json"
+        "repair_count,error,created_at,updated_at,approved_at,completed_at,snapshot_id,usage_json,"
+        "plan_state,wait_reason,next_retry_at"
     )
     rows = db.all_rows(f"select {fields} from runs order by updated_at desc limit ? offset ?", (limit + 1, cursor))
     has_more = len(rows) > limit
@@ -648,13 +663,23 @@ def run_get(run_id: str, _: dict = Depends(require_user)):
     row["plan_versions"] = db.plan_versions(run_id)
     row["subtasks"] = db.subtasks(run_id)
     for subtask in row["subtasks"]:
-        parse_json_fields(subtask, ["depends_on_json", "file_globs_json"])
-        subtask["depends_on"] = subtask.pop("depends_on_json", [])
+        parse_json_fields(subtask, ["depends_on_json", "file_globs_json", "handoff_json", "delta_manifest_json"])
+        subtask["depends_on"] = subtask.get("depends_on", [])
+        subtask.pop("depends_on_json", None)
+        subtask.pop("file_globs_json", None)
+        delta = subtask.pop("delta_manifest", {}) or {}
+        subtask.pop("delta_manifest_json", None)
+        subtask["changed_files"] = sorted(set(delta.get("changed", [])) | set(delta.get("deleted", [])))
+        subtask["handoff"] = subtask.get("handoff", {}) or {}
+        subtask.pop("handoff_json", None)
+        subtask.pop("input_manifest_json", None)
+        subtask.pop("output_manifest_json", None)
         agent = db.one("select name from agent_profiles where id=?", (subtask.get("agent_id"),)) if subtask.get("agent_id") else None
         subtask["agent_name"] = agent["name"] if agent else ""
     row["verification_results"] = db.all_rows("select * from verification_results where run_id=? order by id", (run_id,))
     row["jobs"] = db.all_rows(
-        "select id,job_type,status,attempts,error,started_at,completed_at,cancel_requested_at,created_at,updated_at "
+        "select id,job_type,node_id,status,attempts,error,wait_reason,next_attempt_at,started_at,completed_at,"
+        "cancel_requested_at,created_at,updated_at "
         "from jobs where run_id=? order by id",
         (run_id,),
     )
@@ -825,9 +850,14 @@ def status_api(_: dict = Depends(require_user)):
             response = client.get(settings.ollama_url + "/api/version")
             response.raise_for_status()
             version = response.json()
-        return {"ollama": version, "allowed_roots": [str(root) for root in settings.allowed_roots]}
+        return {"ollama_available": True, "ollama": version, "allowed_roots": [str(root) for root in settings.allowed_roots]}
     except Exception as exc:
-        raise HTTPException(502, f"Ollama error: {exc}") from exc
+        return {
+            "ollama_available": False,
+            "ollama": None,
+            "ollama_error": str(exc),
+            "allowed_roots": [str(root) for root in settings.allowed_roots],
+        }
 
 
 @workspace_router.get("/api/chats")

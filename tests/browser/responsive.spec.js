@@ -60,6 +60,28 @@ test("authenticated workspace chat", async ({ page }) => {
   await expect(page.locator(".msg.assistant .msg-body").last()).toContainText("Workspace fixture answer");
 });
 
+test("task graph stays bounded and exposes accessible links", async ({ page }) => {
+  test.skip(!process.env.E2E_USER || !process.env.E2E_PASSWORD, "E2E credentials not supplied");
+  await page.goto("/");
+  await page.locator("#username").fill(process.env.E2E_USER);
+  await page.locator("#password").fill(process.env.E2E_PASSWORD);
+  await page.locator("#loginForm button[type=submit]").click();
+  await expect(page.locator("#app")).toBeVisible();
+  await page.locator("#activityRuns").click();
+  await page.locator("#runList .item", { hasText: "Graph fixture" }).click();
+
+  await expect(page.locator("#taskGraphSection")).toBeVisible();
+  await expect(page.locator("#taskGraph .tg-node")).toHaveCount(4);
+  await expect(page.locator("#taskGraph .tg-edge")).toHaveCount(4);
+  await expect(page.locator("#taskGraph marker#tg-arrow")).toHaveCount(1);
+  await expect(page.locator('#taskGraph .tg-edge[tabindex="0"]')).toHaveCount(4);
+  await expect(page.locator('#taskGraph .tg-node[data-node="backend"]')).toHaveAttribute("data-complexity", "complex");
+  await expect(page.locator('#taskGraph .tg-node[data-node="backend"]')).toHaveAttribute("data-status", "pending");
+  await expect(page.locator("#taskGraph .tg-handle").first()).toHaveCSS("touch-action", "none");
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+});
+
 test("desktop settings and panel resizing", async ({ page }, testInfo) => {
   test.skip(testInfo.project.use.viewport.width < 1200, "Desktop layout only");
   test.skip(!process.env.E2E_USER || !process.env.E2E_PASSWORD, "E2E credentials not supplied");
