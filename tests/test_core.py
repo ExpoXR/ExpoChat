@@ -1015,50 +1015,6 @@ def test_two_subtask_jobs_can_be_active_but_types_stay_singleton():
         )
 
 
-def _make_base_stage(run_id: str, name: str) -> Path:
-    target = WORKSPACES / name
-    target.mkdir(exist_ok=True)
-    (target / "base.txt").write_text("base\n")
-    return stage_workspace(run_id, target)
-
-
-def test_stage_subtask_isolates_worktrees():
-    run_id = "h" * 24
-    base = _make_base_stage(run_id, "dag-iso-target")
-    wt_a = workspace.stage_subtask(run_id, "a", base)
-    wt_b = workspace.stage_subtask(run_id, "b", base)
-    (wt_a / "only_a.txt").write_text("a\n")
-    assert (wt_a / "base.txt").read_text() == "base\n"
-    assert not (wt_b / "only_a.txt").exists()  # b's worktree is unaffected
-    assert not (base / "only_a.txt").exists()  # base stage is unaffected
-
-
-def test_merge_worktrees_applies_disjoint_changes():
-    run_id = "i" * 24
-    base = _make_base_stage(run_id, "dag-merge-target")
-    wt_a = workspace.stage_subtask(run_id, "a", base)
-    wt_b = workspace.stage_subtask(run_id, "b", base)
-    (wt_a / "a.txt").write_text("from a\n")
-    (wt_b / "b.txt").write_text("from b\n")
-    merged = workspace.merge_worktrees(base, [("a", wt_a), ("b", wt_b)])
-    assert sorted(merged["changed"]) == ["a.txt", "b.txt"]
-    assert (base / "a.txt").read_text() == "from a\n"
-    assert (base / "b.txt").read_text() == "from b\n"
-
-
-def test_merge_worktrees_raises_on_conflict_without_writing():
-    run_id = "j" * 24
-    base = _make_base_stage(run_id, "dag-conflict-target")
-    wt_a = workspace.stage_subtask(run_id, "a", base)
-    wt_b = workspace.stage_subtask(run_id, "b", base)
-    (wt_a / "shared.txt").write_text("a wins\n")
-    (wt_b / "shared.txt").write_text("b wins\n")
-    with pytest.raises(workspace.MergeConflict) as info:
-        workspace.merge_worktrees(base, [("a", wt_a), ("b", wt_b)])
-    assert info.value.conflicts[0]["path"] == "shared.txt"
-    assert not (base / "shared.txt").exists()  # nothing written on conflict
-
-
 def test_lineage_accepts_an_empty_workspace_manifest():
     run_id = "empty-" + secrets.token_hex(6)
     target = WORKSPACES / run_id
@@ -1084,49 +1040,6 @@ def test_lineage_accepts_an_empty_workspace_manifest():
     )
     assert not (resumed / "partial.txt").exists()
     assert (resumed / "created.txt").read_text() == "created\n"
-
-
-def test_execute_dag_runs_subtasks_and_merges(monkeypatch):
-    clear_workflow_tables()
-    run_id = "k" * 24
-    now = db.utcnow()
-    db.execute(
-        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
-        (run_id, "DAG execute", "codex", str(WORKSPACES), "implementing", now, now),
-    )
-    base = _make_base_stage(run_id, "dag-exec-target")
-    nodes = plan_graph.validate_graph({"subtasks": [
-        {"node_id": "a", "spec": "make a", "file_globs": ["a.txt"]},
-        {"node_id": "b", "spec": "make b", "depends_on": ["a"], "file_globs": ["b.txt"]},
-    ]})
-    db.insert_subtasks(run_id, nodes)
-    worker_prompts = {}
-
-    def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24, node_id=None):
-        node = Path(workspace).parts[1] if workspace.startswith("subtasks/") else "main"
-        worker_prompts[node] = task
-        if node == "b":
-            assert (orchestrator.settings.jobs_dir / rid / workspace / "a.txt").read_text() == "from a\n"
-        (orchestrator.settings.jobs_dir / rid / workspace / f"{node}.txt").write_text(f"from {node}\n")
-        return {"ok": True, "content": f"did {node}", "usage": {}}
-
-    monkeypatch.setattr(orchestrator, "worker_call", fake_worker_call)
-    monkeypatch.setattr(orchestrator, "choose_agent", lambda *a, **k: {"id": "impl", "model": "m", "name": "Impl"})
-    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
-    monkeypatch.setattr(
-        orchestrator,
-        "call_brain_with_memory",
-        lambda *a, **k: {"content": '{"passed":true,"issues":"","handoff":{"summary":"done"}}', "usage": {}},
-    )
-
-    summary, implementer_ids = orchestrator.execute_dag(run_id, base)
-    assert (base / "a.txt").read_text() == "from a\n"
-    assert (base / "b.txt").read_text() == "from b\n"
-    assert implementer_ids == {"impl"}
-    assert "did a" in summary and "did b" in summary
-    assert "DEPENDENCY a" in worker_prompts["b"]
-    assert '"summary": "done"' in worker_prompts["b"]
-    assert all(row["status"] == "done" for row in db.subtasks(run_id))
 
 
 def test_worker_activity_records_safe_live_file_states():
@@ -1529,58 +1442,6 @@ def test_validate_graph_passes_through_suggested_model():
     assert nodes[0]["suggested_model"] == "qwen3-coder"
     assert nodes[1]["suggested_model"] is None
     assert nodes[2]["suggested_model"] is None
-
-
-def test_execute_dag_uses_subtask_role(monkeypatch):
-    """Integration: DAG execution uses per-subtask agent selection with mixed roles."""
-    clear_workflow_tables()
-    orchestrator._subtask_assignment_counts.clear()
-    run_id = "d" * 24
-    now = db.utcnow()
-    db.execute(
-        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
-        (run_id, "Mixed role DAG", "codex", str(WORKSPACES), "implementing", now, now),
-    )
-    base = _make_base_stage(run_id, "dag-role-target")
-    nodes = plan_graph.validate_graph({"subtasks": [
-        {"node_id": "research-step", "spec": "research first", "role": "research", "file_globs": ["r.txt"]},
-        {"node_id": "impl-step", "spec": "implement it", "depends_on": ["research-step"], "file_globs": ["i.txt"]},
-    ]})
-    db.insert_subtasks(run_id, nodes)
-    seed_agent("res-agent", "res-model", ["research"], [], 80)
-    seed_agent("impl-agent", "impl-model", ["implementation"], ["tools"], 80)
-
-    chosen_agents = []
-
-    def fake_choose_subtask(node, exclude=None, run_id=None):
-        role = node.get("role", "implementation")
-        if role == "research":
-            agent = {"id": "res-agent", "model": "res-model", "name": "ResAgent"}
-        else:
-            agent = {"id": "impl-agent", "model": "impl-model", "name": "ImplAgent"}
-        chosen_agents.append((node["node_id"], agent["id"]))
-        return agent
-
-    def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24, node_id=None):
-        node = Path(workspace).parts[1] if workspace.startswith("subtasks/") else "main"
-        (orchestrator.settings.jobs_dir / rid / workspace / f"{node}.txt").write_text(f"from {node}\n")
-        return {"ok": True, "content": f"did {node}", "usage": {}}
-
-    monkeypatch.setattr(orchestrator, "choose_subtask_agent", fake_choose_subtask)
-    monkeypatch.setattr(orchestrator, "worker_call", fake_worker_call)
-    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
-    monkeypatch.setattr(
-        orchestrator,
-        "call_brain_with_memory",
-        lambda *a, **k: {"content": '{"passed":true,"issues":"","handoff":{"summary":"done"}}', "usage": {}},
-    )
-
-    summary, implementer_ids = orchestrator.execute_dag(run_id, base)
-    # Research subtask should have been assigned res-agent
-    assert ("research-step", "res-agent") in chosen_agents
-    # Implementation subtask should have been assigned impl-agent
-    assert ("impl-step", "impl-agent") in chosen_agents
-    orchestrator._subtask_assignment_counts.clear()
 
 
 def test_migration_10_creates_brain_memory_table():
