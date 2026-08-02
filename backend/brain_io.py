@@ -7,8 +7,11 @@ strings; parsers tolerate code fences, prose preambles, and malformed output gra
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
+
+log = logging.getLogger("ollma.brain_io")
 
 # ---------------------------------------------------------------------------
 # Typed response structures
@@ -73,8 +76,10 @@ def extract_json(text: str) -> dict[str, Any]:
 def parse_verdict(text: str) -> BrainVerdict:
     """Parse a brain verdict response into a typed BrainVerdict.
 
-    Tries structured JSON extraction first, then falls back to string-sniffing
-    (preserving backward compatibility with terse/malformed brain output).
+    Requires structured JSON. If the response can't be parsed, the verdict fails
+    closed (passed=False): a pass must be an explicit, well-formed decision — never
+    inferred by sniffing "passed":true out of prose, which a discussion of the
+    field could accidentally trip.
     """
     try:
         value = extract_json(text)
@@ -85,9 +90,8 @@ def parse_verdict(text: str) -> BrainVerdict:
             scope_expansion=bool(value.get("scope_expansion")),
         )
     except (ValueError, AttributeError):
-        # Lenient fallback: sniff "passed":true from raw text
-        passed = '"passed":true' in text.replace(" ", "").lower()
-        return BrainVerdict(passed=passed, verdict=text, repair_task="", scope_expansion=False)
+        log.warning("Unparseable brain verdict; failing closed (passed=False)")
+        return BrainVerdict(passed=False, verdict=text, repair_task="", scope_expansion=False)
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +192,9 @@ def parse_subtask_verdict(text: str | dict[str, Any]) -> SubtaskVerdict:
             },
         )
     except (TypeError, ValueError, AttributeError):
-        passed = '"passed":true' in text.replace(" ", "").lower()
-        return SubtaskVerdict(passed=passed, issues="" if passed else text[:500], handoff={})
+        # Fail closed: an unparseable verdict is a failed subtask, not a pass.
+        log.warning("Unparseable subtask verdict; failing closed (passed=False)")
+        return SubtaskVerdict(passed=False, issues=text[:500], handoff={})
 
 
 def build_provisional_plan_prompt(task: str, workspace_inventory: str) -> str:

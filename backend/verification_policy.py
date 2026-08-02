@@ -95,8 +95,23 @@ def evaluate_apply_gate(run_id: str, brain_passed: bool) -> PolicyDecision:
     Policy:
       evidence_passed = (pass_count >= 1) AND (fail_after_edit_count == 0)
       allowed = evidence_passed AND brain_passed
+
+    Only checks run against the *current* post-edit workspace state count. Evidence
+    accumulates across repair and scope-expansion re-runs (whose cycle numbers reset
+    and overlap), so a stale failure from an earlier attempt must never wedge a run
+    that has since been fixed and re-verified. The most recent qualifying pass owns
+    the highest-id rows, and every check in a pass shares that stage's workspace_hash;
+    restricting the gate to that hash is exactly "no check failed after the last edit".
     """
     evidence = get_check_evidence(run_id)
+    if evidence:
+        latest = max(evidence, key=lambda e: e["id"])
+        latest_hash = latest.get("workspace_hash") or ""
+        evidence = (
+            [e for e in evidence if (e.get("workspace_hash") or "") == latest_hash]
+            if latest_hash
+            else [latest]
+        )
     pass_count = sum(1 for e in evidence if e["exit_code"] == 0)
     fail_count = sum(1 for e in evidence if e["exit_code"] != 0)
 
