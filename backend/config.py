@@ -26,6 +26,11 @@ class Settings:
     admin_user: str = field(default_factory=lambda: os.getenv("ADMIN_USER", "admin"))
     admin_password: str = field(default_factory=lambda: os.getenv("ADMIN_PASSWORD", "change-me-now"))
     admin_password_hash: str = field(default_factory=lambda: os.getenv("ADMIN_PASSWORD_HASH", ""))
+    # Dev-only escape hatch: allow a plaintext/md5 ADMIN_PASSWORD when no argon2
+    # hash is set. Off by default so production must use ADMIN_PASSWORD_HASH.
+    allow_insecure_password: bool = field(
+        default_factory=lambda: os.getenv("ALLOW_INSECURE_PASSWORD", "false").lower() == "true"
+    )
     session_secret: str = field(default_factory=lambda: os.getenv("SESSION_SECRET", "change-this-session-secret"))
     credential_key: str = field(default_factory=lambda: os.getenv("CREDENTIAL_ENCRYPTION_KEY", ""))
     ollama_url: str = field(default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://192.168.0.78:11434").rstrip("/"))

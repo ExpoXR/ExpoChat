@@ -287,12 +287,14 @@ async def lifespan(_: FastAPI):
         unsafe.append("WORKER_TOKEN")
     if not settings.credential_key:
         unsafe.append("CREDENTIAL_ENCRYPTION_KEY")
-    if not settings.admin_password_hash and settings.admin_password in {"", "change-me-now"}:
+    if not settings.admin_password_hash and not settings.allow_insecure_password:
+        # Production must use an argon2 hash. Plaintext is only allowed with the
+        # explicit ALLOW_INSECURE_PASSWORD=true dev escape hatch.
         unsafe.append("ADMIN_PASSWORD_HASH")
     if unsafe:
         raise RuntimeError("Unsafe or missing required configuration: " + ", ".join(unsafe))
     if not settings.admin_password_hash:
-        log.warning("legacy_plaintext_admin_password_configured migrate_to_argon2id=true")
+        log.warning("insecure_plaintext_admin_password_enabled migrate_to_argon2id=true")
     db.init_db()
     for interrupted in db.all_rows(
         "select id,snapshot_id from runs where status='failed' and error='Interrupted by service restart' and snapshot_id is not null"
@@ -335,7 +337,16 @@ async def request_context(request: Request, call_next):
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "same-origin"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; "
+        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+    )
+    # HSTS only over HTTPS (directly or behind a TLS-terminating proxy).
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    if request.url.scheme == "https" or forwarded_proto == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     log.info("request", extra={
         "request_id": request_id, "method": request.method, "path": request.url.path,
         "status": response.status_code, "duration_ms": int((time.monotonic() - started) * 1000),
@@ -393,16 +404,20 @@ def readyz() -> JSONResponse:
             brain_response = client.get(settings.brain_url + "/healthz")
             brain_response.raise_for_status()
             checks["brain"] = bool(brain_response.json().get("ok"))
-    except Exception as exc:
-        checks["error"] = str(exc)
+    except Exception:
+        # /readyz is unauthenticated; log the detail server-side but never leak raw
+        # exception strings (host names, stack detail) to anonymous callers.
+        log.exception("readyz_dependency_check_failed")
+        checks["error"] = "dependency check failed"
     try:
         with httpx.Client(timeout=3) as client:
             ollama_response = client.get(settings.ollama_url + "/api/version")
             ollama_response.raise_for_status()
             checks["ollama"] = bool(ollama_response.json().get("version"))
-    except Exception as exc:
+    except Exception:
+        log.warning("readyz_ollama_unavailable")
         checks["ollama"] = False
-        checks["ollama_error"] = str(exc)
+        checks["ollama_error"] = "unavailable"
     ready = all(checks.get(name) is True for name in ("database", "storage", "worker", "brain"))
     return JSONResponse(
         {"ok": ready, "degraded": ready and not checks["ollama"], "checks": checks},

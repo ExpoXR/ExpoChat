@@ -2116,3 +2116,38 @@ def test_qualifying_checks_list_structure():
         assert "command" in check
         assert "args" in check
         assert isinstance(check["args"], list)
+
+
+# --- PR4: password policy ---------------------------------------------------
+
+def test_password_argon2_hash_is_honored(monkeypatch):
+    import dataclasses
+
+    from argon2 import PasswordHasher
+
+    from backend import security
+
+    digest = PasswordHasher().hash("s3cret-pass")
+    patched = dataclasses.replace(security.settings, admin_password_hash=digest)
+    monkeypatch.setattr(security, "settings", patched)
+    assert security.verify_password("s3cret-pass") is True
+    assert security.verify_password("wrong") is False
+
+
+def test_password_plaintext_denied_without_insecure_flag(monkeypatch):
+    import dataclasses
+
+    from backend import security
+
+    # No argon2 hash + insecure fallback disabled -> login is refused outright.
+    denied = dataclasses.replace(
+        security.settings, admin_password_hash="", admin_password="hunter2", allow_insecure_password=False,
+    )
+    monkeypatch.setattr(security, "settings", denied)
+    assert security.verify_password("hunter2") is False
+
+    # Explicit dev opt-in -> plaintext compare works again.
+    allowed = dataclasses.replace(denied, allow_insecure_password=True)
+    monkeypatch.setattr(security, "settings", allowed)
+    assert security.verify_password("hunter2") is True
+    assert security.verify_password("nope") is False
