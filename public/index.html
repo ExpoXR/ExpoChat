@@ -16,7 +16,7 @@
         <input id="username" autocomplete="username" placeholder="Username">
         <input id="password" type="password" autocomplete="current-password" placeholder="Password">
         <button type="submit">Login</button>
-        <p id="loginError"></p>
+        <p id="loginError" role="alert" aria-live="assertive"></p>
       </form>
     </main>
 
@@ -152,12 +152,12 @@
 
         <!-- Editor area -->
         <section class="editor-area">
-          <div class="tabs-row">
-            <button class="editor-tab active" data-editor="chatEditor">chat.md</button>
-            <button class="editor-tab"        data-editor="runEditor">run</button>
-            <button class="editor-tab"        data-editor="fileEditor">file</button>
-            <button class="editor-tab"        data-editor="diffEditor">changes.diff</button>
-            <button class="editor-tab"        data-editor="artifactEditor">evidence.md</button>
+          <div class="tabs-row" role="tablist" aria-label="Editor panes">
+            <button class="editor-tab active" role="tab" aria-selected="true"  data-editor="chatEditor">chat.md</button>
+            <button class="editor-tab"        role="tab" aria-selected="false" data-editor="runEditor">run</button>
+            <button class="editor-tab"        role="tab" aria-selected="false" data-editor="fileEditor">file</button>
+            <button class="editor-tab"        role="tab" aria-selected="false" data-editor="diffEditor">changes.diff</button>
+            <button class="editor-tab"        role="tab" aria-selected="false" data-editor="artifactEditor">evidence.md</button>
           </div>
 
           <!-- Chat editor -->
@@ -428,7 +428,7 @@
       </div>
 
       <footer class="statusbar">
-        <button id="menuBtn">Explorer</button>
+        <button id="menuBtn" aria-label="Toggle navigation sidebar">Menu</button>
         <button id="workspaceBtn">Plan Panel</button>
         <span id="status">Connecting</span>
         <span class="status-spacer"></span>
@@ -440,7 +440,7 @@
     </main>
 
     <!-- Toast notification -->
-    <div id="toast" class="toast hidden"></div>
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
     <!-- Floating context (kebab) menu -->
     <div id="contextMenu" class="context-menu hidden" role="menu"></div>
     <button id="drawerBackdrop" class="drawer-backdrop hidden" aria-label="Close open panel"></button>

@@ -11,6 +11,15 @@ test("markdown escapes raw HTML and preserves escaped code", async () => {
   assert.ok(collision.includes("<code>safe</code>"));
 });
 
+test("markdown bounds pathological input length", async () => {
+  const { renderMarkdown } = await import("../../public/js/render.mjs");
+  const huge = "a".repeat(500_000);
+  const rendered = renderMarkdown(huge);
+  assert.ok(rendered.includes("truncated"));
+  // Input is capped at ~100k before transforms, so output can't reflect all 500k.
+  assert.ok(rendered.length < 150_000);
+});
+
 test("byte formatter uses binary units", async () => {
   const { formatBytes } = await import("../../public/js/render.mjs");
   assert.equal(formatBytes(1024), "1.00 KiB");

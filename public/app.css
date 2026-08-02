@@ -2100,3 +2100,24 @@ pre {
 :root[data-theme="light"] .titlebar,
 :root[data-theme="light"] .tabs-row { border-bottom-color: var(--line); }
 :root[data-theme="light"] :focus-visible { outline-color: var(--accent); }
+
+/* Inline list-pane error placeholder (shown when a fetch fails). */
+.pane-error {
+  margin: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: 13px;
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+
+/* Respect reduced-motion: disable non-essential looping animations/transitions. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

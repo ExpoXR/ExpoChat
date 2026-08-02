@@ -4,7 +4,7 @@ import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMa
 import { artifactPresentation, explorerActivityState, fileActivity, runChoreography, runStatusLabel, subtaskCards, tokenCounts } from "/js/runs.mjs";
 import { assignableAgents, buildGraphModel, computeLayout, edgeList, wouldCycle } from "/js/graph.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
-import { buildSettingsPayload, usageMeter } from "/js/settings_api.mjs";
+import { buildSettingsPayload, clampPriority, usageMeter } from "/js/settings_api.mjs";
 import { consumeSse } from "/js/sse.mjs";
 import { readPreferences, writePreferences } from "/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "/js/workspace.mjs";
@@ -26,6 +26,9 @@ let runs = [];
 let currentRun = null;
 let currentRunData = null;
 let runEventSource = null;
+let runStreamGen = 0;       // guards against stale overlapping loadRun() responses
+let runRefreshTimer = null; // coalesces bursts of run events into one refetch
+let runStreamErrors = 0;    // reconnect-failure cap for the run SSE stream
 let brains = [];
 let drawerReturnFocus = null;
 let searchCursor = null;
@@ -146,6 +149,14 @@ function showToast(message, type = "info") {
   t._tid = setTimeout(() => t.classList.add("hidden"), 3500);
 }
 
+// Render an inline error placeholder into a list pane so a failed fetch leaves a
+// visible, retryable message instead of a silently blank/stale container.
+function showPaneError(containerId, message) {
+  const container = $(containerId);
+  if (!container) return;
+  container.innerHTML = `<div class="pane-error" role="alert">${escapeHtml(message)}</div>`;
+}
+
 // Floating kebab / context menu. items: [{ label, handler, danger?, disabled? }]
 function closeContextMenu() {
   const menu = $("contextMenu");
@@ -176,6 +187,21 @@ function openContextMenu(anchorEl, items) {
   const top = Math.min(rect.bottom + 4, window.innerHeight - menu.offsetHeight - 8);
   menu.style.left = `${left}px`;
   menu.style.top = `${Math.max(8, top)}px`;
+
+  // Keyboard access: move focus into the menu and support arrow/Home/End/Escape.
+  const options = () => [...menu.querySelectorAll("button:not([disabled])")];
+  const focusAt = (list, index) => { if (list.length) list[(index + list.length) % list.length].focus(); };
+  const first = options();
+  if (first.length) first[0].focus();
+  menu.onkeydown = (event) => {
+    const list = options();
+    const idx = list.indexOf(document.activeElement);
+    if (event.key === "ArrowDown") { event.preventDefault(); focusAt(list, idx + 1); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); focusAt(list, idx - 1); }
+    else if (event.key === "Home") { event.preventDefault(); focusAt(list, 0); }
+    else if (event.key === "End") { event.preventDefault(); focusAt(list, list.length - 1); }
+    else if (event.key === "Escape") { event.preventDefault(); closeContextMenu(); anchorEl.focus(); }
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -279,12 +305,17 @@ function setupPanelResizer(id, kind, fallback) {
 }
 
 function switchEditor(id) {
+  // Leaving the run view: stop the run SSE stream so it doesn't keep refetching
+  // in the background (it was previously only closed on terminal status).
+  if (id !== "runEditor") closeRunStream();
   ["chatEditor", "runEditor", "fileEditor", "diffEditor", "artifactEditor", "settingsEditor"].forEach((pane) =>
     $(pane).classList.toggle("hidden", pane !== id)
   );
-  document.querySelectorAll(".editor-tab").forEach((tab) =>
-    tab.classList.toggle("active", tab.dataset.editor === id)
-  );
+  document.querySelectorAll(".editor-tab").forEach((tab) => {
+    const active = tab.dataset.editor === id;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -982,7 +1013,13 @@ async function runTermCommand() {
 
 async function loadSnaps(append = false) {
   const cursor = append ? snapshotNext : 0;
-  const [data, storage] = await Promise.all([api(`/api/snapshots?cursor=${cursor || 0}&limit=50`), api("/api/maintenance/storage")]);
+  let data, storage;
+  try {
+    [data, storage] = await Promise.all([api(`/api/snapshots?cursor=${cursor || 0}&limit=50`), api("/api/maintenance/storage")]);
+  } catch (err) {
+    if (!append) showPaneError("snapList", `Couldn't load snapshots: ${err.message}`);
+    return;
+  }
   snapshotRetentionDays = Number(storage.limits?.snapshot_retention_days) || 30;
   $("cleanSnapsBtn").textContent = `Expire Old (>${snapshotRetentionDays}d)`;
   $("cleanSnapsBtn").title = `Expire snapshot archives older than ${snapshotRetentionDays} days`;
@@ -1076,7 +1113,13 @@ async function cleanOldSnaps() {
 
 async function loadTimeline(append = false) {
   const cursor = append ? timelineNext : 0;
-  const data = await api(`/api/timeline?cursor=${cursor || 0}&limit=50`);
+  let data;
+  try {
+    data = await api(`/api/timeline?cursor=${cursor || 0}&limit=50`);
+  } catch (err) {
+    if (!append) showPaneError("timelineList", `Couldn't load timeline: ${err.message}`);
+    return;
+  }
   if (!append) $("timelineList").innerHTML = "";
   (data.timeline || []).forEach((event) => {
     const item = document.createElement("button");
@@ -1644,7 +1687,12 @@ function renderRunArtifacts(artifacts) {
 }
 
 async function loadRun(id) {
+  // Generation guard: only the most recent loadRun() render wins, so overlapping
+  // responses from a burst of run events (or a fast run switch) can't clobber
+  // newer state with stale data.
+  const gen = ++runStreamGen;
   const run = await api(`/api/runs/${id}`);
+  if (gen !== runStreamGen) return run;
   renderCurrentRun(run);
   renderRunEvents(run.events);
   renderRunArtifacts(run.artifacts);
@@ -1656,8 +1704,14 @@ async function loadRun(id) {
 }
 
 async function loadRuns(append = false) {
-  const cursor = append ? runNext : 0;
-  const data = await api(`/api/runs?cursor=${cursor || 0}&limit=50`);
+  let data;
+  try {
+    const cursor = append ? runNext : 0;
+    data = await api(`/api/runs?cursor=${cursor || 0}&limit=50`);
+  } catch (err) {
+    if (!append) showPaneError("runList", `Couldn't load runs: ${err.message}`);
+    return;
+  }
   runs = append ? [...runs, ...(data.runs || [])] : (data.runs || []);
   runNext = data.next_cursor;
   $("runList").innerHTML = "";
@@ -1666,34 +1720,58 @@ async function loadRuns(append = false) {
     btn.className = "item" + (run.id === currentRun ? " active" : "");
     btn.innerHTML = `<strong>${escapeHtml(run.task.slice(0, 55))}</strong><small>${escapeHtml(runStatusLabel(run))} · ${escapeHtml(run.brain_provider)}</small>`;
     btn.onclick = async () => {
-      await loadRun(run.id);
-      switchEditor("runEditor");
-      closeDrawers();
-      drawerReturnFocus = btn;
-      document.querySelector(".panel-area").classList.add("open");
-      syncDrawerState();
-      subscribeRun(run.id);
+      try {
+        await loadRun(run.id);
+        switchEditor("runEditor");
+        closeDrawers();
+        drawerReturnFocus = btn;
+        document.querySelector(".panel-area").classList.add("open");
+        syncDrawerState();
+        subscribeRun(run.id);
+      } catch (err) { showToast(err.message, "error"); }
     };
     $("runList").appendChild(btn);
   });
   $("loadMoreRunsBtn").classList.toggle("hidden", runNext === null || runNext === undefined);
 }
 
+const TERMINAL_RUN_STATUSES = ["completed", "failed", "cancelled", "rolled_back"];
+const RUN_STREAM_MAX_ERRORS = 5;
+
+function closeRunStream() {
+  if (runEventSource) { runEventSource.close(); runEventSource = null; }
+  if (runRefreshTimer) { clearTimeout(runRefreshTimer); runRefreshTimer = null; }
+}
+
+// Coalesce a burst of run events into a single refetch (~250ms) instead of one
+// full loadRun per event across ~40 listeners.
+function scheduleRunRefresh(id) {
+  if (runRefreshTimer) return;
+  runRefreshTimer = setTimeout(() => {
+    runRefreshTimer = null;
+    loadRun(id).then((run) => {
+      loadRuns().catch(() => {});
+      if (TERMINAL_RUN_STATUSES.includes(run.status)) closeRunStream();
+    }).catch(() => {});
+  }, 250);
+}
+
 function subscribeRun(id) {
-  if (runEventSource) runEventSource.close();
+  closeRunStream();
+  runStreamErrors = 0;
   runEventSource = new EventSource(`/api/runs/${id}/events`);
-  runEventSource.onmessage = () => loadRun(id).catch(() => {});
+  const onEvent = () => { runStreamErrors = 0; scheduleRunRefresh(id); };
+  runEventSource.onmessage = onEvent;
   ["run.created", "ollama.waiting", "ollama.reconnected", "plan.provisional", "plan.refining", "research.started", "research.completed", "plan.ready", "plan.edited", "plan.graph_ready", "plan.redo", "plan.approved", "plan.decomposed", "plan.graph_edited", "scope.approved", "scope.approval_required", "implementation.started", "agent.activity", "subtask.started", "subtask.completed", "subtask.verified", "subtask.retry", "subtask.failed", "subtask.blocked", "subtasks.merged", "subtasks.conflict", "check.completed", "gate.evaluated", "verification.completed", "apply.completed", "rollback.completed", "run.completed", "run.failed", "run.cancelled", "plan.stale"].forEach((name) => {
-    runEventSource.addEventListener(name, () => {
-      loadRun(id).then((run) => {
-        loadRuns().catch(() => {});
-        if (["completed", "failed", "cancelled", "rolled_back"].includes(run.status)) runEventSource.close();
-      }).catch(() => {});
-    });
+    runEventSource.addEventListener(name, onEvent);
   });
-  runEventSource.onerror = () => loadRun(id).then((run) => {
-    if (["completed", "failed", "cancelled", "rolled_back"].includes(run.status)) runEventSource.close();
-  }).catch(() => {});
+  // The native EventSource auto-reconnects; cap repeated failures so a persistently
+  // broken stream stops hammering the server, and reconcile state once per failure.
+  runEventSource.onerror = () => {
+    runStreamErrors += 1;
+    if (runStreamErrors >= RUN_STREAM_MAX_ERRORS) { closeRunStream(); return; }
+    scheduleRunRefresh(id);
+  };
 }
 
 async function runAction(action) {
@@ -1915,7 +1993,7 @@ async function loadAgents() {
           method: "PATCH",
           body: JSON.stringify({
             roles: roles.value.split(",").map((role) => role.trim()).filter(Boolean),
-            priority: Number(priority.value),
+            priority: clampPriority(priority.value, { fallback: agent.priority }),
             system_prompt: prompt.value,
           }),
         });
@@ -2042,11 +2120,13 @@ async function boot() {
     renderOllamaStatus();
     showToast("Ollama models unavailable: " + err.message, "error");
   }
-  await loadChats();
+  // Guard each loader: a transient chat/FS/list error must not reject boot() and
+  // bounce the user back to the login screen.
+  try { await loadChats(); } catch (err) { showToast("Failed to load chats: " + err.message, "error"); }
   await Promise.allSettled([loadRuns(), loadBrains(), loadAgents(), loadSettings()]);
 
   if (prefs.chat && chats.find((c) => c.id === prefs.chat)) {
-    await loadChat(prefs.chat);
+    try { await loadChat(prefs.chat); } catch (_) {}
   }
 
   try { await openPath(prefs.target || ""); } catch (err) { showToast(err.message, "error"); }
@@ -2073,8 +2153,9 @@ document.addEventListener("DOMContentLoaded", () => {
   // Auth
   $("loginForm").onsubmit = login;
   $("logoutBtn").onclick  = async () => {
-    await api("/api/auth/logout", { method: "POST", body: "{}" });
-    location.reload();
+    clearInterval(ollamaPollTimer);
+    closeRunStream();
+    try { await api("/api/auth/logout", { method: "POST", body: "{}" }); } finally { location.reload(); }
   };
 
   // Chat
