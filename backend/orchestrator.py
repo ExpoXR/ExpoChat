@@ -37,6 +37,7 @@ from .verification_policy import (
 from .workspace import (
     MergeConflict,
     apply_stage,
+    cleanup_run_jobs,
     create_snapshot,
     discard_snapshot,
     manifest_hash,
@@ -59,6 +60,11 @@ _brain_locks: dict[str, threading.Lock] = {}
 _brain_locks_guard = threading.Lock()
 _ollama_monitor_stop = threading.Event()
 _ollama_monitor_thread: threading.Thread | None = None
+_jobs_sweeper_stop = threading.Event()
+_jobs_sweeper_wake = threading.Event()
+_jobs_sweeper_thread: threading.Thread | None = None
+
+TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled", "rolled_back"})
 
 
 class OllamaUnavailable(RuntimeError):
@@ -189,6 +195,85 @@ def stop_ollama_monitor() -> None:
     if _ollama_monitor_thread:
         _ollama_monitor_thread.join(timeout=2)
     _ollama_monitor_thread = None
+
+
+def _has_active_jobs(run_id: str) -> bool:
+    row = db.one(
+        "select 1 from jobs where run_id=? and status in ('running','pending','waiting_ollama') limit 1",
+        (run_id,),
+    )
+    return row is not None
+
+
+def _forget_run_memory(run_id: str) -> None:
+    """Drop per-run in-memory bookkeeping so failed runs don't leak it."""
+    _subtask_assignment_counts.pop(run_id, None)
+    with _brain_locks_guard:
+        _brain_locks.pop(run_id, None)
+
+
+def sweep_orphan_jobs() -> int:
+    """Delete working job trees for runs that are terminal (and idle) or gone.
+
+    Runs the correct safety guard — a directory is removed only when its run has
+    no active jobs — so it never races a live worktree. Also reclaims dirs whose
+    run row no longer exists (crash orphans). Returns the number removed.
+    """
+    jobs_dir = settings.jobs_dir
+    if not jobs_dir.exists():
+        return 0
+    removed = 0
+    for child in list(jobs_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        run_id = child.name
+        run = db.one("select status from runs where id=?", (run_id,))
+        if run is None:
+            if cleanup_run_jobs(run_id):
+                removed += 1
+            _forget_run_memory(run_id)
+            continue
+        if run["status"] in TERMINAL_RUN_STATES and not _has_active_jobs(run_id):
+            if cleanup_run_jobs(run_id):
+                removed += 1
+            _forget_run_memory(run_id)
+    return removed
+
+
+def _jobs_sweeper() -> None:
+    while not _jobs_sweeper_stop.is_set():
+        # Wake promptly on a terminal transition, else re-check periodically as a
+        # backstop for jobs that were still 'running' at the last pass.
+        _jobs_sweeper_wake.wait(timeout=120)
+        _jobs_sweeper_wake.clear()
+        if _jobs_sweeper_stop.is_set():
+            break
+        try:
+            sweep_orphan_jobs()
+        except Exception:
+            log.exception("jobs sweeper failed")
+
+
+def trigger_jobs_sweep() -> None:
+    _jobs_sweeper_wake.set()
+
+
+def start_jobs_sweeper() -> None:
+    global _jobs_sweeper_thread
+    if _jobs_sweeper_thread and _jobs_sweeper_thread.is_alive():
+        return
+    _jobs_sweeper_stop.clear()
+    _jobs_sweeper_thread = threading.Thread(target=_jobs_sweeper, name="ollma-jobs-sweeper", daemon=True)
+    _jobs_sweeper_thread.start()
+
+
+def stop_jobs_sweeper() -> None:
+    global _jobs_sweeper_thread
+    _jobs_sweeper_stop.set()
+    _jobs_sweeper_wake.set()
+    if _jobs_sweeper_thread:
+        _jobs_sweeper_thread.join(timeout=2)
+    _jobs_sweeper_thread = None
 
 
 def _lease_heartbeat(job_id: int, lease_owner: str, stopped: threading.Event) -> None:
@@ -695,14 +780,23 @@ def agent_task(agent: dict[str, Any], task: str) -> str:
 
 
 def update_run(run_id: str, **values: Any) -> None:
+    became_terminal = False
     if "status" in values:
         current = db.one("select status from runs where id=?", (run_id,))
         if not current:
             raise RuntimeError("Run not found")
         validate_transition(current["status"], values["status"])
+        became_terminal = (
+            values["status"] in TERMINAL_RUN_STATES and current["status"] not in TERMINAL_RUN_STATES
+        )
     values["updated_at"] = db.utcnow()
     columns = ",".join(f"{key}=?" for key in values)
     db.execute(f"update runs set {columns} where id=?", (*values.values(), run_id))
+    if became_terminal:
+        # Reclaim the run's working job tree once no jobs are active. The sweeper
+        # applies the idle guard so it never races an in-flight worktree.
+        trigger_jobs_sweep()
+        _forget_run_memory(run_id)
 
 
 def _plan_hash(plan: str) -> str:
