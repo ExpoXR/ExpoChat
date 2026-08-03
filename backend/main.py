@@ -40,8 +40,11 @@ from .orchestrator import (
     resume_run,
     rollback_run,
     start_job_queue,
+    start_jobs_sweeper,
     start_ollama_monitor,
+    stop_jobs_sweeper,
     stop_ollama_monitor,
+    sweep_orphan_jobs,
 )
 from .prompts import CAVEMAN_OUTPUT_INSTRUCTIONS
 from .security import (
@@ -311,12 +314,15 @@ async def lifespan(_: FastAPI):
     with contextlib.suppress(Exception):
         cleanup_partial_snapshots()
         cleanup_snapshots()
+        sweep_orphan_jobs()
     start_job_queue()
     start_ollama_monitor()
+    start_jobs_sweeper()
     try:
         yield
     finally:
         stop_ollama_monitor()
+        stop_jobs_sweeper()
 
 
 system_router = APIRouter()

@@ -15,7 +15,7 @@ def test_health_and_csrf_protection():
             async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
                 assert (await client.get("/livez")).status_code == 200
                 root = await client.get("/")
-                assert "Ollma UI" in root.text
+                assert "ExpoChat" in root.text
                 # Security headers present on responses.
                 assert root.headers.get("X-Frame-Options") == "DENY"
                 assert root.headers.get("X-Content-Type-Options") == "nosniff"

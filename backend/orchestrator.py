@@ -5,7 +5,7 @@ import logging
 import secrets
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -37,11 +37,11 @@ from .verification_policy import (
 from .workspace import (
     MergeConflict,
     apply_stage,
+    cleanup_run_jobs,
     create_snapshot,
     discard_snapshot,
     manifest_hash,
     merge_task_lineage,
-    merge_worktrees,
     restore_snapshot,
     stage_subtask_with_ancestors,
     stage_workspace,
@@ -59,6 +59,11 @@ _brain_locks: dict[str, threading.Lock] = {}
 _brain_locks_guard = threading.Lock()
 _ollama_monitor_stop = threading.Event()
 _ollama_monitor_thread: threading.Thread | None = None
+_jobs_sweeper_stop = threading.Event()
+_jobs_sweeper_wake = threading.Event()
+_jobs_sweeper_thread: threading.Thread | None = None
+
+TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled", "rolled_back"})
 
 
 class OllamaUnavailable(RuntimeError):
@@ -189,6 +194,85 @@ def stop_ollama_monitor() -> None:
     if _ollama_monitor_thread:
         _ollama_monitor_thread.join(timeout=2)
     _ollama_monitor_thread = None
+
+
+def _has_active_jobs(run_id: str) -> bool:
+    row = db.one(
+        "select 1 from jobs where run_id=? and status in ('running','pending','waiting_ollama') limit 1",
+        (run_id,),
+    )
+    return row is not None
+
+
+def _forget_run_memory(run_id: str) -> None:
+    """Drop per-run in-memory bookkeeping so failed runs don't leak it."""
+    _subtask_assignment_counts.pop(run_id, None)
+    with _brain_locks_guard:
+        _brain_locks.pop(run_id, None)
+
+
+def sweep_orphan_jobs() -> int:
+    """Delete working job trees for runs that are terminal (and idle) or gone.
+
+    Runs the correct safety guard — a directory is removed only when its run has
+    no active jobs — so it never races a live worktree. Also reclaims dirs whose
+    run row no longer exists (crash orphans). Returns the number removed.
+    """
+    jobs_dir = settings.jobs_dir
+    if not jobs_dir.exists():
+        return 0
+    removed = 0
+    for child in list(jobs_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        run_id = child.name
+        run = db.one("select status from runs where id=?", (run_id,))
+        if run is None:
+            if cleanup_run_jobs(run_id):
+                removed += 1
+            _forget_run_memory(run_id)
+            continue
+        if run["status"] in TERMINAL_RUN_STATES and not _has_active_jobs(run_id):
+            if cleanup_run_jobs(run_id):
+                removed += 1
+            _forget_run_memory(run_id)
+    return removed
+
+
+def _jobs_sweeper() -> None:
+    while not _jobs_sweeper_stop.is_set():
+        # Wake promptly on a terminal transition, else re-check periodically as a
+        # backstop for jobs that were still 'running' at the last pass.
+        _jobs_sweeper_wake.wait(timeout=120)
+        _jobs_sweeper_wake.clear()
+        if _jobs_sweeper_stop.is_set():
+            break
+        try:
+            sweep_orphan_jobs()
+        except Exception:
+            log.exception("jobs sweeper failed")
+
+
+def trigger_jobs_sweep() -> None:
+    _jobs_sweeper_wake.set()
+
+
+def start_jobs_sweeper() -> None:
+    global _jobs_sweeper_thread
+    if _jobs_sweeper_thread and _jobs_sweeper_thread.is_alive():
+        return
+    _jobs_sweeper_stop.clear()
+    _jobs_sweeper_thread = threading.Thread(target=_jobs_sweeper, name="ollma-jobs-sweeper", daemon=True)
+    _jobs_sweeper_thread.start()
+
+
+def stop_jobs_sweeper() -> None:
+    global _jobs_sweeper_thread
+    _jobs_sweeper_stop.set()
+    _jobs_sweeper_wake.set()
+    if _jobs_sweeper_thread:
+        _jobs_sweeper_thread.join(timeout=2)
+    _jobs_sweeper_thread = None
 
 
 def _lease_heartbeat(job_id: int, lease_owner: str, stopped: threading.Event) -> None:
@@ -695,14 +779,23 @@ def agent_task(agent: dict[str, Any], task: str) -> str:
 
 
 def update_run(run_id: str, **values: Any) -> None:
+    became_terminal = False
     if "status" in values:
         current = db.one("select status from runs where id=?", (run_id,))
         if not current:
             raise RuntimeError("Run not found")
         validate_transition(current["status"], values["status"])
+        became_terminal = (
+            values["status"] in TERMINAL_RUN_STATES and current["status"] not in TERMINAL_RUN_STATES
+        )
     values["updated_at"] = db.utcnow()
     columns = ",".join(f"{key}=?" for key in values)
     db.execute(f"update runs set {columns} where id=?", (*values.values(), run_id))
+    if became_terminal:
+        # Reclaim the run's working job tree once no jobs are active. The sweeper
+        # applies the idle guard so it never races an in-flight worktree.
+        trigger_jobs_sweep()
+        _forget_run_memory(run_id)
 
 
 def _plan_hash(plan: str) -> str:
@@ -1625,55 +1718,6 @@ def _merge_and_verify(run_id: str) -> None:
         else:
             update_run(run_id, status="failed", error=str(exc)[:4000])
         db.add_event(run_id, "run.failed", "Merge/verification workflow failed", {"error": str(exc)[:1000]})
-
-
-def execute_dag(run_id: str, base_stage: Path) -> tuple[str, set[str]]:
-    """Run a run's subtask DAG with a bounded worker pool, then merge into base_stage.
-
-    Dependency-gated: a subtask starts only when all its depends_on are done. Concurrency
-    is capped at settings.worker_pool_size (default 1 = serialized on a single GPU). Already
-    'done' subtasks are skipped so a restarted run resumes rather than repeats. Returns a
-    combined summary and the set of implementer agent ids (to exclude from verification).
-    """
-    nodes = db.subtasks(run_id)
-    status = {n["node_id"]: n["status"] for n in nodes}
-    remaining = [n for n in nodes if status.get(n["node_id"]) != "done"]
-
-    def deps_done(node: dict[str, Any]) -> bool:
-        return all(status.get(dep) == "done" for dep in json.loads(node.get("depends_on_json") or "[]"))
-
-    pool = ThreadPoolExecutor(max_workers=max(1, settings.worker_pool_size), thread_name_prefix=f"dag-{run_id[:8]}")
-    futures: dict[Any, dict[str, Any]] = {}
-    try:
-        while remaining or futures:
-            if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
-                raise RuntimeError("Run cancelled")
-            ready = [n for n in remaining if deps_done(n) and n["node_id"] not in {v["node_id"] for v in futures.values()}]
-            for node in ready:
-                remaining.remove(node)
-                futures[pool.submit(_run_subtask, run_id, node, base_stage)] = node
-            if not futures:
-                raise RuntimeError("Subtask DAG deadlocked (unsatisfiable dependencies)")
-            done, _ = wait(list(futures), return_when=FIRST_COMPLETED)
-            for future in done:
-                node = futures.pop(future)
-                future.result()  # re-raise subtask failure
-                status[node["node_id"]] = "done"
-    except Exception:
-        for future in futures:
-            future.cancel()
-        raise
-    finally:
-        pool.shutdown(wait=True)
-
-    worktrees = [(n["node_id"], settings.jobs_dir / run_id / "subtasks" / n["node_id"] / "workspace") for n in nodes]
-    merged = merge_worktrees(base_stage, worktrees)
-    save_artifact(run_id, "merge", "Merged subtask manifest", merged)
-    db.add_event(run_id, "subtasks.merged", f"Merged {merged['subtasks']} subtask worktree(s)", merged)
-    completed = db.subtasks(run_id)
-    implementer_ids = {n["agent_id"] for n in completed if n.get("agent_id")}
-    summary = "\n\n".join(f"### {n['title']}\n{n.get('result_summary') or ''}" for n in completed)
-    return summary, implementer_ids
 
 
 def implement_run(run_id: str) -> None:

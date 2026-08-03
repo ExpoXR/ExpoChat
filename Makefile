@@ -36,5 +36,4 @@ smoke:
 	curl -fsS http://127.0.0.1:31001/readyz
 
 backup:
-	mkdir -p backups
-	sqlite3 data/ollma.sqlite3 ".backup 'backups/ollma-$$(date -u +%Y%m%dT%H%M%SZ).sqlite3'"
+	bash scripts/backup.sh

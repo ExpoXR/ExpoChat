@@ -83,6 +83,22 @@ def stage_workspace(run_id: str, source: Path, destination_name: str = "workspac
     return destination
 
 
+def cleanup_run_jobs(run_id: str) -> bool:
+    """Remove a run's working job tree (jobs/<run_id>) once the run is terminal.
+
+    Each run copytrees the full target workspace into jobs/<run_id> several times
+    (base stage + per-subtask input/workspace + postcheck), so without this the
+    /jobs volume grows without bound. Snapshots live under snapshot_dir, not here,
+    so deleting the job tree never affects rollback. Best-effort; safe to call more
+    than once. Returns True if a directory was removed.
+    """
+    run_dir = settings.jobs_dir / run_id
+    if not run_dir.exists():
+        return False
+    shutil.rmtree(run_dir, ignore_errors=True)
+    return True
+
+
 def _same_path(left: Path, right: Path) -> bool:
     try:
         return left.exists() and right.exists() and os.path.samefile(left, right)
@@ -259,21 +275,6 @@ class MergeConflict(RuntimeError):
         super().__init__(f"Subtask merge conflict on: {paths}")
 
 
-def stage_subtask(run_id: str, node_id: str, base_stage: Path) -> Path:
-    """Create an isolated per-subtask worktree by copying the run's base staged tree.
-
-    Each subtask edits only its own copy under /jobs/{run_id}/subtasks/{node_id}/workspace,
-    so parallel implementers can never corrupt each other. node_id is a validated slug
-    (backend.plan_graph.NODE_ID_RE), so the path cannot escape the run directory.
-    """
-    dest = settings.jobs_dir / run_id / "subtasks" / node_id / "workspace"
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(base_stage, dest, symlinks=False, ignore=_copy_ignore)
-    return dest
-
-
 def workspace_delta(
     before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]],
 ) -> dict[str, list[str]]:
@@ -367,58 +368,6 @@ def merge_task_lineage(base_stage: Path, run_id: str, nodes: list[dict[str, Any]
         deleted.update(delta["deleted"])
         deleted.difference_update(delta["changed"])
     return {"changed": sorted(changed), "deleted": sorted(deleted), "subtasks": len(nodes)}
-
-
-def merge_worktrees(base_stage: Path, worktrees: list[tuple[str, Path]]) -> dict[str, Any]:
-    """Integrate per-subtask worktrees onto the run's base stage in dependency order.
-
-    Each worktree started as a copy of base_stage; its diff vs base_stage is that
-    subtask's edits. A conflict is when two subtasks changed the same path to different
-    content. On any conflict nothing is written and MergeConflict is raised, so the run
-    can be surfaced for re-planning. On success the merged changes are written to
-    base_stage (which the existing verify/apply pipeline then consumes unchanged).
-    """
-    base_manifest = workspace_manifest(base_stage)
-    owner: dict[str, tuple[str, str]] = {}  # rel -> (node_id, sha) of the winning write
-    conflicts: list[dict[str, Any]] = []
-    writes: dict[str, Path] = {}
-    deletes: dict[str, str] = {}
-    for node_id, worktree in worktrees:
-        if not worktree.exists():
-            continue
-        wt_manifest = workspace_manifest(worktree)
-        for rel, value in wt_manifest.items():
-            if base_manifest.get(rel) == value:
-                continue  # unchanged by this subtask
-            sha = value["sha256"]
-            if rel in owner and owner[rel][1] != sha:
-                conflicts.append({"path": rel, "nodes": [owner[rel][0], node_id]})
-                continue
-            owner[rel] = (node_id, sha)
-            writes[rel] = worktree / rel
-            deletes.pop(rel, None)
-        for rel in set(base_manifest) - set(wt_manifest):
-            if rel in owner:
-                conflicts.append({"path": rel, "nodes": [owner[rel][0], node_id]})
-                continue
-            deletes[rel] = node_id
-    if conflicts:
-        raise MergeConflict(conflicts)
-    base_root = base_stage
-    for rel, src in writes.items():
-        dst = base_root / rel
-        resolved = dst.resolve(strict=False)
-        if base_root.resolve() not in resolved.parents and resolved != base_root.resolve():
-            raise RuntimeError("Unsafe merge path")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        temp = dst.with_name(f".{dst.name}.ollma-tmp")
-        shutil.copy2(src, temp)
-        os.replace(temp, dst)
-    for rel in deletes:
-        target = base_root / rel
-        if target.is_file() or target.is_symlink():
-            target.unlink(missing_ok=True)
-    return {"changed": sorted(writes), "deleted": sorted(deletes), "subtasks": len(worktrees)}
 
 
 def cleanup_snapshots(days: int | None = None, dry_run: bool = False) -> int:

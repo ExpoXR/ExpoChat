@@ -313,8 +313,19 @@ def apply_migrations(db: sqlite3.Connection) -> None:
     for version, migration in MIGRATIONS:
         if version in applied:
             continue
-        migration(db)
-        db.execute(
-            "insert into schema_migrations(version,applied_at) values(?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            (version,),
-        )
+        # Each migration + its schema_migrations row is atomic: a mid-migration
+        # failure rolls the savepoint back so the DB never records a half-applied
+        # version (the enclosing init_db transaction commits the whole batch).
+        savepoint = f"migration_{version}"
+        db.execute(f"savepoint {savepoint}")
+        try:
+            migration(db)
+            db.execute(
+                "insert into schema_migrations(version,applied_at) values(?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                (version,),
+            )
+        except Exception:
+            db.execute(f"rollback to savepoint {savepoint}")
+            db.execute(f"release savepoint {savepoint}")
+            raise
+        db.execute(f"release savepoint {savepoint}")
