@@ -83,6 +83,22 @@ def stage_workspace(run_id: str, source: Path, destination_name: str = "workspac
     return destination
 
 
+def cleanup_run_jobs(run_id: str) -> bool:
+    """Remove a run's working job tree (jobs/<run_id>) once the run is terminal.
+
+    Each run copytrees the full target workspace into jobs/<run_id> several times
+    (base stage + per-subtask input/workspace + postcheck), so without this the
+    /jobs volume grows without bound. Snapshots live under snapshot_dir, not here,
+    so deleting the job tree never affects rollback. Best-effort; safe to call more
+    than once. Returns True if a directory was removed.
+    """
+    run_dir = settings.jobs_dir / run_id
+    if not run_dir.exists():
+        return False
+    shutil.rmtree(run_dir, ignore_errors=True)
+    return True
+
+
 def _same_path(left: Path, right: Path) -> bool:
     try:
         return left.exists() and right.exists() and os.path.samefile(left, right)
