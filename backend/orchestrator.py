@@ -50,6 +50,7 @@ from .workspace import (
 )
 
 log = logging.getLogger("ollma.orchestrator")
+BRAIN_CALL_ATTEMPTS = 3
 _queue_workers = max(settings.runner_concurrency, settings.worker_pool_size)
 executor = ThreadPoolExecutor(max_workers=_queue_workers, thread_name_prefix="ollma-runner")
 _run_lock = threading.RLock()
@@ -479,25 +480,40 @@ def call_brain_result(
     if max_output > 0:
         payload["max_output_tokens"] = max_output
     payload["timeout"] = timeout
-    try:
-        with httpx.Client(timeout=timeout + 10) as client:
-            response = client.post(
-                settings.brain_url + "/execute",
-                headers={"X-Worker-Token": settings.worker_token},
-                json=payload,
-            )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"Brain service unavailable: {exc}") from exc
-    if response.status_code != 200:
+    # The brain call is the single most critical dependency (plan/decompose/verdict
+    # /subtask-verify all funnel here); a lone transient blip must not kill a run.
+    # Retry network errors, timeouts, 429 and 5xx with exponential backoff; fail
+    # fast on 4xx (auth/bad request) and never mask budget errors (raised above).
+    attempts = BRAIN_CALL_ATTEMPTS
+    for attempt in range(attempts):
+        last = attempt + 1 >= attempts
+        try:
+            with httpx.Client(timeout=timeout + 10) as client:
+                response = client.post(
+                    settings.brain_url + "/execute",
+                    headers={"X-Worker-Token": settings.worker_token},
+                    json=payload,
+                )
+        except httpx.HTTPError as exc:
+            if last:
+                raise RuntimeError(f"Brain service unavailable: {exc}") from exc
+            time.sleep(1 << attempt)
+            continue
+        if response.status_code == 200:
+            data = response.json()
+            return {"content": str(data["content"]), "usage": data.get("usage") or {}}
         try:
             detail = response.json().get("detail")
         except Exception:
             detail = None
+        retryable = response.status_code == 429 or response.status_code >= 500
+        if retryable and not last:
+            time.sleep(1 << attempt)
+            continue
         if detail:
             raise RuntimeError(str(detail))
         raise RuntimeError(f"Brain service failed with HTTP {response.status_code}")
-    data = response.json()
-    return {"content": str(data["content"]), "usage": data.get("usage") or {}}
+    raise RuntimeError("Brain service unavailable")
 
 
 def call_brain(provider: str, prompt: str, allow_web: bool = False, timeout: int = 900) -> str:
@@ -681,7 +697,11 @@ def choose_agent(role: str, exclude: set[str] | None = None, discover: bool = Tr
 
 
 # In-memory round-robin counters per run for distributing work across equally-scored agents.
+# Guarded by _assignment_lock: with worker_pool_size>1, multiple drainer threads may
+# schedule subtasks for the same run concurrently. A dedicated lock (not _queue_lock)
+# avoids any reentrancy with the enqueue path that calls choose_subtask_agent.
 _subtask_assignment_counts: dict[str, dict[str, int]] = {}
+_assignment_lock = threading.Lock()
 
 
 def choose_subtask_agent(
@@ -720,23 +740,24 @@ def choose_subtask_agent(
     if not run_id:
         return candidates[0][-1]
     if run_id:
-        counts = _subtask_assignment_counts.setdefault(run_id, {})
-        for row in db.all_rows(
-            "select agent_id,count(*) as assignments from subtasks "
-            "where run_id=? and agent_id is not null group by agent_id",
-            (run_id,),
-        ):
-            counts[row["agent_id"]] = max(counts.get(row["agent_id"], 0), int(row["assignments"]))
-        chosen = min(
-            enumerate(candidates),
-            key=lambda item: (
-                counts.get(item[1][-1]["id"], 0),
-                0 if suggested_agent and item[1][-1]["id"] == suggested_agent["id"] else 1,
-                item[0],
-            ),
-        )[1][-1]
-        counts[chosen["id"]] = counts.get(chosen["id"], 0) + 1
-        return chosen
+        with _assignment_lock:
+            counts = _subtask_assignment_counts.setdefault(run_id, {})
+            for row in db.all_rows(
+                "select agent_id,count(*) as assignments from subtasks "
+                "where run_id=? and agent_id is not null group by agent_id",
+                (run_id,),
+            ):
+                counts[row["agent_id"]] = max(counts.get(row["agent_id"], 0), int(row["assignments"]))
+            chosen = min(
+                enumerate(candidates),
+                key=lambda item: (
+                    counts.get(item[1][-1]["id"], 0),
+                    0 if suggested_agent and item[1][-1]["id"] == suggested_agent["id"] else 1,
+                    item[0],
+                ),
+            )[1][-1]
+            counts[chosen["id"]] = counts.get(chosen["id"], 0) + 1
+            return chosen
     return candidates[0][-1]
 
 

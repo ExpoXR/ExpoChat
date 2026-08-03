@@ -566,7 +566,7 @@ def save_brain(body: BrainBody, _: dict = Depends(require_user)):
 
 @config_router.post("/api/brains/{provider}/validate")
 def validate_brain(provider: str, _: dict = Depends(require_user)):
-    if provider not in {"codex", "claude"}:
+    if provider not in {"codex", "claude", "gemini"}:
         raise HTTPException(404, "Unknown provider")
     try:
         content = call_brain(provider, "Reply with exactly: OK", False, timeout=300)
@@ -732,8 +732,12 @@ async def run_events(run_id: str, request: Request, after: int = Query(default=0
     async def stream() -> AsyncIterator[str]:
         nonlocal cursor
         idle = 0
+        # SQLite is synchronous; run every query in a worker thread so many
+        # concurrent SSE viewers never block the single asyncio event loop.
         while not await request.is_disconnected():
-            rows = db.all_rows("select * from run_events where run_id=? and id>? order by id", (run_id, cursor))
+            rows = await asyncio.to_thread(
+                db.all_rows, "select * from run_events where run_id=? and id>? order by id", (run_id, cursor)
+            )
             if rows:
                 idle = 0
                 for row in rows:
@@ -743,11 +747,14 @@ async def run_events(run_id: str, request: Request, after: int = Query(default=0
                 idle += 1
                 if idle % 15 == 0:
                     yield ": keepalive\n\n"
-            run = db.one("select status from runs where id=?", (run_id,))
+            run = await asyncio.to_thread(db.one, "select status from runs where id=?", (run_id,))
             if run and run["status"] in TERMINAL_STATES and not rows:
                 # Final drain: an event may have landed after the last query and
                 # before this terminal-status read; deliver it before closing.
-                for row in db.all_rows("select * from run_events where run_id=? and id>? order by id", (run_id, cursor)):
+                drain = await asyncio.to_thread(
+                    db.all_rows, "select * from run_events where run_id=? and id>? order by id", (run_id, cursor)
+                )
+                for row in drain:
                     cursor = row["id"]
                     yield f"id: {cursor}\nevent: {row['event_type']}\ndata: {json.dumps(row, ensure_ascii=False)}\n\n"
                 break

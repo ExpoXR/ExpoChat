@@ -1238,11 +1238,11 @@ def test_parse_verdict_typed_result():
     assert v.repair_task == "fix it"
     assert v.scope_expansion is True
 
-    # Fallback: no JSON, string-sniff
+    # Fail-closed: prose that merely mentions the field is NOT a pass.
     raw_pass = 'Here is the verdict: "passed":true somewhere'
     v = brain_io.parse_verdict(raw_pass)
-    assert v.passed is True
-    assert v.verdict == raw_pass  # raw text preserved
+    assert v.passed is False
+    assert v.verdict == raw_pass  # raw text preserved for diagnostics
 
     raw_fail = "The implementation has bugs."
     v = brain_io.parse_verdict(raw_fail)
@@ -2276,3 +2276,113 @@ def test_migration_savepoint_rolls_back_on_failure():
         assert applied == {1}               # no half-applied version recorded
     finally:
         conn.close()
+
+
+# --- PR2: LLM resilience & orchestrator correctness ------------------------
+
+class _FakeResp:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    def __init__(self, script):
+        self._script = script
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def post(self, *args, **kwargs):
+        action, value = self._script.pop(0)
+        if action == "raise":
+            raise value
+        return value
+
+
+def _patch_brain(monkeypatch, script):
+    import httpx
+    monkeypatch.setattr(orchestrator, "check_budget", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "provider_config", lambda provider: ("key", "model"))
+    monkeypatch.setattr(orchestrator.db, "get_setting_int", lambda key: 0)
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator.httpx, "Client", lambda *a, **k: _FakeClient(script))
+    return httpx
+
+
+def test_brain_call_retries_transient_then_succeeds(monkeypatch):
+    import httpx
+    script = [
+        ("raise", httpx.ConnectError("boom")),
+        ("resp", _FakeResp(200, {"content": "ok", "usage": {}})),
+    ]
+    _patch_brain(monkeypatch, script)
+    result = orchestrator.call_brain_result("codex", "prompt")
+    assert result["content"] == "ok"
+    assert script == []  # both scripted steps consumed
+
+
+def test_brain_call_retries_5xx_then_succeeds(monkeypatch):
+    script = [
+        ("resp", _FakeResp(503, {"detail": "unavailable"})),
+        ("resp", _FakeResp(200, {"content": "recovered", "usage": {}})),
+    ]
+    _patch_brain(monkeypatch, script)
+    assert orchestrator.call_brain_result("codex", "prompt")["content"] == "recovered"
+    assert script == []
+
+
+def test_brain_call_does_not_retry_4xx(monkeypatch):
+    script = [
+        ("resp", _FakeResp(400, {"detail": "bad request"})),
+        ("resp", _FakeResp(200, {"content": "should-not-reach"})),
+    ]
+    _patch_brain(monkeypatch, script)
+    with pytest.raises(RuntimeError, match="bad request"):
+        orchestrator.call_brain_result("codex", "prompt")
+    assert len(script) == 1  # the success step was never consumed
+
+
+def test_verdict_parsing_fails_closed():
+    # Valid JSON pass is honored.
+    assert brain_io.parse_verdict('{"passed": true, "verdict": "ok"}').passed is True
+    # Garbage / prose that merely mentions the field must NOT be read as a pass.
+    assert brain_io.parse_verdict("total nonsense, no json here").passed is False
+    assert brain_io.parse_verdict('the field "passed": true was discussed').passed is False
+
+
+def test_subtask_verdict_parsing_fails_closed():
+    assert brain_io.parse_subtask_verdict('{"passed": true, "issues": ""}').passed is True
+    assert brain_io.parse_subtask_verdict("no structured verdict").passed is False
+
+
+def test_apply_gate_scopes_to_latest_workspace_state():
+    clear_workflow_tables()
+    run_id = secrets.token_hex(12)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)",
+        (run_id, "gate", "codex", str(WORKSPACES), "verifying", now, now),
+    )
+    # Stale failure from an earlier attempt (older workspace hash).
+    record_check_evidence(run_id, 0, "pytest", [], 1, "old failure", 10, "HASH_OLD")
+    # Current post-edit state (newer hash) — all passing.
+    record_check_evidence(run_id, 0, "ruff", [], 0, "clean", 5, "HASH_NEW")
+    record_check_evidence(run_id, 0, "pytest", [], 0, "green", 8, "HASH_NEW")
+
+    gate = evaluate_apply_gate(run_id, brain_passed=True)
+    assert gate.allowed is True
+    assert gate.pass_count == 2
+    assert gate.fail_after_edit_count == 0  # stale HASH_OLD failure excluded
+
+    # A failure in the current state still blocks.
+    record_check_evidence(run_id, 0, "pytest", [], 1, "new failure", 8, "HASH_NEWER")
+    blocked = evaluate_apply_gate(run_id, brain_passed=True)
+    assert blocked.allowed is False
