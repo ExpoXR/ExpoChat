@@ -14,7 +14,7 @@ def test_health_and_csrf_protection():
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
                 assert (await client.get("/livez")).status_code == 200
-                assert "Ollma UI" in (await client.get("/")).text
+                assert "ExpoChat" in (await client.get("/")).text
                 assert (await client.get("/internal/ollama/api/version")).status_code == 401
                 login = await client.post("/api/auth/login", json={"username": "tester", "password": "correct-horse-battery-staple"})
                 assert login.status_code == 200

@@ -2,7 +2,7 @@ export function runStatusLabel(run) {
   return (run.status || "unknown").replaceAll("_", " ");
 }
 
-export function runEventData(event) {
+function runEventData(event) {
   if (event?.data && typeof event.data === "object") return event.data;
   if (!event?.data_json) return {};
   try { return JSON.parse(event.data_json); } catch (_) { return {}; }

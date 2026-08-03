@@ -1015,50 +1015,6 @@ def test_two_subtask_jobs_can_be_active_but_types_stay_singleton():
         )
 
 
-def _make_base_stage(run_id: str, name: str) -> Path:
-    target = WORKSPACES / name
-    target.mkdir(exist_ok=True)
-    (target / "base.txt").write_text("base\n")
-    return stage_workspace(run_id, target)
-
-
-def test_stage_subtask_isolates_worktrees():
-    run_id = "h" * 24
-    base = _make_base_stage(run_id, "dag-iso-target")
-    wt_a = workspace.stage_subtask(run_id, "a", base)
-    wt_b = workspace.stage_subtask(run_id, "b", base)
-    (wt_a / "only_a.txt").write_text("a\n")
-    assert (wt_a / "base.txt").read_text() == "base\n"
-    assert not (wt_b / "only_a.txt").exists()  # b's worktree is unaffected
-    assert not (base / "only_a.txt").exists()  # base stage is unaffected
-
-
-def test_merge_worktrees_applies_disjoint_changes():
-    run_id = "i" * 24
-    base = _make_base_stage(run_id, "dag-merge-target")
-    wt_a = workspace.stage_subtask(run_id, "a", base)
-    wt_b = workspace.stage_subtask(run_id, "b", base)
-    (wt_a / "a.txt").write_text("from a\n")
-    (wt_b / "b.txt").write_text("from b\n")
-    merged = workspace.merge_worktrees(base, [("a", wt_a), ("b", wt_b)])
-    assert sorted(merged["changed"]) == ["a.txt", "b.txt"]
-    assert (base / "a.txt").read_text() == "from a\n"
-    assert (base / "b.txt").read_text() == "from b\n"
-
-
-def test_merge_worktrees_raises_on_conflict_without_writing():
-    run_id = "j" * 24
-    base = _make_base_stage(run_id, "dag-conflict-target")
-    wt_a = workspace.stage_subtask(run_id, "a", base)
-    wt_b = workspace.stage_subtask(run_id, "b", base)
-    (wt_a / "shared.txt").write_text("a wins\n")
-    (wt_b / "shared.txt").write_text("b wins\n")
-    with pytest.raises(workspace.MergeConflict) as info:
-        workspace.merge_worktrees(base, [("a", wt_a), ("b", wt_b)])
-    assert info.value.conflicts[0]["path"] == "shared.txt"
-    assert not (base / "shared.txt").exists()  # nothing written on conflict
-
-
 def test_lineage_accepts_an_empty_workspace_manifest():
     run_id = "empty-" + secrets.token_hex(6)
     target = WORKSPACES / run_id
@@ -1084,49 +1040,6 @@ def test_lineage_accepts_an_empty_workspace_manifest():
     )
     assert not (resumed / "partial.txt").exists()
     assert (resumed / "created.txt").read_text() == "created\n"
-
-
-def test_execute_dag_runs_subtasks_and_merges(monkeypatch):
-    clear_workflow_tables()
-    run_id = "k" * 24
-    now = db.utcnow()
-    db.execute(
-        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
-        (run_id, "DAG execute", "codex", str(WORKSPACES), "implementing", now, now),
-    )
-    base = _make_base_stage(run_id, "dag-exec-target")
-    nodes = plan_graph.validate_graph({"subtasks": [
-        {"node_id": "a", "spec": "make a", "file_globs": ["a.txt"]},
-        {"node_id": "b", "spec": "make b", "depends_on": ["a"], "file_globs": ["b.txt"]},
-    ]})
-    db.insert_subtasks(run_id, nodes)
-    worker_prompts = {}
-
-    def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24, node_id=None):
-        node = Path(workspace).parts[1] if workspace.startswith("subtasks/") else "main"
-        worker_prompts[node] = task
-        if node == "b":
-            assert (orchestrator.settings.jobs_dir / rid / workspace / "a.txt").read_text() == "from a\n"
-        (orchestrator.settings.jobs_dir / rid / workspace / f"{node}.txt").write_text(f"from {node}\n")
-        return {"ok": True, "content": f"did {node}", "usage": {}}
-
-    monkeypatch.setattr(orchestrator, "worker_call", fake_worker_call)
-    monkeypatch.setattr(orchestrator, "choose_agent", lambda *a, **k: {"id": "impl", "model": "m", "name": "Impl"})
-    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
-    monkeypatch.setattr(
-        orchestrator,
-        "call_brain_with_memory",
-        lambda *a, **k: {"content": '{"passed":true,"issues":"","handoff":{"summary":"done"}}', "usage": {}},
-    )
-
-    summary, implementer_ids = orchestrator.execute_dag(run_id, base)
-    assert (base / "a.txt").read_text() == "from a\n"
-    assert (base / "b.txt").read_text() == "from b\n"
-    assert implementer_ids == {"impl"}
-    assert "did a" in summary and "did b" in summary
-    assert "DEPENDENCY a" in worker_prompts["b"]
-    assert '"summary": "done"' in worker_prompts["b"]
-    assert all(row["status"] == "done" for row in db.subtasks(run_id))
 
 
 def test_worker_activity_records_safe_live_file_states():
@@ -1529,58 +1442,6 @@ def test_validate_graph_passes_through_suggested_model():
     assert nodes[0]["suggested_model"] == "qwen3-coder"
     assert nodes[1]["suggested_model"] is None
     assert nodes[2]["suggested_model"] is None
-
-
-def test_execute_dag_uses_subtask_role(monkeypatch):
-    """Integration: DAG execution uses per-subtask agent selection with mixed roles."""
-    clear_workflow_tables()
-    orchestrator._subtask_assignment_counts.clear()
-    run_id = "d" * 24
-    now = db.utcnow()
-    db.execute(
-        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) values(?,?,?,?,?,?,?)",
-        (run_id, "Mixed role DAG", "codex", str(WORKSPACES), "implementing", now, now),
-    )
-    base = _make_base_stage(run_id, "dag-role-target")
-    nodes = plan_graph.validate_graph({"subtasks": [
-        {"node_id": "research-step", "spec": "research first", "role": "research", "file_globs": ["r.txt"]},
-        {"node_id": "impl-step", "spec": "implement it", "depends_on": ["research-step"], "file_globs": ["i.txt"]},
-    ]})
-    db.insert_subtasks(run_id, nodes)
-    seed_agent("res-agent", "res-model", ["research"], [], 80)
-    seed_agent("impl-agent", "impl-model", ["implementation"], ["tools"], 80)
-
-    chosen_agents = []
-
-    def fake_choose_subtask(node, exclude=None, run_id=None):
-        role = node.get("role", "implementation")
-        if role == "research":
-            agent = {"id": "res-agent", "model": "res-model", "name": "ResAgent"}
-        else:
-            agent = {"id": "impl-agent", "model": "impl-model", "name": "ImplAgent"}
-        chosen_agents.append((node["node_id"], agent["id"]))
-        return agent
-
-    def fake_worker_call(rid, model, mode, task, workspace="workspace", max_turns=24, node_id=None):
-        node = Path(workspace).parts[1] if workspace.startswith("subtasks/") else "main"
-        (orchestrator.settings.jobs_dir / rid / workspace / f"{node}.txt").write_text(f"from {node}\n")
-        return {"ok": True, "content": f"did {node}", "usage": {}}
-
-    monkeypatch.setattr(orchestrator, "choose_subtask_agent", fake_choose_subtask)
-    monkeypatch.setattr(orchestrator, "worker_call", fake_worker_call)
-    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
-    monkeypatch.setattr(
-        orchestrator,
-        "call_brain_with_memory",
-        lambda *a, **k: {"content": '{"passed":true,"issues":"","handoff":{"summary":"done"}}', "usage": {}},
-    )
-
-    summary, implementer_ids = orchestrator.execute_dag(run_id, base)
-    # Research subtask should have been assigned res-agent
-    assert ("research-step", "res-agent") in chosen_agents
-    # Implementation subtask should have been assigned impl-agent
-    assert ("impl-step", "impl-agent") in chosen_agents
-    orchestrator._subtask_assignment_counts.clear()
 
 
 def test_migration_10_creates_brain_memory_table():
@@ -2116,6 +1977,156 @@ def test_qualifying_checks_list_structure():
         assert "command" in check
         assert "args" in check
         assert isinstance(check["args"], list)
+
+
+# --- PR5: coverage for high-risk paths --------------------------------------
+
+def _node_worktree(run_id: str, node_id: str) -> Path:
+    wt = orchestrator.settings.jobs_dir / run_id / "subtasks" / node_id / "workspace"
+    wt.mkdir(parents=True, exist_ok=True)
+    return wt
+
+
+def test_merge_task_lineage_raises_on_divergent_edits():
+    run_id = "lineage-" + secrets.token_hex(6)
+    target = WORKSPACES / f"lineage-{secrets.token_hex(4)}"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "shared.txt").write_text("base\n")
+    base_stage = workspace.stage_workspace(run_id, target)
+    base_manifest = workspace.workspace_manifest(base_stage)
+    nodes = []
+    for node_id, content in (("a", "from-a\n"), ("b", "from-b\n")):
+        (_node_worktree(run_id, node_id) / "shared.txt").write_text(content)
+        nodes.append({"node_id": node_id, "input_manifest_json": json.dumps(base_manifest)})
+    with pytest.raises(workspace.MergeConflict):
+        workspace.merge_task_lineage(base_stage, run_id, nodes)
+
+
+def test_merge_task_lineage_applies_disjoint_edits():
+    run_id = "lineage2-" + secrets.token_hex(6)
+    target = WORKSPACES / f"lineage2-{secrets.token_hex(4)}"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "base.txt").write_text("base\n")
+    base_stage = workspace.stage_workspace(run_id, target)
+    base_manifest = workspace.workspace_manifest(base_stage)
+    nodes = []
+    for node_id, fname in (("a", "a.txt"), ("b", "b.txt")):
+        wt = _node_worktree(run_id, node_id)
+        (wt / "base.txt").write_text("base\n")
+        (wt / fname).write_text(f"from {node_id}\n")
+        nodes.append({"node_id": node_id, "input_manifest_json": json.dumps(base_manifest)})
+    merged = workspace.merge_task_lineage(base_stage, run_id, nodes)
+    assert sorted(merged["changed"]) == ["a.txt", "b.txt"]
+    assert (base_stage / "a.txt").read_text() == "from a\n"
+    assert (base_stage / "b.txt").read_text() == "from b\n"
+
+
+def test_snapshot_restore_roundtrip():
+    target = WORKSPACES / f"snaproundtrip-{secrets.token_hex(4)}"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "f.txt").write_text("v1")
+    snap = workspace.create_snapshot(target)
+    (target / "f.txt").write_text("v2")
+    (target / "new.txt").write_text("added after snapshot")
+    workspace.restore_snapshot(snap["id"])
+    assert (target / "f.txt").read_text() == "v1"          # reverted
+    assert not (target / "new.txt").exists()               # post-snapshot file removed
+
+
+def test_init_db_recovers_interrupted_runs_and_jobs():
+    clear_workflow_tables()
+    run_id = secrets.token_hex(12)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)",
+        (run_id, "interrupted", "codex", str(WORKSPACES), "applying", now, now),
+    )
+    db.execute(
+        "insert into jobs(run_id,job_type,status,lease_owner,created_at,updated_at) values(?,?,?,?,?,?)",
+        (run_id, "implementation", "running", "worker-1", now, now),
+    )
+    db.execute(
+        "insert into subtasks(id,run_id,node_id,title,spec,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?)",
+        (secrets.token_hex(8), run_id, "n1", "t", "s", "running", now, now),
+    )
+
+    db.init_db()  # simulates a restart
+
+    assert db.one("select status from runs where id=?", (run_id,))["status"] == "failed"
+    assert "Interrupted" in (db.one("select error from runs where id=?", (run_id,))["error"] or "")
+    # An interrupted apply is not silently re-run: its job is failed (manual resume
+    # required), while the running subtask is reset to pending for safe re-execution.
+    assert db.one("select status from jobs where run_id=?", (run_id,))["status"] == "failed"
+    assert db.one("select status from subtasks where run_id=?", (run_id,))["status"] == "pending"
+
+
+def test_apply_migrations_is_idempotent():
+    from backend.migrations import MIGRATIONS, apply_migrations
+
+    expected = {version for version, _ in MIGRATIONS}
+    with db.connect() as conn:
+        before = {row[0] for row in conn.execute("select version from schema_migrations")}
+        apply_migrations(conn)  # re-run against an already-migrated DB
+        after = {row[0] for row in conn.execute("select version from schema_migrations")}
+        conn.commit()
+    assert before == after == expected
+
+
+def _seed_verifiers():
+    seed_agent("verf-1", "vmodel-1", ["verification"], [], 80)
+    seed_agent("verf-2", "vmodel-2", ["verification"], [], 70)
+
+
+def test_verify_and_apply_scope_expansion_requeues_decompose(monkeypatch):
+    clear_workflow_tables()
+    _seed_verifiers()
+    run_id = secrets.token_hex(12)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,approved_plan,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?)",
+        (run_id, "scope run", "codex", str(WORKSPACES), "implementing", "PLAN", now, now),
+    )
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "worker_call", lambda *a, **k: {"ok": True, "content": "FAIL", "usage": {}})
+    monkeypatch.setattr(
+        orchestrator, "brain_verdict",
+        lambda *a, **k: (False, json.dumps({"passed": False, "scope_expansion": True, "repair_task": "widen"})),
+    )
+
+    orchestrator._verify_and_apply(run_id, "summary", set(), {"id": "impl", "model": "m", "name": "Impl"})
+
+    assert db.one("select status from runs where id=?", (run_id,))["status"] == "decomposing"
+    job = db.one("select * from jobs where run_id=? and job_type='decompose'", (run_id,))
+    assert job is not None
+
+
+def test_verify_and_apply_fails_after_two_repair_cycles(monkeypatch):
+    clear_workflow_tables()
+    _seed_verifiers()
+    run_id = secrets.token_hex(12)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,approved_plan,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?)",
+        (run_id, "fail run", "codex", str(WORKSPACES), "implementing", "PLAN", now, now),
+    )
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "worker_call", lambda *a, **k: {"ok": True, "content": "FAIL", "usage": {}})
+    monkeypatch.setattr(
+        orchestrator, "brain_verdict",
+        lambda *a, **k: (False, json.dumps({"passed": False, "scope_expansion": False, "repair_task": "fix"})),
+    )
+
+    orchestrator._verify_and_apply(run_id, "summary", set(), {"id": "impl", "model": "m", "name": "Impl"})
+
+    run = db.one("select status,error from runs where id=?", (run_id,))
+    assert run["status"] == "failed"
+    assert "two repair cycles" in (run["error"] or "")
 
 
 # --- PR2: LLM resilience & orchestrator correctness ------------------------
