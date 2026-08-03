@@ -5,7 +5,7 @@ import logging
 import secrets
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -41,7 +41,6 @@ from .workspace import (
     discard_snapshot,
     manifest_hash,
     merge_task_lineage,
-    merge_worktrees,
     restore_snapshot,
     stage_subtask_with_ancestors,
     stage_workspace,
@@ -1625,55 +1624,6 @@ def _merge_and_verify(run_id: str) -> None:
         else:
             update_run(run_id, status="failed", error=str(exc)[:4000])
         db.add_event(run_id, "run.failed", "Merge/verification workflow failed", {"error": str(exc)[:1000]})
-
-
-def execute_dag(run_id: str, base_stage: Path) -> tuple[str, set[str]]:
-    """Run a run's subtask DAG with a bounded worker pool, then merge into base_stage.
-
-    Dependency-gated: a subtask starts only when all its depends_on are done. Concurrency
-    is capped at settings.worker_pool_size (default 1 = serialized on a single GPU). Already
-    'done' subtasks are skipped so a restarted run resumes rather than repeats. Returns a
-    combined summary and the set of implementer agent ids (to exclude from verification).
-    """
-    nodes = db.subtasks(run_id)
-    status = {n["node_id"]: n["status"] for n in nodes}
-    remaining = [n for n in nodes if status.get(n["node_id"]) != "done"]
-
-    def deps_done(node: dict[str, Any]) -> bool:
-        return all(status.get(dep) == "done" for dep in json.loads(node.get("depends_on_json") or "[]"))
-
-    pool = ThreadPoolExecutor(max_workers=max(1, settings.worker_pool_size), thread_name_prefix=f"dag-{run_id[:8]}")
-    futures: dict[Any, dict[str, Any]] = {}
-    try:
-        while remaining or futures:
-            if (db.one("select status from runs where id=?", (run_id,)) or {}).get("status") == "cancelled":
-                raise RuntimeError("Run cancelled")
-            ready = [n for n in remaining if deps_done(n) and n["node_id"] not in {v["node_id"] for v in futures.values()}]
-            for node in ready:
-                remaining.remove(node)
-                futures[pool.submit(_run_subtask, run_id, node, base_stage)] = node
-            if not futures:
-                raise RuntimeError("Subtask DAG deadlocked (unsatisfiable dependencies)")
-            done, _ = wait(list(futures), return_when=FIRST_COMPLETED)
-            for future in done:
-                node = futures.pop(future)
-                future.result()  # re-raise subtask failure
-                status[node["node_id"]] = "done"
-    except Exception:
-        for future in futures:
-            future.cancel()
-        raise
-    finally:
-        pool.shutdown(wait=True)
-
-    worktrees = [(n["node_id"], settings.jobs_dir / run_id / "subtasks" / n["node_id"] / "workspace") for n in nodes]
-    merged = merge_worktrees(base_stage, worktrees)
-    save_artifact(run_id, "merge", "Merged subtask manifest", merged)
-    db.add_event(run_id, "subtasks.merged", f"Merged {merged['subtasks']} subtask worktree(s)", merged)
-    completed = db.subtasks(run_id)
-    implementer_ids = {n["agent_id"] for n in completed if n.get("agent_id")}
-    summary = "\n\n".join(f"### {n['title']}\n{n.get('result_summary') or ''}" for n in completed)
-    return summary, implementer_ids
 
 
 def implement_run(run_id: str) -> None:
