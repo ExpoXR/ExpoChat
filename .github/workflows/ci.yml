@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Lint + Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Ruff
+        run: ruff check app.py backend tests
+      - name: Pytest
+        run: python -m pytest -q
+      - name: Dependency audit (advisory)
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt -r requirements-worker.txt -r requirements-brain.txt || true
+        continue-on-error: true
+
+  frontend:
+    name: Frontend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Node unit tests
+        run: node --test tests/js/*.test.js tests/js/*.test.mjs

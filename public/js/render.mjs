@@ -41,8 +41,19 @@ export function formatLocalDateTime(value) {
   return `${day} ${formatLocalTime(value)}`;
 }
 
+// Hardened, dependency-free markdown → HTML.
+// SECURITY INVARIANT: the full input is escapeHtml()'d before any transform, and
+// this renderer emits NO links, href, src, or raw HTML sinks — so model output can
+// never inject active content. Do not add link/image/raw-HTML support without a
+// real sanitizer. Input is length-bounded to cap regex backtracking (ReDoS) on
+// pathological model output.
+const MARKDOWN_MAX_CHARS = 100_000;
+
 export function renderMarkdown(value) {
   let text = String(value);
+  if (text.length > MARKDOWN_MAX_CHARS) {
+    text = `${text.slice(0, MARKDOWN_MAX_CHARS)}\n\n… (truncated)`;
+  }
   const codeBlocks = [];
   let codeMarker = "\x00OLLMA_CODE_";
   while (text.includes(codeMarker)) codeMarker += "_";

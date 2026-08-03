@@ -43,6 +43,16 @@ export function buildSettingsPayload(values = {}) {
   return payload;
 }
 
+// Clamp an agent priority field to the server's accepted range, tolerating blank
+// or non-numeric input (which would otherwise serialize to null and corrupt the
+// profile). Returns fallback when the field is empty/invalid.
+export function clampPriority(value, { min = 0, max = 1000, fallback = 50 } = {}) {
+  if (value === "" || value === null || value === undefined) return fallback;
+  const n = Math.trunc(Number(value));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
 // Given /api/usage, compute a meter for today's paid usage vs the daily cap.
 export function usageMeter(usage = {}) {
   const used = Number(usage?.paid_today?.total ?? 0) || 0;

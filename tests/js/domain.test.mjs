@@ -4,7 +4,7 @@ import test from "node:test";
 import { buildChatPayload, chatAgentStep, chatEventStatus, cloudEngineValue, isCloudEngine } from "../../public/js/chat.mjs";
 import { artifactPresentation, explorerActivityState, fileActivity, runChoreography, runStatusLabel, tokenCounts } from "../../public/js/runs.mjs";
 import { BRAIN_MODELS, modelLabel, modelOptions, providerOptions } from "../../public/js/settings.mjs";
-import { buildSettingsPayload, usageMeter } from "../../public/js/settings_api.mjs";
+import { buildSettingsPayload, clampPriority, usageMeter } from "../../public/js/settings_api.mjs";
 import { readPreferences, writePreferences } from "../../public/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "../../public/js/workspace.mjs";
 import { baseName, duplicateName, joinPath, parentDir, pasteTarget } from "../../public/js/fsops.mjs";
@@ -172,4 +172,13 @@ test("settings payload building and usage meter are pure and clamped", () => {
   const over = usageMeter({ paid_today: { total: 1200 }, budgets: { daily: 1000 } });
   assert.equal(over.over, true);
   assert.equal(over.pct, 100);
+});
+
+test("clampPriority tolerates blank/invalid and clamps to range", () => {
+  assert.equal(clampPriority(""), 50);            // blank → fallback
+  assert.equal(clampPriority("abc"), 50);         // non-numeric → fallback
+  assert.equal(clampPriority("", { fallback: 70 }), 70);
+  assert.equal(clampPriority("250"), 250);        // valid numeric string
+  assert.equal(clampPriority(5000), 1000);        // above max
+  assert.equal(clampPriority(-5), 0);             // below min
 });

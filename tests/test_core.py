@@ -1979,6 +1979,41 @@ def test_qualifying_checks_list_structure():
         assert isinstance(check["args"], list)
 
 
+# --- PR4: password policy ---------------------------------------------------
+
+def test_password_argon2_hash_is_honored(monkeypatch):
+    import dataclasses
+
+    from argon2 import PasswordHasher
+
+    from backend import security
+
+    digest = PasswordHasher().hash("s3cret-pass")
+    patched = dataclasses.replace(security.settings, admin_password_hash=digest)
+    monkeypatch.setattr(security, "settings", patched)
+    assert security.verify_password("s3cret-pass") is True
+    assert security.verify_password("wrong") is False
+
+
+def test_password_plaintext_denied_without_insecure_flag(monkeypatch):
+    import dataclasses
+
+    from backend import security
+
+    # No argon2 hash + insecure fallback disabled -> login is refused outright.
+    denied = dataclasses.replace(
+        security.settings, admin_password_hash="", admin_password="hunter2", allow_insecure_password=False,
+    )
+    monkeypatch.setattr(security, "settings", denied)
+    assert security.verify_password("hunter2") is False
+
+    # Explicit dev opt-in -> plaintext compare works again.
+    allowed = dataclasses.replace(denied, allow_insecure_password=True)
+    monkeypatch.setattr(security, "settings", allowed)
+    assert security.verify_password("hunter2") is True
+    assert security.verify_password("nope") is False
+
+
 # --- PR5: coverage for high-risk paths --------------------------------------
 
 def _node_worktree(run_id: str, node_id: str) -> Path:
@@ -2127,6 +2162,120 @@ def test_verify_and_apply_fails_after_two_repair_cycles(monkeypatch):
     run = db.one("select status,error from runs where id=?", (run_id,))
     assert run["status"] == "failed"
     assert "two repair cycles" in (run["error"] or "")
+
+
+def _insert_run_row(run_id: str, status: str) -> None:
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)",
+        (run_id, "sweep", "codex", str(WORKSPACES), status, now, now),
+    )
+
+
+def _insert_job_row(run_id: str, status: str) -> None:
+    now = db.utcnow()
+    db.execute(
+        "insert into jobs(run_id,job_type,status,created_at,updated_at) values(?,?,?,?,?)",
+        (run_id, "implementation", status, now, now),
+    )
+
+
+def test_cleanup_run_jobs_removes_tree_but_keeps_snapshot(tmp_path):
+    target = WORKSPACES / "cleanup-src"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "file.txt").write_text("keep me\n")
+    run_id = secrets.token_hex(12)
+    stage = workspace.stage_workspace(run_id, target)
+    snap = workspace.create_snapshot(target)
+
+    assert (workspace.settings.jobs_dir / run_id).exists()
+    assert stage.exists()
+
+    assert workspace.cleanup_run_jobs(run_id) is True
+    assert not (workspace.settings.jobs_dir / run_id).exists()
+    # Snapshot archive is untouched and still restorable.
+    assert workspace._archive_path(snap["ref"]).exists()
+    restored = workspace.restore_snapshot(snap["id"])
+    assert restored is not None
+    # Idempotent: a second call on a gone dir is a harmless no-op.
+    assert workspace.cleanup_run_jobs(run_id) is False
+
+
+def test_sweep_orphan_jobs_guards_active_and_nonterminal():
+    clear_workflow_tables()
+    jobs_dir = workspace.settings.jobs_dir
+
+    old_orphan = "sweep-orphan-" + secrets.token_hex(4)    # no row, aged → removed
+    new_orphan = "sweep-new-" + secrets.token_hex(4)       # no row, fresh → kept (in-flight create_run)
+    terminal_idle = "sweep-done-" + secrets.token_hex(4)   # completed, no jobs → removed
+    failed_idle = "sweep-failed-" + secrets.token_hex(4)   # failed, idle → kept (resumable)
+    terminal_busy = "sweep-busy-" + secrets.token_hex(4)   # completed, pending job → kept
+    running = "sweep-run-" + secrets.token_hex(4)           # non-terminal → kept
+
+    for rid in (old_orphan, new_orphan, terminal_idle, failed_idle, terminal_busy, running):
+        (jobs_dir / rid).mkdir(parents=True, exist_ok=True)
+    # Age the old orphan past the grace window so it is treated as a crash orphan.
+    stale = time.time() - orchestrator.ORPHAN_JOB_GRACE_SECONDS - 60
+    os.utime(jobs_dir / old_orphan, (stale, stale))
+
+    _insert_run_row(terminal_idle, "completed")
+    _insert_run_row(failed_idle, "failed")
+    _insert_run_row(terminal_busy, "completed")
+    _insert_job_row(terminal_busy, "pending")
+    _insert_run_row(running, "implementing")
+
+    orchestrator.sweep_orphan_jobs()
+
+    assert not (jobs_dir / old_orphan).exists()
+    assert (jobs_dir / new_orphan).exists()      # too young to reclaim
+    assert not (jobs_dir / terminal_idle).exists()
+    assert (jobs_dir / failed_idle).exists()     # retained for resume
+    assert (jobs_dir / terminal_busy).exists()
+    assert (jobs_dir / running).exists()
+
+
+def test_update_run_terminal_transition_triggers_sweep():
+    clear_workflow_tables()
+    run_id = secrets.token_hex(12)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)",
+        (run_id, "trigger", "codex", str(WORKSPACES), "implementing", now, now),
+    )
+    orchestrator._jobs_sweeper_wake.clear()
+    orchestrator.update_run(run_id, status="failed", error="boom")
+    assert orchestrator._jobs_sweeper_wake.is_set()
+
+
+def test_migration_savepoint_rolls_back_on_failure():
+    from backend import migrations as mig
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        def good(db_conn):
+            db_conn.execute("create table sp_good(x integer)")
+
+        def bad(db_conn):
+            db_conn.execute("create table sp_bad(x integer)")
+            raise RuntimeError("migration blew up")
+
+        original = mig.MIGRATIONS
+        mig.MIGRATIONS = [(1, good), (2, bad)]
+        try:
+            with pytest.raises(RuntimeError, match="migration blew up"):
+                mig.apply_migrations(conn)
+        finally:
+            mig.MIGRATIONS = original
+
+        tables = {row[0] for row in conn.execute("select name from sqlite_master where type='table'")}
+        assert "sp_good" in tables          # committed migration survives
+        assert "sp_bad" not in tables       # failed migration fully rolled back
+        applied = {row[0] for row in conn.execute("select version from schema_migrations")}
+        assert applied == {1}               # no half-applied version recorded
+    finally:
+        conn.close()
 
 
 # --- PR2: LLM resilience & orchestrator correctness ------------------------
