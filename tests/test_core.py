@@ -2171,23 +2171,31 @@ def test_sweep_orphan_jobs_guards_active_and_nonterminal():
     clear_workflow_tables()
     jobs_dir = workspace.settings.jobs_dir
 
-    orphan = "sweep-orphan-" + secrets.token_hex(4)      # no runs row → removed
-    terminal_idle = "sweep-done-" + secrets.token_hex(4)  # terminal, no jobs → removed
-    terminal_busy = "sweep-busy-" + secrets.token_hex(4)  # terminal, pending job → kept
-    running = "sweep-run-" + secrets.token_hex(4)          # non-terminal → kept
+    old_orphan = "sweep-orphan-" + secrets.token_hex(4)    # no row, aged → removed
+    new_orphan = "sweep-new-" + secrets.token_hex(4)       # no row, fresh → kept (in-flight create_run)
+    terminal_idle = "sweep-done-" + secrets.token_hex(4)   # completed, no jobs → removed
+    failed_idle = "sweep-failed-" + secrets.token_hex(4)   # failed, idle → kept (resumable)
+    terminal_busy = "sweep-busy-" + secrets.token_hex(4)   # completed, pending job → kept
+    running = "sweep-run-" + secrets.token_hex(4)           # non-terminal → kept
 
-    for rid in (orphan, terminal_idle, terminal_busy, running):
+    for rid in (old_orphan, new_orphan, terminal_idle, failed_idle, terminal_busy, running):
         (jobs_dir / rid).mkdir(parents=True, exist_ok=True)
+    # Age the old orphan past the grace window so it is treated as a crash orphan.
+    stale = time.time() - orchestrator.ORPHAN_JOB_GRACE_SECONDS - 60
+    os.utime(jobs_dir / old_orphan, (stale, stale))
 
     _insert_run_row(terminal_idle, "completed")
-    _insert_run_row(terminal_busy, "failed")
+    _insert_run_row(failed_idle, "failed")
+    _insert_run_row(terminal_busy, "completed")
     _insert_job_row(terminal_busy, "pending")
     _insert_run_row(running, "implementing")
 
     orchestrator.sweep_orphan_jobs()
 
-    assert not (jobs_dir / orphan).exists()
+    assert not (jobs_dir / old_orphan).exists()
+    assert (jobs_dir / new_orphan).exists()      # too young to reclaim
     assert not (jobs_dir / terminal_idle).exists()
+    assert (jobs_dir / failed_idle).exists()     # retained for resume
     assert (jobs_dir / terminal_busy).exists()
     assert (jobs_dir / running).exists()
 

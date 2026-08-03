@@ -64,6 +64,13 @@ _jobs_sweeper_wake = threading.Event()
 _jobs_sweeper_thread: threading.Thread | None = None
 
 TERMINAL_RUN_STATES = frozenset({"completed", "failed", "cancelled", "rolled_back"})
+# Only these terminal states have their working job tree reclaimed. 'failed' is
+# excluded because it is resumable (resume_run reuses jobs/<run_id> without
+# restaging), so deleting its tree would break resume.
+SWEEPABLE_RUN_STATES = frozenset({"completed", "cancelled", "rolled_back"})
+# A directory with no runs row is only a crash orphan once it is older than this;
+# younger ones may be an in-flight create_run (which stages before inserting the row).
+ORPHAN_JOB_GRACE_SECONDS = 900
 
 
 class OllamaUnavailable(RuntimeError):
@@ -221,6 +228,7 @@ def sweep_orphan_jobs() -> int:
     jobs_dir = settings.jobs_dir
     if not jobs_dir.exists():
         return 0
+    now = time.time()
     removed = 0
     for child in list(jobs_dir.iterdir()):
         if not child.is_dir():
@@ -228,11 +236,20 @@ def sweep_orphan_jobs() -> int:
         run_id = child.name
         run = db.one("select status from runs where id=?", (run_id,))
         if run is None:
+            # No run row: a genuine crash orphan OR a create_run staging its tree
+            # before inserting the row. Only reclaim once it is older than the grace
+            # window so we never delete an in-flight run's directory.
+            try:
+                age = now - child.stat().st_mtime
+            except OSError:
+                continue
+            if age < ORPHAN_JOB_GRACE_SECONDS:
+                continue
             if cleanup_run_jobs(run_id):
                 removed += 1
             _forget_run_memory(run_id)
             continue
-        if run["status"] in TERMINAL_RUN_STATES and not _has_active_jobs(run_id):
+        if run["status"] in SWEEPABLE_RUN_STATES and not _has_active_jobs(run_id):
             if cleanup_run_jobs(run_id):
                 removed += 1
             _forget_run_memory(run_id)
