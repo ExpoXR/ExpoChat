@@ -24,4 +24,6 @@ jobs:
           pip install -r requirements-dev.txt
           npm ci
       - name: Run e2e
-        run: make e2e
+        # CI installs into the workflow's interpreter, not a .venv, so override the
+        # Makefile's default PYTHON (?= .venv/bin/python).
+        run: make e2e PYTHON=python

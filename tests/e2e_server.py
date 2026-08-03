@@ -24,6 +24,7 @@ os.environ.update(
         "WORKER_TOKEN": "e2e-only-worker-token-long-value",
         "ADMIN_USER": "tester",
         "ADMIN_PASSWORD": "correct-horse-battery-staple",
+        "ALLOW_INSECURE_PASSWORD": "true",
         "SECURE_COOKIE": "false",
         "OLLAMA_BASE_URL": f"http://127.0.0.1:{PORT}/fake-ollama",
         "WORKER_URL": f"http://127.0.0.1:{PORT}/fake-worker",
