@@ -2116,3 +2116,153 @@ def test_qualifying_checks_list_structure():
         assert "command" in check
         assert "args" in check
         assert isinstance(check["args"], list)
+
+
+# --- PR5: coverage for high-risk paths --------------------------------------
+
+def _node_worktree(run_id: str, node_id: str) -> Path:
+    wt = orchestrator.settings.jobs_dir / run_id / "subtasks" / node_id / "workspace"
+    wt.mkdir(parents=True, exist_ok=True)
+    return wt
+
+
+def test_merge_task_lineage_raises_on_divergent_edits():
+    run_id = "lineage-" + secrets.token_hex(6)
+    target = WORKSPACES / f"lineage-{secrets.token_hex(4)}"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "shared.txt").write_text("base\n")
+    base_stage = workspace.stage_workspace(run_id, target)
+    base_manifest = workspace.workspace_manifest(base_stage)
+    nodes = []
+    for node_id, content in (("a", "from-a\n"), ("b", "from-b\n")):
+        (_node_worktree(run_id, node_id) / "shared.txt").write_text(content)
+        nodes.append({"node_id": node_id, "input_manifest_json": json.dumps(base_manifest)})
+    with pytest.raises(workspace.MergeConflict):
+        workspace.merge_task_lineage(base_stage, run_id, nodes)
+
+
+def test_merge_task_lineage_applies_disjoint_edits():
+    run_id = "lineage2-" + secrets.token_hex(6)
+    target = WORKSPACES / f"lineage2-{secrets.token_hex(4)}"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "base.txt").write_text("base\n")
+    base_stage = workspace.stage_workspace(run_id, target)
+    base_manifest = workspace.workspace_manifest(base_stage)
+    nodes = []
+    for node_id, fname in (("a", "a.txt"), ("b", "b.txt")):
+        wt = _node_worktree(run_id, node_id)
+        (wt / "base.txt").write_text("base\n")
+        (wt / fname).write_text(f"from {node_id}\n")
+        nodes.append({"node_id": node_id, "input_manifest_json": json.dumps(base_manifest)})
+    merged = workspace.merge_task_lineage(base_stage, run_id, nodes)
+    assert sorted(merged["changed"]) == ["a.txt", "b.txt"]
+    assert (base_stage / "a.txt").read_text() == "from a\n"
+    assert (base_stage / "b.txt").read_text() == "from b\n"
+
+
+def test_snapshot_restore_roundtrip():
+    target = WORKSPACES / f"snaproundtrip-{secrets.token_hex(4)}"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "f.txt").write_text("v1")
+    snap = workspace.create_snapshot(target)
+    (target / "f.txt").write_text("v2")
+    (target / "new.txt").write_text("added after snapshot")
+    workspace.restore_snapshot(snap["id"])
+    assert (target / "f.txt").read_text() == "v1"          # reverted
+    assert not (target / "new.txt").exists()               # post-snapshot file removed
+
+
+def test_init_db_recovers_interrupted_runs_and_jobs():
+    clear_workflow_tables()
+    run_id = secrets.token_hex(12)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?)",
+        (run_id, "interrupted", "codex", str(WORKSPACES), "applying", now, now),
+    )
+    db.execute(
+        "insert into jobs(run_id,job_type,status,lease_owner,created_at,updated_at) values(?,?,?,?,?,?)",
+        (run_id, "implementation", "running", "worker-1", now, now),
+    )
+    db.execute(
+        "insert into subtasks(id,run_id,node_id,title,spec,status,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?)",
+        (secrets.token_hex(8), run_id, "n1", "t", "s", "running", now, now),
+    )
+
+    db.init_db()  # simulates a restart
+
+    assert db.one("select status from runs where id=?", (run_id,))["status"] == "failed"
+    assert "Interrupted" in (db.one("select error from runs where id=?", (run_id,))["error"] or "")
+    # An interrupted apply is not silently re-run: its job is failed (manual resume
+    # required), while the running subtask is reset to pending for safe re-execution.
+    assert db.one("select status from jobs where run_id=?", (run_id,))["status"] == "failed"
+    assert db.one("select status from subtasks where run_id=?", (run_id,))["status"] == "pending"
+
+
+def test_apply_migrations_is_idempotent():
+    from backend.migrations import MIGRATIONS, apply_migrations
+
+    expected = {version for version, _ in MIGRATIONS}
+    with db.connect() as conn:
+        before = {row[0] for row in conn.execute("select version from schema_migrations")}
+        apply_migrations(conn)  # re-run against an already-migrated DB
+        after = {row[0] for row in conn.execute("select version from schema_migrations")}
+        conn.commit()
+    assert before == after == expected
+
+
+def _seed_verifiers():
+    seed_agent("verf-1", "vmodel-1", ["verification"], [], 80)
+    seed_agent("verf-2", "vmodel-2", ["verification"], [], 70)
+
+
+def test_verify_and_apply_scope_expansion_requeues_decompose(monkeypatch):
+    clear_workflow_tables()
+    _seed_verifiers()
+    run_id = secrets.token_hex(12)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,approved_plan,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?)",
+        (run_id, "scope run", "codex", str(WORKSPACES), "implementing", "PLAN", now, now),
+    )
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "worker_call", lambda *a, **k: {"ok": True, "content": "FAIL", "usage": {}})
+    monkeypatch.setattr(
+        orchestrator, "brain_verdict",
+        lambda *a, **k: (False, json.dumps({"passed": False, "scope_expansion": True, "repair_task": "widen"})),
+    )
+
+    orchestrator._verify_and_apply(run_id, "summary", set(), {"id": "impl", "model": "m", "name": "Impl"})
+
+    assert db.one("select status from runs where id=?", (run_id,))["status"] == "decomposing"
+    job = db.one("select * from jobs where run_id=? and job_type='decompose'", (run_id,))
+    assert job is not None
+
+
+def test_verify_and_apply_fails_after_two_repair_cycles(monkeypatch):
+    clear_workflow_tables()
+    _seed_verifiers()
+    run_id = secrets.token_hex(12)
+    now = db.utcnow()
+    db.execute(
+        "insert into runs(id,task,brain_provider,target_path,status,approved_plan,created_at,updated_at) "
+        "values(?,?,?,?,?,?,?,?)",
+        (run_id, "fail run", "codex", str(WORKSPACES), "implementing", "PLAN", now, now),
+    )
+    monkeypatch.setattr(orchestrator, "start_job_queue", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "record_usage", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "worker_call", lambda *a, **k: {"ok": True, "content": "FAIL", "usage": {}})
+    monkeypatch.setattr(
+        orchestrator, "brain_verdict",
+        lambda *a, **k: (False, json.dumps({"passed": False, "scope_expansion": False, "repair_task": "fix"})),
+    )
+
+    orchestrator._verify_and_apply(run_id, "summary", set(), {"id": "impl", "model": "m", "name": "Impl"})
+
+    run = db.one("select status,error from runs where id=?", (run_id,))
+    assert run["status"] == "failed"
+    assert "two repair cycles" in (run["error"] or "")
