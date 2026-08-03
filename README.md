@@ -42,7 +42,20 @@ Required production values:
 - `CREDENTIAL_ENCRYPTION_KEY`: Fernet key for stored provider credentials.
 - `WORKER_TOKEN`: long random internal service token.
 
-Rotate any value previously committed or copied from an unsafe example. Use HTTPS with `SECURE_COOKIE=true`, explicit `ALLOWED_ORIGINS`, and trusted `FORWARDED_ALLOW_IPS`.
+`ADMIN_PASSWORD_HASH` is **required** in production — the app refuses to start
+without it unless `ALLOW_INSECURE_PASSWORD=true` is set (a dev-only escape hatch
+that re-enables plaintext/md5 `ADMIN_PASSWORD`). Generate a hash with
+`python -c "from argon2 import PasswordHasher; print(PasswordHasher().hash('yourpass'))"`.
+`CREDENTIAL_ENCRYPTION_KEY` should be a real Fernet key
+(`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`);
+a non-Fernet value still works via a derived key but is weak and logs a warning.
+
+Rotate any value previously committed or copied from an unsafe example. Use HTTPS
+with `SECURE_COOKIE=true`, explicit `ALLOWED_ORIGINS`, and set `FORWARDED_ALLOW_IPS`
+to the **actual reverse-proxy IP** — otherwise `X-Forwarded-*` is ignored and every
+client (and the login rate-limit key) collapses to the proxy address. The in-memory
+login/API rate limiter is per-process; it protects the intended single-process
+deployment but would not coordinate across multiple UI replicas.
 
 ## Developer Commands
 
@@ -72,6 +85,10 @@ make backup     # SQLite online backup
 | `RUNNER_CONCURRENCY` | `1` | Concurrent durable job drainers (separate runs) |
 | `WORKER_POOL_SIZE` | `1` | Subtasks a single run runs in parallel (1 = serialized; raise only when Ollama serves models concurrently) |
 | `CHAT_CONTEXT_BYTES` | `120000` | Pinned chat context budget |
+| `ALLOW_INSECURE_PASSWORD` | `false` | Dev-only: permit plaintext/md5 `ADMIN_PASSWORD` when no hash is set |
+| `UI_MEM_LIMIT` / `UI_CPUS` | `1g` / `2.0` | Container limits for `ollma-ui` |
+| `BRAIN_MEM_LIMIT` / `BRAIN_CPUS` | `1g` / `1.0` | Container limits for `ollma-brain` |
+| `WORKER_MEM_LIMIT` / `WORKER_CPUS` | `2g` / `2.0` | Container limits for `ollma-worker` |
 
 Brain memory budget (per-run context window for brain continuity) is a DB setting
 (`brain_memory_budget`, default 4000 tokens). Configurable at runtime via settings API.

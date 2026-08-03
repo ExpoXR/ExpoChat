@@ -17,5 +17,6 @@ os.environ.update({
     "WORKER_TOKEN": "test-only-worker-token-long-value",
     "ADMIN_USER": "tester",
     "ADMIN_PASSWORD": "correct-horse-battery-staple",
+    "ALLOW_INSECURE_PASSWORD": "true",
     "SECURE_COOKIE": "false",
 })

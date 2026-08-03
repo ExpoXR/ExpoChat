@@ -29,6 +29,10 @@ def _fernet() -> Fernet:
     try:
         return Fernet(raw)
     except ValueError:
+        # Not a valid 32-byte urlsafe-base64 Fernet key. We still derive one so an
+        # existing deployment keeps working, but this is weak — warn loudly so the
+        # operator sets a proper key (generate: Fernet.generate_key()).
+        log.warning("credential_encryption_key_not_fernet_format deriving_via_sha256 set_a_proper_key=true")
         derived = base64.urlsafe_b64encode(hashlib.sha256(raw).digest())
         return Fernet(derived)
 
@@ -53,13 +57,20 @@ def verify_password(candidate: str) -> bool:
             return _hasher.verify(stored_hash, candidate)
         except (VerifyMismatchError, ValueError):
             return False
+    # No argon2 hash configured. The plaintext/md5 fallbacks are dev-only and must
+    # be explicitly enabled; production requires ADMIN_PASSWORD_HASH.
+    if not settings.allow_insecure_password:
+        log.error("admin_password_hash_missing_and_insecure_password_disabled")
+        return False
     stored = settings.admin_password
     if stored.startswith("md5:"):
-        log.warning("legacy_md5_admin_password_configured")
+        log.warning("legacy_md5_admin_password_configured migrate_to_argon2id=true")
         digest = hashlib.md5(candidate.encode(), usedforsecurity=False).hexdigest()
         return hmac.compare_digest(digest, stored[4:])
     if stored in {"change-me-now", ""}:
         log.error("unsafe_default_admin_password_configured")
+        return False
+    log.warning("insecure_plaintext_admin_password_in_use migrate_to_argon2id=true")
     return hmac.compare_digest(candidate, stored)
 
 

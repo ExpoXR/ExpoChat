@@ -30,6 +30,8 @@ services:
     read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
+    mem_limit: ${UI_MEM_LIMIT:-1g}
+    cpus: ${UI_CPUS:-2.0}
     tmpfs:
       - /tmp:size=512m,mode=1777
     ports:
@@ -101,6 +103,8 @@ services:
     read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
+    mem_limit: ${BRAIN_MEM_LIMIT:-1g}
+    cpus: ${BRAIN_CPUS:-1.0}
     tmpfs:
       - /tmp:size=512m,mode=1777
     environment:
@@ -129,6 +133,8 @@ services:
     read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
+    mem_limit: ${WORKER_MEM_LIMIT:-2g}
+    cpus: ${WORKER_CPUS:-2.0}
     tmpfs:
       - /tmp:size=1g,mode=1777
     environment:
