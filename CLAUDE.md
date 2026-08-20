@@ -67,9 +67,9 @@ Ultra-compressed communication mode with full technical accuracy.
 
 Stop: "stop caveman" or "normal mode".
 Skills live in `.claude/skills/` (canonical: `caveman/SKILL.md`) and expose matching slash
-commands. **`.claude/` is git-ignored** (see `.gitignore`), so these are a
-local, per-developer Claude Code setup — not checked into the repo and possibly absent in
-a fresh clone. The app's own terseness comes from `CAVEMAN_OUTPUT_INSTRUCTIONS`
+commands. These skill files **are checked into the repo** under `.claude/skills/`, so they
+ship with a fresh clone and only affect Claude Code sessions on this repo. The app's own
+terseness comes from `CAVEMAN_OUTPUT_INSTRUCTIONS`
 ([`backend/prompts.py`](backend/prompts.py)), independent of these files.
 
 ## Developer commands

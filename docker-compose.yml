@@ -43,8 +43,8 @@ services:
       ALLOW_INSECURE_PASSWORD: ${ALLOW_INSECURE_PASSWORD:-}
       SESSION_SECRET: ${SESSION_SECRET:-change-this-session-secret}
       CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:-}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://192.168.0.78:11434}
-      ALLOWED_ROOTS: ${ALLOWED_ROOTS:-/workspace/apps,/workspace/projects,/datasets/tank,/datasets/apps,/datasets/usb_backup}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      ALLOWED_ROOTS: ${ALLOWED_ROOTS:-/workspace/apps,/workspace/projects}
       DATA_DIR: /data
       JOBS_DIR: /jobs
       SNAPSHOT_DIR: /snapshots
@@ -70,11 +70,10 @@ services:
       - ./data:/data
       - ./jobs:/jobs
       - ./snapshots:/snapshots
-      - /mnt/apps/docker:/workspace/apps
-      - /mnt/tank/projects:/workspace/projects
-      - /mnt/tank:/datasets/tank
-      - /mnt/apps:/datasets/apps
-      - /mnt/usb_backup:/datasets/usb_backup
+      # Mount your own workspace roots here (must match ALLOWED_ROOTS above).
+      # Example: map host directories to the container paths the app is allowed to touch.
+      - ${APPS_HOST_PATH:-./workspace/apps}:/workspace/apps
+      - ${PROJECTS_HOST_PATH:-./workspace/projects}:/workspace/projects
     depends_on:
       ollma-init:
         condition: service_completed_successfully

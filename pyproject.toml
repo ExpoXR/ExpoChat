@@ -1,3 +1,10 @@
+[project]
+name = "expochat"
+version = "0.1.0"
+description = "Self-hosted supervisor for local Ollama workers with cloud Brain planning."
+requires-python = ">=3.12"
+license = "MIT"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"

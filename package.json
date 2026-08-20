@@ -1,6 +1,7 @@
 {
   "name": "ollma-ui-tests",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "test": "node --test tests/js/*.test.js tests/js/*.test.mjs",
     "test:e2e": "playwright test",

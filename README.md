@@ -1,5 +1,7 @@
 # Ollma UI
 
+> **Repository:** `ExpoChat` · **Product name:** Ollma UI. Container and service names use the `ollma-` prefix.
+
 TrueNAS-hosted supervisor for local Ollama workers plus Codex or Claude planning. Changes run in staged workspaces, pass independent verification, then apply behind a verified snapshot.
 
 ## Architecture
@@ -17,7 +19,7 @@ Browser -> FastAPI web -> SQLite / snapshots / staged jobs
 - `backend/workspace.py`: staging, manifests, atomic snapshots, restore, storage reporting.
 - `backend/workspace_tools.py`: shared path-safe file/search/check tools.
 - `backend/plan_graph.py`: task-graph validation, dependency resolution, `suggested_model` pass-through.
-- `backend/migrations.py`: ordered, idempotent SQLite migrations (12 migrations through Series B).
+- `backend/migrations.py`: ordered, idempotent SQLite migrations applied transactionally at startup.
 - `public/`: native ES-module workbench; no frontend build step.
 
 Providers never receive original workspace mounts. Ollama workers edit `/jobs`; web service applies verified results after approval. Interactive chat uses read-only tools or bounded pinned-file context.
@@ -135,3 +137,12 @@ Migrations run transactionally at startup. Restore a DB backup only while servic
 4. Build both images without cached application layers.
 5. Deploy, then verify `/livez`, `/readyz`, login, model discovery, storage report, and one staged test run.
 6. Confirm no new orphan or partial archives appear.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup and local gate, and
+[SECURITY.md](SECURITY.md) for the security model and how to report a vulnerability.
+
+## License
+
+Released under the [MIT License](LICENSE).

@@ -53,11 +53,10 @@ across steps. Prompt builders live in `brain_io.py` — add new ones there, not 
 
 These live under `.claude/` (skill `caveman/SKILL.md` with levels lite / full / ultra,
 plus slash commands `/caveman`, `/caveman-commit`, `/caveman-review`, `/caveman-help`,
-`/caveman-compress`; stop with "normal mode"). **`.claude/` is git-ignored** (see
-`.gitignore`), so these files are a local, per-developer Claude Code setup — they are
-**not** checked into the repo and may be absent in a fresh clone. The app's own terseness
-does not depend on them; it comes from `CAVEMAN_OUTPUT_INSTRUCTIONS` in
-[`backend/prompts.py`](backend/prompts.py).
+`/caveman-compress`; stop with "normal mode"). These skill files **are checked into the
+repo** under `.claude/skills/`, so they ship with a fresh clone. They only affect Claude
+Code sessions on this repo. The app's own terseness does not depend on them; it comes from
+`CAVEMAN_OUTPUT_INSTRUCTIONS` in [`backend/prompts.py`](backend/prompts.py).
 
 ## Working rules
 
