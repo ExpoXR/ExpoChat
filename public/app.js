@@ -4,7 +4,7 @@ import { escapeHtml, formatBytes, formatLocalDateTime, formatLocalTime, renderMa
 import { artifactPresentation, explorerActivityState, fileActivity, runChoreography, runStatusLabel, subtaskCards, tokenCounts } from "/js/runs.mjs";
 import { assignableAgents, buildGraphModel, computeLayout, edgeList, wouldCycle } from "/js/graph.mjs";
 import { modelLabel, modelOptions, providerOptions } from "/js/settings.mjs";
-import { buildSettingsPayload, clampPriority, usageMeter } from "/js/settings_api.mjs";
+import { buildSettingsPayload, clampPriority, hostStatusLabel, normalizeHostUrl, usageMeter } from "/js/settings_api.mjs";
 import { consumeSse } from "/js/sse.mjs";
 import { readPreferences, writePreferences } from "/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "/js/workspace.mjs";
@@ -233,7 +233,7 @@ async function openSettingsPage() {
   setSettingsMode(true);
   switchEditor("settingsEditor");
   closeDrawers();
-  await Promise.allSettled([loadBrains(), loadAgents(), loadSettings(), loadSettingsStorage()]);
+  await Promise.allSettled([loadBrains(), loadHosts(), loadAgents(), loadSettings(), loadSettingsStorage()]);
 }
 
 function syncDrawerState() {
@@ -1962,15 +1962,109 @@ async function saveSettings(values, message) {
   } catch (err) { showToast(err.message, "error"); }
 }
 
+let hostsCache = [];
+
+async function loadHosts() {
+  const data = await api("/api/hosts");
+  hostsCache = data.hosts || [];
+  const list = $("hostList");
+  if (!list) return;
+  list.innerHTML = "";
+  hostsCache.forEach((host) => {
+    const badge = hostStatusLabel(host.status, host.last_seen);
+    const row = document.createElement("div");
+    row.className = "host-row";
+    row.innerHTML = `<strong>${escapeHtml(host.name)}</strong>`
+      + `<span class="host-badge host-badge-${badge.tone}">${escapeHtml(badge.text)}</span>`
+      + `<small>${escapeHtml(host.base_url)} · ${escapeHtml(host.kind)}</small>`;
+    const rescan = document.createElement("button");
+    rescan.textContent = "Discover";
+    rescan.onclick = () => discoverAgentModels(host.id);
+    const toggle = document.createElement("button");
+    toggle.textContent = host.enabled ? "Enabled" : "Disabled";
+    toggle.onclick = async () => {
+      try {
+        await api(`/api/hosts/${host.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !host.enabled }) });
+        await Promise.allSettled([loadHosts(), loadAgents()]);
+      } catch (err) { showToast(err.message, "error"); }
+    };
+    const remove = document.createElement("button");
+    remove.textContent = "Remove";
+    remove.onclick = async () => {
+      if (!confirm(`Remove host "${host.name}" and its agents?`)) return;
+      try {
+        await api(`/api/hosts/${host.id}`, { method: "DELETE" });
+        await Promise.allSettled([loadHosts(), loadAgents()]);
+      } catch (err) { showToast(err.message, "error"); }
+    };
+    row.append(rescan, toggle, remove);
+    list.appendChild(row);
+  });
+}
+
+async function addHost() {
+  const url = normalizeHostUrl($("hostUrl").value);
+  if (!url) { showToast("Enter a valid host URL like http://127.0.0.1:11434", "error"); return; }
+  const name = ($("hostName").value || "").trim() || url;
+  setBusy(["addHostBtn"], true);
+  try {
+    await api("/api/hosts", { method: "POST", body: JSON.stringify({ name, base_url: url, kind: $("hostKind").value }) });
+    $("hostName").value = "";
+    $("hostUrl").value = "";
+    await Promise.allSettled([loadHosts(), loadAgents()]);
+    showToast("Host added", "success");
+  } catch (err) { showToast(err.message, "error"); }
+  finally { setBusy(["addHostBtn"], false); }
+}
+
+async function scanHosts() {
+  const entered = normalizeHostUrl($("hostUrl").value);
+  const box = $("scanResults");
+  setBusy(["scanHostsBtn"], true);
+  try {
+    const data = await api("/api/hosts/scan", { method: "POST", body: JSON.stringify(entered ? { base_url: entered } : {}) });
+    const results = data.results || [];
+    box.innerHTML = "";
+    box.hidden = false;
+    results.forEach((r) => {
+      const row = document.createElement("div");
+      row.className = "scan-row";
+      const label = r.reachable ? `${r.models.length} model(s)` : "unreachable";
+      row.innerHTML = `<span class="host-badge host-badge-${r.reachable ? "ok" : "bad"}">${r.reachable ? "Online" : "Offline"}</span><small>${escapeHtml(r.base_url)} · ${escapeHtml(label)}</small>`;
+      if (r.reachable && !r.registered) {
+        const add = document.createElement("button");
+        add.textContent = "Add";
+        add.onclick = async () => {
+          try {
+            await api("/api/hosts", { method: "POST", body: JSON.stringify({ name: r.base_url, base_url: r.base_url, kind: "network" }) });
+            await Promise.allSettled([loadHosts(), loadAgents()]);
+            showToast("Host added", "success");
+          } catch (err) { showToast(err.message, "error"); }
+        };
+        row.appendChild(add);
+      } else if (r.registered) {
+        const tag = document.createElement("small");
+        tag.textContent = "already added";
+        row.appendChild(tag);
+      }
+      box.appendChild(row);
+    });
+    if (!results.length) box.textContent = "No candidates probed.";
+  } catch (err) { showToast(err.message, "error"); }
+  finally { setBusy(["scanHostsBtn"], false); }
+}
+
 async function loadAgents() {
   const data = await api("/api/agents");
   const agents = data.agents || [];
   agentsCache = agents;
+  const hostName = (id) => (hostsCache.find((h) => h.id === id) || {}).name || "";
   $("agentList").innerHTML = "";
   agents.forEach((agent) => {
     const row = document.createElement("div");
     row.className = "agent-row";
-    row.innerHTML = `<strong>${escapeHtml(agent.name)}</strong><span>${escapeHtml((agent.roles || []).join(" · "))}</span><small>${escapeHtml((agent.capabilities || []).join(", "))} · priority ${agent.priority}</small>`;
+    const host = hostName(agent.host_id);
+    row.innerHTML = `<strong>${escapeHtml(agent.name)}</strong><span>${escapeHtml((agent.roles || []).join(" · "))}</span><small>${escapeHtml((agent.capabilities || []).join(", "))} · priority ${agent.priority}${host ? ` · ${escapeHtml(host)}` : ""}</small>`;
     const roles = document.createElement("input");
     roles.value = (agent.roles || []).join(", ");
     roles.setAttribute("aria-label", `${agent.name} roles`);
@@ -2013,12 +2107,18 @@ async function loadAgents() {
   });
 }
 
-async function discoverAgentModels() {
+async function discoverAgentModels(hostId = null) {
   setBusy(["discoverAgentsBtn"], true);
   try {
-    await api("/api/agents/discover", { method: "POST", body: "{}" });
-    await loadAgents();
-    showToast("Ollama agents discovered", "success");
+    const body = hostId ? JSON.stringify({ host_id: hostId }) : "{}";
+    const data = await api("/api/agents/discover", { method: "POST", body });
+    await Promise.allSettled([loadHosts(), loadAgents()]);
+    const errors = data.errors || [];
+    if (errors.length) {
+      showToast(`Unreachable: ${errors.map((e) => e.name).join(", ")}`, "error");
+    } else {
+      showToast(`Discovered ${(data.agents || []).length} agent(s)`, "success");
+    }
   } catch (err) { showToast(err.message, "error"); }
   finally { setBusy(["discoverAgentsBtn"], false); }
 }
@@ -2297,7 +2397,9 @@ document.addEventListener("DOMContentLoaded", () => {
     run_events_cap: $("runEventsCap").value,
     run_artifacts_cap: $("runArtifactsCap").value,
   }, "Evidence retention saved");
-  $("discoverAgentsBtn").onclick = discoverAgentModels;
+  $("discoverAgentsBtn").onclick = () => discoverAgentModels();
+  $("addHostBtn").onclick = addHost;
+  $("scanHostsBtn").onclick = scanHosts;
   $("closeSettingsBtn").onclick = () => { setSettingsMode(false); switchEditor("chatEditor"); };
   $("openSnapshotsSettingsBtn").onclick = () => { switchSidePane("snaps"); loadSnaps(); };
   $("openTimelineSettingsBtn").onclick = () => { switchSidePane("timeline"); loadTimeline(); };

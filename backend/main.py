@@ -674,9 +674,13 @@ def host_create(body: HostCreateBody, _: dict = Depends(require_user)):
         host = db.add_ollama_host(body.name, url, body.kind)
     except Exception as exc:
         raise HTTPException(409, "A host with this URL already exists") from exc
-    # Best-effort probe + discover so the new host's models appear immediately.
-    with contextlib.suppress(Exception):
-        discover_agents(host["id"])
+    # Best-effort: only enumerate models if the host answers a quick probe, so adding an
+    # unreachable host returns immediately instead of blocking on discovery timeouts.
+    if host_reachable(url, timeout=2.0):
+        with contextlib.suppress(Exception):
+            discover_agents(host["id"])
+    else:
+        db.set_host_status(host["id"], "unreachable", "not reachable at add time")
     return db.ollama_host(host["id"]) or host
 
 

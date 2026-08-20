@@ -1769,6 +1769,54 @@ pre {
   margin-top: 3px;
 }
 
+/* Ollama hosts */
+.host-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0;
+}
+.host-add-row input {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+.settings-host-grid {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+.host-row,
+.scan-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--surface-raised);
+}
+.host-row small,
+.scan-row small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.host-row strong { margin-right: auto; }
+.scan-results {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+.host-badge {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line-soft);
+}
+.host-badge-ok { color: #1a7f37; border-color: #1a7f37; }
+.host-badge-bad { color: #cf222e; border-color: #cf222e; }
+.host-badge-muted { color: var(--muted); }
+
 /* -----------------------------------------------------------------------
    Full-page settings
 ----------------------------------------------------------------------- */

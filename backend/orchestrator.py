@@ -679,7 +679,9 @@ def discover_agents(host_id: str | None = None) -> list[dict[str, Any]]:
     for host in hosts:
         hid, base = host["id"], host["base_url"]
         try:
-            with httpx.Client(timeout=30) as client:
+            # Short timeout so a dead host doesn't stall a multi-host sweep; per-model /api/show
+            # below keeps a longer budget for the reachable host's model metadata.
+            with httpx.Client(timeout=10) as client:
                 tags_response = client.get(base + "/api/tags")
                 tags_response.raise_for_status()
                 tags = tags_response.json().get("models", [])
@@ -740,17 +742,23 @@ def _reachable_host_ids() -> set[str]:
 
 
 def _candidate_agents(role: str, exclude: set[str] | None = None) -> list[tuple]:
-    """Score + sort eligible agents on a reachable host for a role. Shared by both choosers."""
+    """Score + sort eligible agents for a role, preferring reachable hosts.
+
+    Host reachability is a best-effort hint: agents on a reachable/unknown host are preferred,
+    but if that would leave no candidates (e.g. a stale/transient 'unreachable' status), we
+    fall back to all eligible agents rather than starving selection — a genuinely-down host is
+    still caught at dispatch by the OllamaUnavailable pause/resume path.
+    """
     exclude = exclude or set()
     reachable = _reachable_host_ids()
-    candidates = []
+    eligible: list[tuple] = []
     for row in db.all_rows("select * from agent_profiles where enabled=1"):
         if not _agent_is_eligible(row, role, exclude):
             continue
-        if row.get("host_id") and row["host_id"] not in reachable:
-            continue
         scores = json.loads(row["role_scores_json"] or "{}")
-        candidates.append((int(scores.get(role, 0)), int(row["priority"]), int(row["context_size"]), row["name"], row))
+        eligible.append((int(scores.get(role, 0)), int(row["priority"]), int(row["context_size"]), row["name"], row))
+    on_reachable = [c for c in eligible if not c[-1].get("host_id") or c[-1]["host_id"] in reachable]
+    candidates = on_reachable or eligible
     candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].lower()))
     return candidates
 

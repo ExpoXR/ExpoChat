@@ -310,3 +310,64 @@ def test_brain_service_requires_auth_and_forwards_provider_request(monkeypatch):
     assert forwarded["allow_web"] is True
     assert forwarded["api_key"] == "secret"
     assert captured["env"]["HOME"].startswith("/tmp/ollma-codex-")
+
+
+def test_hosts_api_crud_and_scan():
+    async def run():
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                login = await client.post(
+                    "/api/auth/login",
+                    json={"username": "tester", "password": "correct-horse-battery-staple"},
+                )
+                csrf = login.json()["csrf"]
+                headers = {"X-CSRF-Token": csrf}
+
+                # Default host is present from migration 15.
+                listed = (await client.get("/api/hosts")).json()["hosts"]
+                assert any(h["id"] == "host-default" for h in listed)
+
+                # Create (best-effort discover against an unreachable URL is suppressed).
+                created = await client.post(
+                    "/api/hosts", headers=headers,
+                    json={"name": "Lab", "base_url": "http://198.51.100.7:11434/", "kind": "network"},
+                )
+                assert created.status_code == 200
+                host = created.json()
+                assert host["base_url"] == "http://198.51.100.7:11434"  # normalized
+
+                # Duplicate URL rejected.
+                dup = await client.post(
+                    "/api/hosts", headers=headers,
+                    json={"name": "Dup", "base_url": "http://198.51.100.7:11434", "kind": "network"},
+                )
+                assert dup.status_code == 409
+
+                # Invalid URL rejected.
+                bad = await client.post(
+                    "/api/hosts", headers=headers,
+                    json={"name": "Bad", "base_url": "not-a-url", "kind": "network"},
+                )
+                assert bad.status_code == 400
+
+                # Rename via PATCH.
+                patched = await client.patch(
+                    f"/api/hosts/{host['id']}", headers=headers, json={"name": "Lab 2"},
+                )
+                assert patched.status_code == 200 and patched.json()["name"] == "Lab 2"
+
+                # Scan returns non-committing probe results.
+                scan = await client.post("/api/hosts/scan", headers=headers, json={})
+                assert scan.status_code == 200
+                assert isinstance(scan.json()["results"], list)
+
+                # Status now surfaces the hosts array.
+                status = (await client.get("/api/status")).json()
+                assert "hosts" in status and isinstance(status["hosts"], list)
+
+                # Delete the added host.
+                deleted = await client.delete(f"/api/hosts/{host['id']}", headers=headers)
+                assert deleted.status_code == 200
+
+    asyncio.run(run())

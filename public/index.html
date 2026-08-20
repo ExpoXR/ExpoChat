@@ -378,10 +378,28 @@
                   </article>
                   <article class="settings-card">
                     <h3>Local Ollama agents</h3>
-                    <p class="settings-help">Discover installed models, then assign roles, priority, and optional system prompts.</p>
+                    <p class="settings-help">Discover models across your hosts, then assign roles, priority, and optional system prompts.</p>
                     <button id="discoverAgentsBtn">Discover models</button>
                   </article>
                 </div>
+
+                <article class="settings-card">
+                  <h3>Ollama hosts</h3>
+                  <p class="settings-help">Add local LLM servers — this device, your network, or other machines. Detect probes reachable servers; each host's models become agents below.</p>
+                  <div class="host-add-row">
+                    <input id="hostName" placeholder="Name (e.g. Workstation)" aria-label="New host name">
+                    <input id="hostUrl" placeholder="http://127.0.0.1:11434" aria-label="New host URL">
+                    <select id="hostKind" aria-label="New host kind">
+                      <option value="local">Same device</option>
+                      <option value="network" selected>Network</option>
+                    </select>
+                    <button id="addHostBtn">Add host</button>
+                    <button id="scanHostsBtn">Detect</button>
+                  </div>
+                  <div id="scanResults" class="scan-results" hidden></div>
+                  <div id="hostList" class="settings-host-grid"></div>
+                </article>
+
                 <div id="agentList" class="settings-agent-grid"></div>
               </section>
             </div>

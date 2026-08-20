@@ -53,6 +53,32 @@ export function clampPriority(value, { min = 0, max = 1000, fallback = 50 } = {}
   return Math.min(max, Math.max(min, n));
 }
 
+// Normalize a user-entered Ollama host URL: trim, add http:// if no scheme, drop a
+// trailing slash. Returns "" for blank/invalid input so callers can reject it.
+export function normalizeHostUrl(value) {
+  let url = String(value ?? "").trim();
+  if (!url) return "";
+  if (!/^https?:\/\//i.test(url)) url = `http://${url}`;
+  try {
+    const parsed = new URL(url);
+    if (!parsed.hostname) return "";
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+// Human label + severity for a host's reachability, for a status badge.
+export function hostStatusLabel(status, lastSeen) {
+  if (status === "reachable") {
+    return { text: "Online", tone: "ok" };
+  }
+  if (status === "unreachable") {
+    return { text: "Offline", tone: "bad" };
+  }
+  return { text: lastSeen ? "Idle" : "Not checked", tone: "muted" };
+}
+
 // Given /api/usage, compute a meter for today's paid usage vs the daily cap.
 export function usageMeter(usage = {}) {
   const used = Number(usage?.paid_today?.total ?? 0) || 0;

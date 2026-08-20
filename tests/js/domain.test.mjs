@@ -4,7 +4,7 @@ import test from "node:test";
 import { buildChatPayload, chatAgentStep, chatEventStatus, cloudEngineValue, isCloudEngine } from "../../public/js/chat.mjs";
 import { artifactPresentation, explorerActivityState, fileActivity, runChoreography, runStatusLabel, tokenCounts } from "../../public/js/runs.mjs";
 import { BRAIN_MODELS, modelLabel, modelOptions, providerOptions } from "../../public/js/settings.mjs";
-import { buildSettingsPayload, clampPriority, usageMeter } from "../../public/js/settings_api.mjs";
+import { buildSettingsPayload, clampPriority, hostStatusLabel, normalizeHostUrl, usageMeter } from "../../public/js/settings_api.mjs";
 import { readPreferences, writePreferences } from "../../public/js/state.mjs";
 import { splitCommand, updatePinnedPaths } from "../../public/js/workspace.mjs";
 import { baseName, duplicateName, joinPath, parentDir, pasteTarget } from "../../public/js/fsops.mjs";
@@ -181,4 +181,19 @@ test("clampPriority tolerates blank/invalid and clamps to range", () => {
   assert.equal(clampPriority("250"), 250);        // valid numeric string
   assert.equal(clampPriority(5000), 1000);        // above max
   assert.equal(clampPriority(-5), 0);             // below min
+});
+
+test("normalizeHostUrl adds scheme, trims trailing slash, rejects blanks", () => {
+  assert.equal(normalizeHostUrl("http://10.0.0.5:11434/"), "http://10.0.0.5:11434");
+  assert.equal(normalizeHostUrl("10.0.0.5:11434"), "http://10.0.0.5:11434"); // scheme added
+  assert.equal(normalizeHostUrl("  https://box:11434  "), "https://box:11434"); // trimmed
+  assert.equal(normalizeHostUrl(""), "");
+  assert.equal(normalizeHostUrl("   "), "");
+});
+
+test("hostStatusLabel maps status to badge text + tone", () => {
+  assert.deepEqual(hostStatusLabel("reachable"), { text: "Online", tone: "ok" });
+  assert.deepEqual(hostStatusLabel("unreachable"), { text: "Offline", tone: "bad" });
+  assert.deepEqual(hostStatusLabel("unknown", "2026-01-01"), { text: "Idle", tone: "muted" });
+  assert.deepEqual(hostStatusLabel("unknown", null), { text: "Not checked", tone: "muted" });
 });
