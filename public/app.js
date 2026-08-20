@@ -844,7 +844,7 @@ async function openFile(path) {
   pinContextPath(currentFile);
   $("fileTitle").textContent = data.path;
   document.querySelector('.editor-tab[data-editor="fileEditor"]').textContent =
-    data.path.split("/").pop() || "file";
+    data.path.split("/").pop() || "File";
   $("editor").value = data.content;
   switchEditor("fileEditor");
   document.querySelector(".sidebar").classList.remove("open");
