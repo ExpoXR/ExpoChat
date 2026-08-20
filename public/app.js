@@ -89,32 +89,33 @@ function setBusy(ids, busy) {
   ids.forEach((id) => { const el = $(id); if (el) el.disabled = busy; })
 }
 
-function setWorkspaceTag(path) {
+// One chat-context chip: workspace folder + pinned-file count in a single indicator.
+function renderContextChip() {
   const tag = $("workspaceTag");
   if (!tag) return;
-  if (path) {
-    const label = path.split("/").filter(Boolean).pop() || path;
-    tag.textContent = `📂 ${label}`;
-    tag.title = `Workspace: ${path}`;
-    tag.classList.remove("hidden");
-  } else {
-    tag.classList.add("hidden");
-  };
+  const path = $("targetPath").value.trim();
+  const folder = path ? (path.split("/").filter(Boolean).pop() || path) : "";
+  const pins = pinnedContextPaths.length;
+  if (!folder && !pins) { tag.classList.add("hidden"); return; }
+  const parts = [];
+  if (folder) parts.push(`📂 ${folder}`);
+  if (pins) parts.push(`📌 ${pins}`);
+  tag.textContent = parts.join(" · ");
+  tag.title = (path ? `Workspace: ${path}` : "")
+    + (pins ? `${path ? "\n" : ""}Pinned files:\n${pinnedContextPaths.join("\n")}` : "");
+  tag.classList.remove("hidden");
+}
+
+function setWorkspaceTag() {
+  renderContextChip();
 }
 
 function syncPinnedContext() {
-  const tag = $("contextTag");
   const button = $("pinFileBtn");
   const currentPinned = Boolean(currentFile && pinnedContextPaths.includes(currentFile));
   button.disabled = !currentFile;
   button.textContent = currentPinned ? "Unpin from Chat" : "Pin to Chat";
-  if (pinnedContextPaths.length) {
-    tag.textContent = `📌 ${pinnedContextPaths.length}`;
-    tag.title = `Pinned context:\n${pinnedContextPaths.join("\n")}`;
-    tag.classList.remove("hidden");
-  } else {
-    tag.classList.add("hidden");
-  }
+  renderContextChip();
 }
 
 function pinContextPath(path) {
@@ -374,6 +375,9 @@ function switchEditor(id) {
     const active = tab.dataset.editor === id;
     tab.classList.toggle("active", active);
     tab.setAttribute("aria-selected", active ? "true" : "false");
+    // Reveal a tab the first time its pane is shown (Chat stays always-visible); optional
+    // tabs (run/file/diff/evidence) start hidden so you can't navigate into a blank pane.
+    if (active && id !== "settingsEditor") tab.classList.remove("hidden");
   });
 }
 
@@ -537,7 +541,7 @@ function renderChatEngines() {
   select.appendChild(localGroup);
   if (cloud.length) {
     const cloudGroup = document.createElement("optgroup");
-    cloudGroup.label = "Cloud (API)";
+    cloudGroup.label = "Brains (cloud)";
     cloud.forEach((provider) => {
       const opt = document.createElement("option");
       opt.value = cloudEngineValue(provider.value);
@@ -1238,10 +1242,9 @@ async function loadTimeline(append = false) {
 
 async function generatePlan() {
   planEditing = false;
-  const path = $("planPath").value.trim()
-            || $("filePath").value.trim()
-            || $("targetPath").value.trim();
-  if (path) $("planPath").value = path;
+  // Single workspace folder: planPath and targetPath are bound; filePath is explorer-nav only.
+  const path = $("planPath").value.trim() || $("targetPath").value.trim();
+  if (path) { $("planPath").value = path; $("targetPath").value = path; }
   const task = $("planTask").value.trim();
   const provider = $("planProvider").value;
 
@@ -2359,7 +2362,7 @@ async function boot() {
     const cfg = await api("/api/config");
     // Populate plan provider selector based on what's enabled (loadBrains re-syncs later)
     const providerList = [
-      { key: "codex", enabled: cfg.openai_enabled, label: "Codex (OpenAI)", indicator: "openaiIndicator" },
+      { key: "codex", enabled: cfg.openai_enabled, label: "ChatGPT", indicator: "openaiIndicator" },
       { key: "claude", enabled: cfg.claude_enabled, label: "Claude (Anthropic)", indicator: "claudeIndicator" },
       { key: "gemini", enabled: cfg.gemini_enabled, label: "Gemini (Google)", indicator: "geminiIndicator" },
     ];
@@ -2448,12 +2451,21 @@ document.addEventListener("DOMContentLoaded", () => {
   $("saveNewChatBtn").onclick  = saveAndNewChat;
   $("applyCodeBtn").onclick = applyLastCodeBlock;
   $("chatModelSelect").onchange = () => syncChatModel($("chatModelSelect").value);
+  // Chat target and supervisor path are one workspace folder — keep them in lock-step so the
+  // run target can't silently diverge from the chat context.
   $("targetPath").onchange = () => {
+    const v = $("targetPath").value.trim();
     hide("targetHint");
-    setWorkspaceTag($("targetPath").value.trim());
+    setWorkspaceTag(v);
+    $("planPath").value = v;
     resetPinnedContext();
   };
   $("targetPath").oninput  = () => { if ($("targetPath").value.trim()) { hide("targetHint"); setWorkspaceTag($("targetPath").value.trim()); } };
+  $("planPath").onchange = () => {
+    const v = $("planPath").value.trim();
+    $("targetPath").value = v;
+    setWorkspaceTag(v);
+  };
 
   // Explorer
   $("openPathBtn").onclick = () => openPath($("filePath").value);

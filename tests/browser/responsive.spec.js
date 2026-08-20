@@ -51,7 +51,7 @@ test("authenticated workspace chat", async ({ page }) => {
   await page.locator("#openPathBtn").click();
   await page.locator("#fileList .item", { hasText: "sample.py" }).click();
   await expect(page.locator("#pinFileBtn")).toHaveText("Unpin from Chat");
-  await expect(page.locator("#contextTag")).toContainText("1");
+  await expect(page.locator("#workspaceTag")).toContainText("1");
   await page.locator("#activityChat").click();
   await page.locator("#newChatBtn").click();
   await page.locator('.editor-tab[data-editor="chatEditor"]').click();

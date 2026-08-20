@@ -291,6 +291,7 @@ textarea {
 }
 
 .activity {
+  position: relative;
   width: 48px;
   height: 48px;
   display: grid;
@@ -306,6 +307,30 @@ textarea {
   background: transparent;
   color: #cccccc;
 }
+
+/* Discoverable label flyout (reads aria-label) — appears on hover AND keyboard focus,
+   so icons aren't cryptic; native title tooltips don't show on focus. */
+.activity::after {
+  content: attr(aria-label);
+  position: absolute;
+  left: calc(100% + 6px);
+  top: 50%;
+  transform: translateY(-50%);
+  white-space: nowrap;
+  background: var(--surface-raised);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 12px;
+  pointer-events: none;
+  opacity: 0;
+  z-index: 40;
+  transition: opacity 0.08s ease;
+}
+.activity:hover::after,
+.activity:focus-visible::after { opacity: 1; }
+@media (max-width: 767px) { .activity::after { display: none; } }
 
 .activity.active {
   border-left-color: #ffffff;

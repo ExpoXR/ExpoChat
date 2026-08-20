@@ -153,10 +153,10 @@
         <section class="editor-area">
           <div class="tabs-row" role="tablist" aria-label="Editor panes">
             <button class="editor-tab active" role="tab" aria-selected="true"  data-editor="chatEditor">Chat</button>
-            <button class="editor-tab"        role="tab" aria-selected="false" data-editor="runEditor">Supervisor Run</button>
-            <button class="editor-tab"        role="tab" aria-selected="false" data-editor="fileEditor">File</button>
-            <button class="editor-tab"        role="tab" aria-selected="false" data-editor="diffEditor">Diff</button>
-            <button class="editor-tab"        role="tab" aria-selected="false" data-editor="artifactEditor">Evidence</button>
+            <button class="editor-tab hidden" role="tab" aria-selected="false" data-editor="runEditor">Supervisor Run</button>
+            <button class="editor-tab hidden" role="tab" aria-selected="false" data-editor="fileEditor">File</button>
+            <button class="editor-tab hidden" role="tab" aria-selected="false" data-editor="diffEditor">Diff</button>
+            <button class="editor-tab hidden" role="tab" aria-selected="false" data-editor="artifactEditor">Evidence</button>
           </div>
 
           <!-- Chat editor -->
@@ -165,8 +165,7 @@
               <span class="toolbar-label">Chat — <span id="ollamaStatus">connecting…</span></span>
               <label class="toolbar-model-label" for="chatModelSelect">Model</label>
               <select id="chatModelSelect" class="toolbar-model" title="Change model for this chat"></select>
-              <span id="workspaceTag" class="workspace-tag hidden" title="Active workspace folder sent to Ollama"></span>
-              <span id="contextTag" class="workspace-tag hidden" title="Pinned files sent to Ollama"></span>
+              <span id="workspaceTag" class="workspace-tag hidden" title="Workspace folder + pinned files sent to Ollama"></span>
               <button id="applyCodeBtn" title="Apply last code block to the active file">Apply to File</button>
             </div>
             <div id="messages" class="messages">
