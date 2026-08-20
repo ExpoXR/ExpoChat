@@ -265,6 +265,17 @@ textarea {
   grid-template-rows: minmax(0, 1fr);
 }
 
+/* Desktop only: the Supervisor Run star collapses/expands the right panel column
+   (below 1181px the panel is a slide-in drawer instead — see the tablet media query). */
+@media (min-width: 1181px) {
+  .main-grid { transition: grid-template-columns 0.16s ease; }
+  .main-grid.panel-collapsed {
+    grid-template-columns: 48px var(--sidebar-width, 292px) 5px minmax(0, 1fr) 0 0;
+  }
+  .main-grid.panel-collapsed #panelResize,
+  .main-grid.panel-collapsed .panel-area { display: none; }
+}
+
 .main-grid.settings-active .tabs-row {
   display: none;
 }
@@ -1889,6 +1900,22 @@ pre {
   color: var(--text);
 }
 .role-check input[disabled] + * { color: var(--muted); }
+.link-hint {
+  background: transparent;
+  border: none;
+  padding: 4px 0 0;
+  color: var(--accent);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.link-hint-inline {
+  display: inline;
+  margin-left: 8px;
+  padding: 0;
+  font-size: 11px;
+}
 
 /* -----------------------------------------------------------------------
    Full-page settings

@@ -138,6 +138,7 @@
           <section id="morePane" class="side-pane hidden">
             <div class="section-title">MORE</div>
             <div class="more-menu">
+              <button id="moreSupervisorBtn">Supervisor Run</button>
               <button id="moreToolsBtn">Search</button>
               <button id="moreSnapsBtn">Snapshots</button>
               <button id="moreTimelineBtn">Timeline</button>
@@ -152,7 +153,7 @@
         <section class="editor-area">
           <div class="tabs-row" role="tablist" aria-label="Editor panes">
             <button class="editor-tab active" role="tab" aria-selected="true"  data-editor="chatEditor">chat.md</button>
-            <button class="editor-tab"        role="tab" aria-selected="false" data-editor="runEditor">run</button>
+            <button class="editor-tab"        role="tab" aria-selected="false" data-editor="runEditor">Supervisor Run</button>
             <button class="editor-tab"        role="tab" aria-selected="false" data-editor="fileEditor">file</button>
             <button class="editor-tab"        role="tab" aria-selected="false" data-editor="diffEditor">changes.diff</button>
             <button class="editor-tab"        role="tab" aria-selected="false" data-editor="artifactEditor">evidence.md</button>
@@ -422,6 +423,7 @@
             <select id="planProvider"></select>
             <label class="check-label"><input id="webResearch" type="checkbox"> Allow web research for this run</label>
             <button id="generatePlanBtn">Research &amp; Write Plan</button>
+            <button id="planProviderHint" class="link-hint hidden" type="button">No Brain linked — open Settings → Brains</button>
           </div>
 
           <!-- Plan review actions — act on the run shown in the center pane -->

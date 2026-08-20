@@ -238,10 +238,42 @@ async function openSettingsPage() {
 
 function syncDrawerState() {
   const mobile = window.matchMedia("(max-width: 767px)").matches;
-  const open = document.querySelector(".sidebar").classList.contains("open") ||
-               document.querySelector(".panel-area").classList.contains("open");
+  const desktop = window.matchMedia("(min-width: 1181px)").matches;
+  const drawerOpen = document.querySelector(".panel-area").classList.contains("open");
+  const open = document.querySelector(".sidebar").classList.contains("open") || drawerOpen;
   $("drawerBackdrop").classList.toggle("hidden", !(mobile && open));
-  $("activityPlan").setAttribute("aria-expanded", String(document.querySelector(".panel-area").classList.contains("open")));
+  // On desktop the panel is a column toggled by .panel-collapsed; below that it's a drawer.
+  const panelVisible = desktop
+    ? !document.querySelector(".main-grid").classList.contains("panel-collapsed")
+    : drawerOpen;
+  $("activityPlan").setAttribute("aria-expanded", String(panelVisible));
+}
+
+// The Supervisor Run panel: a collapsible column on desktop, a drawer on smaller widths.
+function toggleSupervisorPanel() {
+  if (window.matchMedia("(min-width: 1181px)").matches) {
+    document.querySelector(".main-grid").classList.toggle("panel-collapsed");
+  } else {
+    document.querySelector(".panel-area").classList.toggle("open");
+  }
+  syncDrawerState();
+}
+
+// From the mobile "More" menu: close the sidebar drawer and reveal the panel drawer.
+function openSupervisorFromMore() {
+  document.querySelector(".sidebar").classList.remove("open");
+  document.querySelector(".panel-area").classList.add("open");
+  syncDrawerState();
+}
+
+// Ensure the panel is showing (used when a plan/run needs it), regardless of layout.
+function revealSupervisorPanel() {
+  if (window.matchMedia("(min-width: 1181px)").matches) {
+    document.querySelector(".main-grid").classList.remove("panel-collapsed");
+  } else {
+    document.querySelector(".panel-area").classList.add("open");
+  }
+  syncDrawerState();
 }
 
 function closeDrawers() {
@@ -674,6 +706,24 @@ async function sendPrompt(event) {
 // File explorer
 // ---------------------------------------------------------------------------
 
+// Explicitly point the chat (and supervisor) at a folder. This is the ONE place browsing
+// turns into "what the model sees", so the pin reset is intentional and announced.
+function useFolderForContext(path) {
+  const previous = $("targetPath").value.trim();
+  $("targetPath").value = path;
+  $("planPath").value = path;
+  setWorkspaceTag(path);
+  hide("targetHint");
+  if (previous && previous !== path) {
+    resetPinnedContext();
+    showToast("Chat context set — pinned files cleared", "success");
+  } else {
+    showToast(`Chat context set to ${path}`, "success");
+  }
+  savePrefs();
+  openPath(path);
+}
+
 async function openPath(path) {
   const data = await api(`/api/files?path=${encodeURIComponent(path || "/")}`);
   if (data.is_dir === false) {
@@ -683,17 +733,22 @@ async function openPath(path) {
   $("filePath").value = data.path === "/" ? "" : data.path;
   $("fileList").innerHTML = "";
 
-  // Sync the chat target folder and plan path to wherever the Explorer is pointing
+  // Browsing is purely navigational: it no longer silently repoints the chat context or
+  // drops pinned files. Setting the chat context is an explicit action below.
   if (data.path && data.path !== "/") {
-    const previousTarget = $("targetPath").value.trim();
-    $("targetPath").value = data.path;
-    $("planPath").value = data.path;
-    if (previousTarget && previousTarget !== data.path) resetPinnedContext();
-    setWorkspaceTag(data.path);
-    hide("targetHint");
-    savePrefs();
     const ctx = $("explorerContext");
-    ctx.textContent = `📂 Ollama context: ${data.path}`;
+    ctx.innerHTML = "";
+    const isContext = $("targetPath").value.trim() === data.path;
+    const label = document.createElement("span");
+    label.textContent = isContext ? `📂 Chat context: ${data.path}` : `📁 ${data.path}`;
+    ctx.appendChild(label);
+    if (!isContext) {
+      const useBtn = document.createElement("button");
+      useBtn.className = "link-hint link-hint-inline";
+      useBtn.textContent = "Use for chat context";
+      useBtn.onclick = () => useFolderForContext(data.path);
+      ctx.appendChild(useBtn);
+    }
     show("explorerContext");
   } else {
     hide("explorerContext");
@@ -1161,7 +1216,7 @@ async function generatePlan() {
     return;
   }
   if (!provider) {
-    showToast("Link Codex or Claude in Brains & Agents.", "error");
+    showToast("Link a Brain in Settings → Brains first.", "error");
     return;
   }
   setBusy(["generatePlanBtn"], true);
@@ -1284,6 +1339,7 @@ async function redoPlan() {
 
 async function rejectPlan() {
   if (!currentRun) return;
+  if (!confirm("Reject this plan and end the run? The generated plan will be discarded.")) return;
   try {
     await api(`/api/runs/${currentRun}/reject`, { method: "POST", body: "{}" });
     await loadRun(currentRun);
@@ -1448,6 +1504,10 @@ function drawTaskGraph(run, subs, agents, editable) {
   svg.setAttribute("class", `tg-edges${editable ? " editable" : ""}`);
   svg.setAttribute("width", String(layout.width));
   svg.setAttribute("height", String(layout.height));
+  svg.setAttribute("role", "img");
+  const svgTitle = document.createElementNS(svgNS, "title");
+  svgTitle.textContent = `Task dependency graph, ${layout.nodes.length} task(s)`;
+  svg.appendChild(svgTitle);
   const defs = document.createElementNS(svgNS, "defs");
   const marker = document.createElementNS(svgNS, "marker");
   marker.setAttribute("id", "tg-arrow");
@@ -1502,6 +1562,17 @@ function drawTaskGraph(run, subs, agents, editable) {
     box.dataset.complexity = node.complexity;
     box.dataset.node = node.node_id;
     box.title = node.blocked_reason || node.handoff?.summary || node.title;
+    // Make each task focusable and announced (nodes were previously SR-invisible divs).
+    box.setAttribute("tabindex", "0");
+    box.setAttribute("role", "group");
+    const deps = (node.depends_on || []).join(", ");
+    box.setAttribute(
+      "aria-label",
+      `Task ${node.title}. Role ${node.role}. Status ${node.status}.`
+      + (node.complexity === "complex" ? " Complex." : "")
+      + (deps ? ` Depends on ${deps}.` : "")
+      + (node.blocked_reason ? ` Blocked: ${node.blocked_reason}.` : ""),
+    );
     if (isReady(node)) box.dataset.ready = "1";
     box.style.left = `${node.x}px`;
     box.style.top = `${node.y}px`;
@@ -1723,8 +1794,7 @@ async function loadRuns(append = false) {
         switchEditor("runEditor");
         closeDrawers();
         drawerReturnFocus = btn;
-        document.querySelector(".panel-area").classList.add("open");
-        syncDrawerState();
+        revealSupervisorPanel();
         subscribeRun(run.id);
       } catch (err) { showToast(err.message, "error"); }
     };
@@ -1835,11 +1905,15 @@ function syncProviderOptions() {
   if (!enabled.length) {
     const option = document.createElement("option");
     option.value = "";
-    option.textContent = "No AI provider configured";
+    option.textContent = "No Brain linked";
     select.appendChild(option);
   } else if (enabled.some((provider) => provider.value === selected)) {
     select.value = selected;
   }
+  // Guide the user when no Brain is linked: disable generate + show a link to Settings.
+  const hasProvider = enabled.length > 0;
+  $("generatePlanBtn").disabled = !hasProvider;
+  $("planProviderHint").classList.toggle("hidden", hasProvider);
 
   // Reflect linked providers into the chat engine picker + Agent Mode brain select.
   renderChatEngines();
@@ -2375,6 +2449,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // AI Plan (right panel)
   $("generatePlanBtn").onclick = generatePlan;
+  $("planProviderHint").onclick = openSettingsPage;
   $("approvePlanBtn").onclick  = implementPlan;
   $("editPlanBtn").onclick = () => setPlanEditing(true);
   $("savePlanBtn").onclick = savePlanChanges;
@@ -2420,8 +2495,7 @@ document.addEventListener("DOMContentLoaded", () => {
     hide("currentRunBadge");
     show("runEmptyHint");
     switchEditor("runEditor");
-    document.querySelector(".panel-area").classList.add("open");
-    syncDrawerState();
+    revealSupervisorPanel();
     $("planTask").focus();
   };
   $("refreshRunsBtn").onclick = () => loadRuns(false);
@@ -2474,13 +2548,14 @@ document.addEventListener("DOMContentLoaded", () => {
   $("activityTools").onclick    = () => switchSidePane("tools");
   $("activitySnaps").onclick    = () => { switchSidePane("snaps");    loadSnaps();    };
   $("activityTimeline").onclick = () => { switchSidePane("timeline"); loadTimeline(); };
-  $("activityPlan").onclick     = () => { document.querySelector(".panel-area").classList.toggle("open"); syncDrawerState(); };
+  $("activityPlan").onclick     = toggleSupervisorPanel;
   $("activitySettings").onclick = openSettingsPage;
   $("activityMore").onclick = () => switchSidePane("more");
   $("moreToolsBtn").onclick = () => switchSidePane("tools");
   $("moreSnapsBtn").onclick = () => { switchSidePane("snaps"); loadSnaps(); };
   $("moreTimelineBtn").onclick = () => { switchSidePane("timeline"); loadTimeline(); };
   $("moreSettingsBtn").onclick = openSettingsPage;
+  $("moreSupervisorBtn").onclick = openSupervisorFromMore;
 
   // Editor tabs
   document.querySelectorAll(".editor-tab").forEach((tab) => {
@@ -2489,7 +2564,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Status bar toggles
   $("menuBtn").onclick      = () => { document.querySelector(".sidebar").classList.toggle("open"); syncDrawerState(); };
-  $("workspaceBtn").onclick = () => { document.querySelector(".panel-area").classList.toggle("open"); syncDrawerState(); };
+  $("workspaceBtn").onclick = toggleSupervisorPanel;
   $("drawerBackdrop").onclick = closeDrawers;
   $("closeSidebarBtn").onclick = closeDrawers;
   $("closePlanBtn").onclick = closeDrawers;
