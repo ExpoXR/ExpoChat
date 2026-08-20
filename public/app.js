@@ -1962,42 +1962,69 @@ async function saveSettings(values, message) {
 
 let hostsCache = [];
 
+const KNOWN_ROLES = ["research", "implementation", "verification"];
+
 async function loadHosts() {
   const data = await api("/api/hosts");
   hostsCache = data.hosts || [];
   const list = $("hostList");
   if (!list) return;
   list.innerHTML = "";
+  if (!hostsCache.length) {
+    const empty = document.createElement("div");
+    empty.className = "settings-empty";
+    empty.textContent = "No hosts yet — add one above, or Scan network to detect a local server.";
+    list.appendChild(empty);
+    return;
+  }
   hostsCache.forEach((host) => {
     const badge = hostStatusLabel(host.status, host.last_seen);
     const row = document.createElement("div");
     row.className = "host-row";
+    const reason = host.status === "unreachable" && host.last_error ? ` · ${host.last_error}` : "";
     row.innerHTML = `<strong>${escapeHtml(host.name)}</strong>`
       + `<span class="host-badge host-badge-${badge.tone}">${escapeHtml(badge.text)}</span>`
-      + `<small>${escapeHtml(host.base_url)} · ${escapeHtml(host.kind)}</small>`;
-    const rescan = document.createElement("button");
-    rescan.textContent = "Discover";
-    rescan.onclick = () => discoverAgentModels(host.id);
+      + `<small>${escapeHtml(host.base_url)} · ${escapeHtml(host.kind)}${escapeHtml(reason)}</small>`;
+    const test = document.createElement("button");
+    test.textContent = "Test";
+    test.onclick = () => testHost(host);
+    const refresh = document.createElement("button");
+    refresh.textContent = "Refresh models";
+    refresh.onclick = () => discoverAgentModels(host.id);
     const toggle = document.createElement("button");
     toggle.textContent = host.enabled ? "Enabled" : "Disabled";
     toggle.onclick = async () => {
       try {
         await api(`/api/hosts/${host.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !host.enabled }) });
+        showToast(host.enabled ? "Host disabled" : "Host enabled", "success");
         await Promise.allSettled([loadHosts(), loadAgents()]);
       } catch (err) { showToast(err.message, "error"); }
     };
     const remove = document.createElement("button");
+    remove.className = "danger-btn";
     remove.textContent = "Remove";
     remove.onclick = async () => {
       if (!confirm(`Remove host "${host.name}" and its agents?`)) return;
       try {
         await api(`/api/hosts/${host.id}`, { method: "DELETE" });
+        showToast("Host removed", "success");
         await Promise.allSettled([loadHosts(), loadAgents()]);
       } catch (err) { showToast(err.message, "error"); }
     };
-    row.append(rescan, toggle, remove);
+    row.append(test, refresh, toggle, remove);
     list.appendChild(row);
   });
+}
+
+// Probe one host on demand and report reachability inline (reuses the scan endpoint).
+async function testHost(host) {
+  try {
+    const data = await api("/api/hosts/scan", { method: "POST", body: JSON.stringify({ base_url: host.base_url }) });
+    const hit = (data.results || []).find((r) => r.base_url === host.base_url);
+    if (hit && hit.reachable) showToast(`${host.name} online — ${hit.models.length} model(s)`, "success");
+    else showToast(`${host.name} unreachable at ${host.base_url}`, "error");
+    await loadHosts();
+  } catch (err) { showToast(err.message, "error"); }
 }
 
 async function addHost() {
@@ -2024,6 +2051,10 @@ async function scanHosts() {
     const results = data.results || [];
     box.innerHTML = "";
     box.hidden = false;
+    const title = document.createElement("div");
+    title.className = "scan-results-title";
+    title.textContent = "Detected servers";
+    box.appendChild(title);
     results.forEach((r) => {
       const row = document.createElement("div");
       row.className = "scan-row";
@@ -2047,7 +2078,12 @@ async function scanHosts() {
       }
       box.appendChild(row);
     });
-    if (!results.length) box.textContent = "No candidates probed.";
+    if (!results.length) {
+      const none = document.createElement("div");
+      none.className = "settings-empty";
+      none.textContent = "No servers detected. Enter a URL above and try again.";
+      box.appendChild(none);
+    }
   } catch (err) { showToast(err.message, "error"); }
   finally { setBusy(["scanHostsBtn"], false); }
 }
@@ -2057,15 +2093,43 @@ async function loadAgents() {
   const agents = data.agents || [];
   agentsCache = agents;
   const hostName = (id) => (hostsCache.find((h) => h.id === id) || {}).name || "";
-  $("agentList").innerHTML = "";
+  const list = $("agentList");
+  const head = document.querySelector(".agent-list-head");
+  list.innerHTML = "";
+  if (head) head.style.display = agents.length ? "grid" : "none";
+  if (!agents.length) {
+    const empty = document.createElement("div");
+    empty.className = "settings-empty";
+    empty.textContent = "No models yet — add a host above, then Refresh models.";
+    list.appendChild(empty);
+    return;
+  }
   agents.forEach((agent) => {
     const row = document.createElement("div");
     row.className = "agent-row";
     const host = hostName(agent.host_id);
     row.innerHTML = `<strong>${escapeHtml(agent.name)}</strong><span>${escapeHtml((agent.roles || []).join(" · "))}</span><small>${escapeHtml((agent.capabilities || []).join(", "))} · priority ${agent.priority}${host ? ` · ${escapeHtml(host)}` : ""}</small>`;
-    const roles = document.createElement("input");
-    roles.value = (agent.roles || []).join(", ");
-    roles.setAttribute("aria-label", `${agent.name} roles`);
+    // Roles as checkboxes over the known roles, not free-text CSV. Implementation needs the
+    // tools capability, so disable it when the model can't call tools.
+    const canImpl = (agent.capabilities || []).includes("tools");
+    const roleWrap = document.createElement("div");
+    roleWrap.className = "agent-roles";
+    const roleBoxes = KNOWN_ROLES.map((role) => {
+      const lbl = document.createElement("label");
+      lbl.className = "role-check";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = role;
+      cb.checked = (agent.roles || []).includes(role);
+      if (role === "implementation" && !canImpl) {
+        cb.disabled = true;
+        cb.checked = false;
+        lbl.title = "Model lacks the tools capability required for implementation";
+      }
+      lbl.append(cb, document.createTextNode(role));
+      roleWrap.appendChild(lbl);
+      return cb;
+    });
     const priority = document.createElement("input");
     priority.type = "number";
     priority.min = "0";
@@ -2084,11 +2148,12 @@ async function loadAgents() {
         await api(`/api/agents/${agent.id}`, {
           method: "PATCH",
           body: JSON.stringify({
-            roles: roles.value.split(",").map((role) => role.trim()).filter(Boolean),
+            roles: roleBoxes.filter((cb) => cb.checked).map((cb) => cb.value),
             priority: clampPriority(priority.value, { fallback: agent.priority }),
             system_prompt: prompt.value,
           }),
         });
+        showToast("Agent saved", "success");
         await loadAgents();
       } catch (err) { showToast(err.message, "error"); }
     };
@@ -2097,11 +2162,12 @@ async function loadAgents() {
     toggle.onclick = async () => {
       try {
         await api(`/api/agents/${agent.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !agent.enabled }) });
+        showToast(agent.enabled ? "Agent disabled" : "Agent enabled", "success");
         await loadAgents();
       } catch (err) { showToast(err.message, "error"); }
     };
-    row.append(roles, priority, prompt, save, toggle);
-    $("agentList").appendChild(row);
+    row.append(roleWrap, priority, prompt, save, toggle);
+    list.appendChild(row);
   });
 }
 

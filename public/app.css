@@ -13,6 +13,7 @@
   --accent: #007acc;
   --accent-strong: #0e639c;
   --danger: #f48771;
+  --ok: #89e68f;
   --input: #3c3c3c;
   --status: #007acc;
   --surface-raised: #1b1b1b;
@@ -37,6 +38,7 @@
   --accent: #0066b8;
   --accent-strong: #0e639c;
   --danger: #c72e2e;
+  --ok: #1a7f37;
   --input: #ffffff;
   --status: #0066b8;
   --surface-raised: #eef0f2;
@@ -49,6 +51,7 @@
     --title: #dcdcdc; --activity: #e4e4e4; --side: #f3f3f3; --editor: #ffffff;
     --panel: #f6f6f6; --tab: #ececec; --line: #cfcfcf; --line-soft: #e4e4e4;
     --text: #1f1f1f; --muted: #5f5f5f; --accent: #0066b8; --status: #0066b8;
+    --danger: #c72e2e; --ok: #1a7f37;
     --input: #ffffff; --surface-raised: #eef0f2; --msg-user: #dbeafe;
   }
 }
@@ -1806,16 +1809,86 @@ pre {
   display: grid;
   gap: 6px;
   margin-top: 8px;
+  padding: 8px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+}
+.scan-results-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+  margin-bottom: 4px;
 }
 .host-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-size: 11px;
   padding: 1px 8px;
   border-radius: 999px;
-  border: 1px solid var(--line-soft);
+  border: 1px solid currentColor;
 }
-.host-badge-ok { color: #1a7f37; border-color: #1a7f37; }
-.host-badge-bad { color: #cf222e; border-color: #cf222e; }
+/* Dot keeps status legible without relying on color alone (badge text still labels it). */
+.host-badge::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.host-badge-ok { color: var(--ok); }
+.host-badge-bad { color: var(--danger); }
 .host-badge-muted { color: var(--muted); }
+
+/* Ollama host mark + discovered-models header */
+.ollama-mark { background: #2b3a2f; color: var(--ok); }
+.agent-section-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 18px 0 6px;
+}
+.agent-section-head h3 { margin: 0; }
+.agent-list-head {
+  display: none;
+  gap: 8px;
+  padding: 4px 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+}
+.settings-empty {
+  padding: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  text-align: center;
+}
+/* Destructive action in host/agent rows reads as danger, not another neutral button. */
+.danger-btn {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: transparent;
+}
+.danger-btn:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); }
+.agent-roles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 3px;
+}
+.role-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text);
+}
+.role-check input[disabled] + * { color: var(--muted); }
 
 /* -----------------------------------------------------------------------
    Full-page settings

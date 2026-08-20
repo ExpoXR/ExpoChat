@@ -367,23 +367,20 @@
 
               <section class="settings-section">
                 <div class="settings-section-heading"><div><h2>Appearance &amp; defaults</h2><p>Stored server-side and applied on every signed-in browser.</p></div></div>
-                <div class="settings-grid settings-grid-two">
+                <div class="settings-grid">
                   <article class="settings-card">
                     <label for="themeSelect">Theme</label>
                     <select id="themeSelect"><option value="dark">Dark</option><option value="light">Light</option><option value="auto">Match system</option></select>
                     <label class="check-label"><input id="agentModeDefault" type="checkbox"> Default new chats to Agent Mode</label>
                     <button id="saveAppearanceBtn">Save appearance</button>
                   </article>
-                  <article class="settings-card">
-                    <h3>Local Ollama agents</h3>
-                    <p class="settings-help">Discover models across your hosts, then assign roles, priority, and optional system prompts.</p>
-                    <button id="discoverAgentsBtn">Discover models</button>
-                  </article>
                 </div>
+              </section>
 
+              <section class="settings-section">
+                <div class="settings-section-heading"><div><h2>Local models &amp; hosts</h2><p>Run models on this device, your network, or other machines. Add a host, scan to confirm it is reachable, then assign roles to the models it exposes.</p></div></div>
                 <article class="settings-card">
-                  <h3>Ollama hosts</h3>
-                  <p class="settings-help">Add local LLM servers — this device, your network, or other machines. Detect probes reachable servers; each host's models become agents below.</p>
+                  <div class="settings-card-title"><span class="provider-mark ollama-mark">L</span><div><h3>Ollama hosts</h3><p>Register a server; Scan confirms it is reachable and lists its models.</p></div></div>
                   <div class="host-add-row">
                     <input id="hostName" placeholder="Name (e.g. Workstation)" aria-label="New host name">
                     <input id="hostUrl" placeholder="http://127.0.0.1:11434" aria-label="New host URL">
@@ -391,13 +388,18 @@
                       <option value="local">Same device</option>
                       <option value="network" selected>Network</option>
                     </select>
-                    <button id="addHostBtn">Add host</button>
-                    <button id="scanHostsBtn">Detect</button>
+                    <button id="addHostBtn">Add</button>
+                    <button id="scanHostsBtn">Scan network</button>
                   </div>
                   <div id="scanResults" class="scan-results" hidden></div>
                   <div id="hostList" class="settings-host-grid"></div>
                 </article>
 
+                <div class="agent-section-head">
+                  <div><h3>Discovered models</h3><p class="settings-help">Models found on your hosts. Assign the roles and priority the Brain uses to pick an agent.</p></div>
+                  <button id="discoverAgentsBtn">Refresh models</button>
+                </div>
+                <div class="agent-list-head" aria-hidden="true"><span>Model</span><span>Roles</span><span>Priority</span></div>
                 <div id="agentList" class="settings-agent-grid"></div>
               </section>
             </div>
