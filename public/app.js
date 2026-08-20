@@ -145,8 +145,12 @@ function showToast(message, type = "info") {
   const t = $("toast");
   t.textContent = message;
   t.className = `toast toast-${type}`;
+  // Errors are announced assertively and linger longer so actionable failures aren't missed.
+  const assertive = type === "error";
+  t.setAttribute("role", assertive ? "alert" : "status");
+  t.setAttribute("aria-live", assertive ? "assertive" : "polite");
   clearTimeout(t._tid);
-  t._tid = setTimeout(() => t.classList.add("hidden"), 3500);
+  t._tid = setTimeout(() => t.classList.add("hidden"), assertive ? 6000 : 3500);
 }
 
 // Render an inline error placeholder into a list pane so a failed fetch leaves a
@@ -214,11 +218,16 @@ function switchSidePane(name) {
     const panEl = $(pane + "Pane");
     if (panEl) panEl.classList.toggle("hidden", pane !== name);
     const btn = $("activity" + pane[0].toUpperCase() + pane.slice(1));
-    if (btn) btn.classList.toggle("active", pane === name);
+    if (btn) {
+      btn.classList.toggle("active", pane === name);
+      btn.setAttribute("aria-current", pane === name ? "page" : "false");
+    }
   });
   drawerReturnFocus = document.activeElement;
-  document.querySelector(".sidebar").classList.add("open");
+  const sidebar = document.querySelector(".sidebar");
+  sidebar.classList.add("open");
   syncDrawerState();
+  focusSheetInto(sidebar);
 }
 
 function setSettingsMode(active) {
@@ -226,7 +235,9 @@ function setSettingsMode(active) {
   const wasActive = grid.classList.contains("settings-active");
   grid.classList.toggle("settings-active", active);
   $("activitySettings").classList.toggle("active", active);
-  if (!active && wasActive && !$("settingsEditor").classList.contains("hidden")) switchEditor("chatEditor");
+  $("activitySettings").setAttribute("aria-current", active ? "page" : "false");
+  // Returning from settings restores the editor you were in, not always chat.
+  if (!active && wasActive && !$("settingsEditor").classList.contains("hidden")) switchEditor(lastContentEditor || "chatEditor");
 }
 
 async function openSettingsPage() {
@@ -251,19 +262,23 @@ function syncDrawerState() {
 
 // The Supervisor Run panel: a collapsible column on desktop, a drawer on smaller widths.
 function toggleSupervisorPanel() {
+  const panel = document.querySelector(".panel-area");
   if (window.matchMedia("(min-width: 1181px)").matches) {
     document.querySelector(".main-grid").classList.toggle("panel-collapsed");
   } else {
-    document.querySelector(".panel-area").classList.toggle("open");
+    panel.classList.toggle("open");
+    if (panel.classList.contains("open")) focusSheetInto(panel);
   }
   syncDrawerState();
 }
 
 // From the mobile "More" menu: close the sidebar drawer and reveal the panel drawer.
 function openSupervisorFromMore() {
+  const panel = document.querySelector(".panel-area");
   document.querySelector(".sidebar").classList.remove("open");
-  document.querySelector(".panel-area").classList.add("open");
+  panel.classList.add("open");
   syncDrawerState();
+  focusSheetInto(panel);
 }
 
 // Ensure the panel is showing (used when a plan/run needs it), regardless of layout.
@@ -282,6 +297,15 @@ function closeDrawers() {
   syncDrawerState();
   if (drawerReturnFocus && drawerReturnFocus.isConnected) drawerReturnFocus.focus();
   drawerReturnFocus = null;
+}
+
+// When a drawer/overlay opens (≤1180px), move focus into it so keyboard users land inside.
+function focusSheetInto(el) {
+  if (!el || !window.matchMedia("(max-width: 1180px)").matches) return;
+  const focusable = el.querySelector(
+    "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])"
+  );
+  if (focusable) requestAnimationFrame(() => focusable.focus());
 }
 
 const PANEL_LAYOUT_KEY = "ollma_panel_layout";
@@ -336,10 +360,13 @@ function setupPanelResizer(id, kind, fallback) {
   });
 }
 
+let lastContentEditor = "chatEditor"; // last non-settings editor, for return-from-settings
+
 function switchEditor(id) {
   // Leaving the run view: stop the run SSE stream so it doesn't keep refetching
   // in the background (it was previously only closed on terminal status).
   if (id !== "runEditor") closeRunStream();
+  if (id !== "settingsEditor") lastContentEditor = id;
   ["chatEditor", "runEditor", "fileEditor", "diffEditor", "artifactEditor", "settingsEditor"].forEach((pane) =>
     $(pane).classList.toggle("hidden", pane !== id)
   );
@@ -695,7 +722,18 @@ async function sendPrompt(event) {
   } catch (err) {
     showToast(err.message, "error");
     setStatus("Error");
-    if (!fullText) node.querySelector(".msg-body").textContent = "Error: " + err.message;
+    const body = node.querySelector(".msg-body");
+    if (!fullText) body.textContent = "Error: " + err.message;
+    // Leave an inline retry so a failed send isn't a dead end after the toast fades.
+    const retry = document.createElement("button");
+    retry.className = "msg-retry link-hint";
+    retry.textContent = "Retry";
+    retry.onclick = () => {
+      node.remove();
+      $("prompt").value = content;
+      sendPrompt({ preventDefault() {} });
+    };
+    body.appendChild(retry);
   } finally {
     hide("streamCursor");
     setBusy(["sendBtn", "prompt"], false);
@@ -2039,7 +2077,9 @@ let hostsCache = [];
 const KNOWN_ROLES = ["research", "implementation", "verification"];
 
 async function loadHosts() {
-  const data = await api("/api/hosts");
+  let data;
+  try { data = await api("/api/hosts"); }
+  catch (err) { showPaneError("hostList", `Couldn't load hosts: ${err.message}`); return; }
   hostsCache = data.hosts || [];
   const list = $("hostList");
   if (!list) return;
@@ -2163,7 +2203,9 @@ async function scanHosts() {
 }
 
 async function loadAgents() {
-  const data = await api("/api/agents");
+  let data;
+  try { data = await api("/api/agents"); }
+  catch (err) { showPaneError("agentList", `Couldn't load models: ${err.message}`); return; }
   const agents = data.agents || [];
   agentsCache = agents;
   const hostName = (id) => (hostsCache.find((h) => h.id === id) || {}).name || "";
@@ -2537,7 +2579,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("discoverAgentsBtn").onclick = () => discoverAgentModels();
   $("addHostBtn").onclick = addHost;
   $("scanHostsBtn").onclick = scanHosts;
-  $("closeSettingsBtn").onclick = () => { setSettingsMode(false); switchEditor("chatEditor"); };
+  $("closeSettingsBtn").onclick = () => setSettingsMode(false);
   $("openSnapshotsSettingsBtn").onclick = () => { switchSidePane("snaps"); loadSnaps(); };
   $("openTimelineSettingsBtn").onclick = () => { switchSidePane("timeline"); loadTimeline(); };
 
@@ -2579,7 +2621,7 @@ document.addEventListener("DOMContentLoaded", () => {
       closeContextMenu();
       closeDrawers();
     }
-    if (e.key === "Tab" && window.matchMedia("(max-width: 767px)").matches) {
+    if (e.key === "Tab" && window.matchMedia("(max-width: 1180px)").matches) {
       const sheet = document.querySelector(".panel-area.open") || document.querySelector(".sidebar.open");
       if (!sheet) return;
       const focusable = [...sheet.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])")]

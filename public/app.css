@@ -9,7 +9,7 @@
   --line: #3c3c3c;
   --line-soft: #2a2a2a;
   --text: #cccccc;
-  --muted: #8a8a8a;
+  --muted: #9e9e9e;
   --accent: #007acc;
   --accent-strong: #0e639c;
   --danger: #f48771;
@@ -268,7 +268,6 @@ textarea {
 /* Desktop only: the Supervisor Run star collapses/expands the right panel column
    (below 1181px the panel is a slide-in drawer instead — see the tablet media query). */
 @media (min-width: 1181px) {
-  .main-grid { transition: grid-template-columns 0.16s ease; }
   .main-grid.panel-collapsed {
     grid-template-columns: 48px var(--sidebar-width, 292px) 5px minmax(0, 1fr) 0 0;
   }
@@ -300,7 +299,7 @@ textarea {
   border-left: 2px solid transparent;
   border-radius: 0;
   background: transparent;
-  color: #858585;
+  color: #a0a0a0;
 }
 
 .activity:hover {
@@ -1915,6 +1914,10 @@ pre {
   margin-left: 8px;
   padding: 0;
   font-size: 11px;
+}
+.msg-retry {
+  display: inline-block;
+  margin-top: 6px;
 }
 
 /* -----------------------------------------------------------------------

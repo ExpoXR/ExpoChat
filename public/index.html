@@ -13,8 +13,8 @@
       <form id="loginForm" class="login-panel">
         <div class="login-mark">E</div>
         <h1>ExpoChat</h1>
-        <input id="username" autocomplete="username" placeholder="Username">
-        <input id="password" type="password" autocomplete="current-password" placeholder="Password">
+        <input id="username" autocomplete="username" placeholder="Username" aria-label="Username">
+        <input id="password" type="password" autocomplete="current-password" placeholder="Password" aria-label="Password">
         <button type="submit">Login</button>
         <p id="loginError" role="alert" aria-live="assertive"></p>
       </form>
@@ -68,7 +68,7 @@
           <section id="chatPane" class="side-pane">
             <div class="section-title">CHAT</div>
             <label>Target Folder <span class="label-hint">(required for file context)</span></label>
-            <input id="targetPath" placeholder="/datasets/tank/projects">
+            <input id="targetPath" placeholder="/datasets/tank/projects" aria-label="Chat target folder">
             <p id="targetHint" class="field-hint hidden">⚠ Set a target folder so Ollama can see your files.</p>
             <div class="btn-row">
               <button id="newChatBtn">New Chat</button>
@@ -93,7 +93,7 @@
           <section id="filesPane" class="side-pane hidden">
             <div class="section-title">EXPLORER</div>
             <div class="pathbar compact">
-              <input id="filePath" placeholder="/datasets/tank">
+              <input id="filePath" placeholder="/datasets/tank" aria-label="Explorer folder path">
               <button id="openPathBtn">Open</button>
             </div>
             <div class="btn-row">
@@ -108,7 +108,7 @@
           <!-- Search pane -->
           <section id="toolsPane" class="side-pane hidden">
             <div class="section-title">SEARCH</div>
-            <input id="searchTerm" placeholder="Search text…">
+            <input id="searchTerm" placeholder="Search text…" aria-label="Search workspace text">
             <button id="searchBtn">Search</button>
             <div id="searchResults" class="tree"></div>
             <button id="searchMoreBtn" class="hidden">More results</button>
@@ -174,11 +174,11 @@
             </div>
             <form id="chatForm" class="composer">
               <div class="composer-controls">
-                <label class="check-label agent-toggle"><input id="agentModeToggle" type="checkbox"> Agent Mode</label>
-                <select id="chatBrainSelect" class="hidden" title="Supervisor brain used to plan in Agent Mode"></select>
+                <label class="check-label agent-toggle" title="Agent Mode: a quick in-chat agentic reply using a Brain. For the full research → plan → approve → implement pipeline, use Supervisor Run."><input id="agentModeToggle" type="checkbox"> Agent Mode</label>
+                <select id="chatBrainSelect" class="hidden" title="Brain used to plan in Agent Mode" aria-label="Agent Mode brain"></select>
               </div>
               <div class="composer-input">
-                <textarea id="prompt" rows="3" placeholder="Ask Ollama… (Ctrl+Enter to send)"></textarea>
+                <textarea id="prompt" rows="3" placeholder="Ask Ollama… (Ctrl+Enter to send)" aria-label="Chat message"></textarea>
                 <button type="submit" id="sendBtn">Send</button>
               </div>
             </form>
@@ -416,11 +416,11 @@
           <div class="plan-section-title">SUPERVISOR RUN</div>
           <div id="planFormArea">
             <label>Target Path</label>
-            <input id="planPath" placeholder="/datasets/tank/myproject">
+            <input id="planPath" placeholder="/datasets/tank/myproject" aria-label="Supervisor run target path">
             <label>Task</label>
-            <textarea id="planTask" rows="4" placeholder="Describe what to build or fix…"></textarea>
+            <textarea id="planTask" rows="4" placeholder="Describe what to build or fix…" aria-label="Supervisor run task description"></textarea>
             <label>Brain</label>
-            <select id="planProvider"></select>
+            <select id="planProvider" aria-label="Supervisor run brain"></select>
             <label class="check-label"><input id="webResearch" type="checkbox"> Allow web research for this run</label>
             <button id="generatePlanBtn">Research &amp; Write Plan</button>
             <button id="planProviderHint" class="link-hint hidden" type="button">No Brain linked — open Settings → Brains</button>
