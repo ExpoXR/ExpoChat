@@ -35,7 +35,7 @@
           <button id="activityChat"     class="activity active" title="Chat" aria-label="Chat">
             <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
           </button>
-          <button id="activityRuns"     class="activity" title="Agent Runs" aria-label="Agent runs">
+          <button id="activityRuns"     class="activity" title="Run History" aria-label="Run history">
             <svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h5M8 17h7"/></svg>
           </button>
           <button id="activityFiles"    class="activity" title="Explorer" aria-label="Explorer">
@@ -50,10 +50,10 @@
           <button id="activityTimeline" class="activity" title="Timeline" aria-label="Timeline">
             <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
           </button>
-          <button id="activityPlan"     class="activity" title="AI Plan Panel" aria-label="Supervisor run" aria-expanded="false">
+          <button id="activityPlan"     class="activity" title="Supervisor Run" aria-label="Supervisor run" aria-expanded="false">
             <svg viewBox="0 0 24 24"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg>
           </button>
-          <button id="activitySettings" class="activity" title="Brains and Agents" aria-label="Brains and agents">
+          <button id="activitySettings" class="activity" title="Settings" aria-label="Settings">
             <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
           </button>
           <button id="activityMore" class="activity mobile-only" title="More" aria-label="More">
@@ -67,8 +67,6 @@
           <!-- Chat pane -->
           <section id="chatPane" class="side-pane">
             <div class="section-title">CHAT</div>
-            <label>Model</label>
-            <select id="modelSelect"></select>
             <label>Target Folder <span class="label-hint">(required for file context)</span></label>
             <input id="targetPath" placeholder="/datasets/tank/projects">
             <p id="targetHint" class="field-hint hidden">⚠ Set a target folder so Ollama can see your files.</p>
@@ -143,7 +141,7 @@
               <button id="moreToolsBtn">Search</button>
               <button id="moreSnapsBtn">Snapshots</button>
               <button id="moreTimelineBtn">Timeline</button>
-              <button id="moreSettingsBtn">Brains &amp; Agents</button>
+              <button id="moreSettingsBtn">Settings</button>
             </div>
           </section>
         </aside>
@@ -447,7 +445,7 @@
 
       <footer class="statusbar">
         <button id="menuBtn" aria-label="Toggle navigation sidebar">Menu</button>
-        <button id="workspaceBtn">Plan Panel</button>
+        <button id="workspaceBtn">Supervisor Run</button>
         <span id="status">Connecting</span>
         <span class="status-spacer"></span>
         <span id="claudeIndicator" class="brain-indicator hidden"></span>

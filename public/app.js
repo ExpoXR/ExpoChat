@@ -67,7 +67,7 @@ function renderOllamaStatus() {
     $("ollamaStatus").textContent = "Offline";
     return;
   }
-  const value = $("modelSelect")?.value || $("chatModelSelect")?.value || "";
+  const value = $("chatModelSelect")?.value || "";
   $("ollamaStatus").textContent = (value || (ollamaOnline ? "Online" : "connecting…")).replace(/^cloud:/, "");
 }
 
@@ -460,42 +460,40 @@ async function loadModels() {
   renderChatEngines();
 }
 
-// Rebuild the chat engine picker: local Ollama models + linked cloud brains.
+// Rebuild the chat engine picker (single control): local Ollama models + linked cloud brains.
 function renderChatEngines() {
-  const selects = [$("modelSelect"), $("chatModelSelect")].filter(Boolean);
-  const prev = $("chatModelSelect")?.value || $("modelSelect").value || loadPrefs().model;
+  const select = $("chatModelSelect");
+  if (!select) return;
+  const prev = select.value || loadPrefs().model;
   const cloud = providerOptions(brains || []);
-  selects.forEach((select) => {
-    select.innerHTML = "";
-    const localGroup = document.createElement("optgroup");
-    localGroup.label = "Local (Ollama)";
-    models.forEach((model) => {
-      const opt = document.createElement("option");
-      opt.value = model.name || model.model;
-      opt.textContent = model.name || model.model;
-      localGroup.appendChild(opt);
-    });
-    select.appendChild(localGroup);
-    if (cloud.length) {
-      const cloudGroup = document.createElement("optgroup");
-      cloudGroup.label = "Cloud (API)";
-      cloud.forEach((provider) => {
-        const opt = document.createElement("option");
-        opt.value = cloudEngineValue(provider.value);
-        opt.textContent = provider.label;
-        cloudGroup.appendChild(opt);
-      });
-      select.appendChild(cloudGroup);
-    }
-    if (prev && [...select.options].some((opt) => opt.value === prev)) select.value = prev;
+  select.innerHTML = "";
+  const localGroup = document.createElement("optgroup");
+  localGroup.label = "Local (Ollama)";
+  models.forEach((model) => {
+    const opt = document.createElement("option");
+    opt.value = model.name || model.model;
+    opt.textContent = model.name || model.model;
+    localGroup.appendChild(opt);
   });
-  syncChatModel($("modelSelect").value || $("chatModelSelect")?.value || "");
+  select.appendChild(localGroup);
+  if (cloud.length) {
+    const cloudGroup = document.createElement("optgroup");
+    cloudGroup.label = "Cloud (API)";
+    cloud.forEach((provider) => {
+      const opt = document.createElement("option");
+      opt.value = cloudEngineValue(provider.value);
+      opt.textContent = provider.label;
+      cloudGroup.appendChild(opt);
+    });
+    select.appendChild(cloudGroup);
+  }
+  if (prev && [...select.options].some((opt) => opt.value === prev)) select.value = prev;
+  syncChatModel(select.value || "");
 }
 
 function syncChatModel(value) {
-  [$("modelSelect"), $("chatModelSelect")].filter(Boolean).forEach((select) => {
-    if ([...select.options].some((option) => option.value === value)) select.value = value;
-  });
+  const select = $("chatModelSelect");
+  if (select && [...select.options].some((option) => option.value === value)) select.value = value;
   renderOllamaStatus();
   savePrefs();
 }
@@ -520,7 +518,7 @@ async function loadChat(id) {
     $("planPath").value = chat.target_path || "";
     setWorkspaceTag(chat.target_path || "");
     if (previousTarget !== (chat.target_path || "")) resetPinnedContext();
-    if (chat.model && [...$("modelSelect").options].some((option) => option.value === chat.model)) {
+    if (chat.model && [...$("chatModelSelect").options].some((option) => option.value === chat.model)) {
       syncChatModel(chat.model);
     }
   }
@@ -533,7 +531,7 @@ async function loadChat(id) {
 }
 
 async function createChat(withSnapshot) {
-  const model = $("modelSelect").value;
+  const model = $("chatModelSelect").value;
   const target = $("targetPath").value.trim();
   if (!model) {
     showToast("Select an available Ollama model.", "error");
@@ -576,7 +574,7 @@ async function sendPrompt(event) {
   event.preventDefault();
   const content = $("prompt").value.trim();
   if (!content) return;
-  if (!$("modelSelect").value) {
+  if (!$("chatModelSelect").value) {
     showToast("Select an available Ollama model.", "error");
     return;
   }
@@ -599,7 +597,7 @@ async function sendPrompt(event) {
 
   const engineLabel = $("agentModeToggle").checked
     ? "agents"
-    : ($("modelSelect").selectedOptions[0]?.textContent || "assistant");
+    : ($("chatModelSelect").selectedOptions[0]?.textContent || "assistant");
   const node = addMessageNode("assistant", engineLabel);
   show("streamCursor");
 
@@ -614,7 +612,7 @@ async function sendPrompt(event) {
       },
       body: JSON.stringify(buildChatPayload(
         content,
-        $("modelSelect").value,
+        $("chatModelSelect").value,
         $("targetPath").value.trim(),
         pinnedContextPaths,
         { agentMode: $("agentModeToggle").checked, brainProvider: $("chatBrainSelect").value },
@@ -2130,7 +2128,7 @@ async function discoverAgentModels(hostId = null) {
 function savePrefs() {
   try {
     writePreferences(localStorage, {
-      model: $("modelSelect").value,
+      model: $("chatModelSelect").value,
       target: $("targetPath").value,
       file: currentFile,
       chat: currentChat,
@@ -2267,7 +2265,6 @@ document.addEventListener("DOMContentLoaded", () => {
   $("newChatBtn").onclick      = newChat;
   $("saveNewChatBtn").onclick  = saveAndNewChat;
   $("applyCodeBtn").onclick = applyLastCodeBlock;
-  $("modelSelect").onchange = () => syncChatModel($("modelSelect").value);
   $("chatModelSelect").onchange = () => syncChatModel($("chatModelSelect").value);
   $("targetPath").onchange = () => {
     hide("targetHint");
