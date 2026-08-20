@@ -287,6 +287,68 @@ def _offline_safe_graph(db: sqlite3.Connection) -> None:
     )
 
 
+def _ollama_hosts(db: sqlite3.Connection) -> None:
+    """Introduce a multi-host Ollama registry and bind every agent to a host.
+
+    Adds the ``ollama_hosts`` table, seeds a ``host-default`` row from the configured
+    ``OLLAMA_BASE_URL`` (so existing single-host installs keep working unchanged), then
+    rebuilds ``agent_profiles`` to add ``host_id``/``host_base_url`` and change uniqueness
+    from ``model`` alone to ``(host_id, model)`` — the same model may now live on two hosts.
+    """
+    # Import here (not module-scope): db.py imports this module, so a top-level
+    # ``from .config`` risks an import cycle; config imports neither db nor migrations.
+    from .config import settings
+
+    seed_url = settings.ollama_url
+
+    db.execute(
+        "create table if not exists ollama_hosts ("
+        " id text primary key, name text not null, base_url text not null unique,"
+        " kind text not null default 'network' check(kind in ('local','network')),"
+        " enabled integer not null default 1,"
+        " status text not null default 'unknown',"  # unknown | reachable | unreachable
+        " last_seen text, last_error text,"
+        " created_at text not null, updated_at text not null)"
+    )
+    # Seed the default host from env config. Fixed id so the seed is idempotent and the
+    # agent_profiles back-fill below can point every existing agent at it.
+    db.execute(
+        "insert or ignore into ollama_hosts(id,name,base_url,kind,enabled,status,created_at,updated_at) "
+        "values('host-default','Default (env)',?,'network',1,'unknown',"
+        "strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (seed_url,),
+    )
+
+    # Rebuild agent_profiles: SQLite can't ALTER a column-level UNIQUE, so follow the
+    # table-rebuild pattern used by _brain_gemini / _task_dag. Idempotent via host_id guard.
+    current = db.execute(
+        "select sql from sqlite_master where type='table' and name='agent_profiles'"
+    ).fetchone()
+    if current and "host_id" in (current[0] or ""):
+        return
+    db.execute(
+        "create table agent_profiles_new ("
+        " id text primary key, name text not null, model text not null,"
+        " roles_json text not null, system_prompt text not null default '',"
+        " capabilities_json text not null default '[]', context_size integer not null default 0,"
+        " priority integer not null default 50, role_scores_json text not null default '{}',"
+        " enabled integer not null default 1, discovered_at text not null, updated_at text not null,"
+        " host_id text not null default 'host-default', host_base_url text not null default '',"
+        " unique(host_id, model))"
+    )
+    db.execute(
+        "insert into agent_profiles_new("
+        "id,name,model,roles_json,system_prompt,capabilities_json,context_size,priority,"
+        "role_scores_json,enabled,discovered_at,updated_at,host_id,host_base_url) "
+        "select id,name,model,roles_json,system_prompt,capabilities_json,context_size,priority,"
+        "role_scores_json,enabled,discovered_at,updated_at,'host-default',? from agent_profiles",
+        (seed_url,),
+    )
+    db.execute("drop table agent_profiles")
+    db.execute("alter table agent_profiles_new rename to agent_profiles")
+    db.execute("create index if not exists idx_agent_profiles_host on agent_profiles(host_id)")
+
+
 MIGRATIONS: list[tuple[int, Migration]] = [
     (1, _snapshot_metadata),
     (2, _durable_jobs),
@@ -302,6 +364,7 @@ MIGRATIONS: list[tuple[int, Migration]] = [
     (12, _check_evidence),
     (13, _subtask_graph_ui),
     (14, _offline_safe_graph),
+    (15, _ollama_hosts),
 ]
 
 

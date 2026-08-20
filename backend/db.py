@@ -1,4 +1,5 @@
 import json
+import secrets
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
@@ -180,6 +181,84 @@ def add_brain_memory(run_id: str, step: str, role: str, content: str) -> int:
 def brain_memory(run_id: str) -> list[dict[str, Any]]:
     """Retrieve all brain memory entries for a run, ordered by sequence."""
     return all_rows("select * from brain_memory where run_id=? order by seq", (run_id,))
+
+
+# ---------------------------------------------------------------------------
+# Ollama hosts — multi-host registry (same device / network / multiple devices)
+# ---------------------------------------------------------------------------
+
+DEFAULT_HOST_ID = "host-default"
+
+
+def normalize_base_url(value: str) -> str:
+    """Trim and strip a trailing slash so equal URLs compare/dedupe consistently."""
+    return (value or "").strip().rstrip("/")
+
+
+def ollama_hosts(enabled_only: bool = False) -> list[dict[str, Any]]:
+    clause = " where enabled=1" if enabled_only else ""
+    return all_rows(f"select * from ollama_hosts{clause} order by created_at, id")
+
+
+def ollama_host(host_id: str) -> dict[str, Any] | None:
+    return one("select * from ollama_hosts where id=?", (host_id,))
+
+
+def ollama_host_by_url(base_url: str) -> dict[str, Any] | None:
+    return one("select * from ollama_hosts where base_url=?", (normalize_base_url(base_url),))
+
+
+def add_ollama_host(name: str, base_url: str, kind: str = "network") -> dict[str, Any]:
+    """Register a host. Returns the new row. Raises sqlite3.IntegrityError on duplicate URL."""
+    host_id = "host-" + secrets.token_hex(6)
+    now = utcnow()
+    kind = kind if kind in ("local", "network") else "network"
+    execute(
+        "insert into ollama_hosts(id,name,base_url,kind,enabled,status,created_at,updated_at) "
+        "values(?,?,?,?,1,'unknown',?,?)",
+        (host_id, name.strip() or base_url, normalize_base_url(base_url), kind, now, now),
+    )
+    return ollama_host(host_id) or {}
+
+
+def update_ollama_host(host_id: str, **values: Any) -> None:
+    if not values:
+        return
+    if "base_url" in values:
+        values["base_url"] = normalize_base_url(values["base_url"])
+    values["updated_at"] = utcnow()
+    columns = ",".join(f"{key}=?" for key in values)
+    execute(f"update ollama_hosts set {columns} where id=?", (*values.values(), host_id))
+
+
+def set_host_status(host_id: str, status: str, error: str | None = None) -> None:
+    """Record a host's reachability. 'reachable' stamps last_seen; errors keep last_error."""
+    now = utcnow()
+    if status == "reachable":
+        execute(
+            "update ollama_hosts set status=?,last_seen=?,last_error=null,updated_at=? where id=?",
+            (status, now, now, host_id),
+        )
+    else:
+        execute(
+            "update ollama_hosts set status=?,last_error=?,updated_at=? where id=?",
+            (status, (error or "")[:2000], now, host_id),
+        )
+
+
+def delete_ollama_host(host_id: str) -> None:
+    """Hard-delete a host and its discovered agents. Callers guard the last-enabled host."""
+    with transaction() as conn:
+        conn.execute("delete from agent_profiles where host_id=?", (host_id,))
+        conn.execute("delete from ollama_hosts where id=?", (host_id,))
+
+
+def set_host_agents_enabled(host_id: str, enabled: bool) -> None:
+    """Soft-toggle every agent bound to a host (used when a host is disabled)."""
+    execute(
+        "update agent_profiles set enabled=?,updated_at=? where host_id=?",
+        (1 if enabled else 0, utcnow(), host_id),
+    )
 
 
 DEFAULT_SETTINGS: dict[str, str] = {

@@ -12,7 +12,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request, Response
@@ -34,6 +35,7 @@ from .orchestrator import (
     discover_agents,
     edit_plan,
     edit_task_graph,
+    host_reachable,
     provider_config,
     record_chat_usage,
     redo_plan,
@@ -119,6 +121,25 @@ class AgentCreateBody(BaseModel):
     priority: int = Field(default=50, ge=0, le=1000)
     role_scores: dict[str, int] = Field(default_factory=dict)
     enabled: bool = True
+
+
+class HostCreateBody(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    base_url: str = Field(min_length=1, max_length=500)
+    kind: Literal["local", "network"] = "network"
+
+
+class HostPatchBody(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    enabled: bool | None = None
+
+
+class HostScanBody(BaseModel):
+    base_url: str | None = Field(default=None, max_length=500)
+
+
+class DiscoverBody(BaseModel):
+    host_id: str | None = Field(default=None, max_length=64)
 
 
 class RunBody(BaseModel):
@@ -377,13 +398,23 @@ async def internal_ollama_proxy(ollama_path: str, request: Request):
         raise HTTPException(401, "Invalid worker token")
     if ollama_path not in {"api/chat", "api/tags", "api/show", "api/version"}:
         raise HTTPException(404, "Unsupported Ollama route")
+    # Resolve which host to forward to. Only a registered + enabled host resolves — never an
+    # arbitrary caller-supplied URL — so the SSRF boundary is preserved. Absent host_id falls
+    # back to the configured default host for backward compatibility with older workers.
+    upstream_base = settings.ollama_url
+    host_id = request.query_params.get("host_id")
+    if host_id:
+        host = db.ollama_host(host_id)
+        if not host or not host.get("enabled"):
+            raise HTTPException(403, "Unknown or disabled Ollama host")
+        upstream_base = host["base_url"]
     body = await request.body()
     if len(body) > 2_000_000:
         raise HTTPException(413, "Ollama request too large")
     async with httpx.AsyncClient(timeout=320) as client:
         upstream = await client.request(
             request.method,
-            f"{settings.ollama_url}/{ollama_path}",
+            f"{upstream_base}/{ollama_path}",
             content=body or None,
             headers={"Content-Type": "application/json"},
         )
@@ -607,12 +638,117 @@ def agent_create(body: AgentCreateBody, _: dict = Depends(require_user)):
 
 
 @config_router.post("/api/agents/discover")
-def agents_discover(_: dict = Depends(require_user)):
+def agents_discover(body: DiscoverBody | None = None, _: dict = Depends(require_user)):
+    host_id = body.host_id if body else None
+    rows = discover_agents(host_id)
+    hosts = [db.ollama_host(host_id)] if host_id else db.ollama_hosts(enabled_only=True)
+    errors = [
+        {"host_id": h["id"], "name": h["name"], "error": h.get("last_error") or "unreachable"}
+        for h in hosts if h and h.get("status") == "unreachable"
+    ]
+    return {
+        "agents": [parse_json_fields(row, ["roles_json", "capabilities_json", "role_scores_json"]) for row in rows],
+        "errors": errors,
+    }
+
+
+def _validate_host_url(base_url: str) -> str:
+    normalized = db.normalize_base_url(base_url)
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(400, "Host URL must look like http(s)://host:port")
+    return normalized
+
+
+@config_router.get("/api/hosts")
+def hosts_list(_: dict = Depends(require_user)):
+    return {"hosts": db.ollama_hosts()}
+
+
+@config_router.post("/api/hosts")
+def host_create(body: HostCreateBody, _: dict = Depends(require_user)):
+    url = _validate_host_url(body.base_url)
+    if db.ollama_host_by_url(url):
+        raise HTTPException(409, "A host with this URL already exists")
     try:
-        rows = discover_agents()
-        return {"agents": [parse_json_fields(row, ["roles_json", "capabilities_json", "role_scores_json"]) for row in rows]}
+        host = db.add_ollama_host(body.name, url, body.kind)
     except Exception as exc:
-        raise HTTPException(502, f"Ollama discovery failed: {exc}") from exc
+        raise HTTPException(409, "A host with this URL already exists") from exc
+    # Best-effort probe + discover so the new host's models appear immediately.
+    with contextlib.suppress(Exception):
+        discover_agents(host["id"])
+    return db.ollama_host(host["id"]) or host
+
+
+@config_router.patch("/api/hosts/{host_id}")
+def host_update(host_id: str, body: HostPatchBody, _: dict = Depends(require_user)):
+    host = db.ollama_host(host_id)
+    if not host:
+        raise HTTPException(404, "Host not found")
+    values: dict[str, Any] = {}
+    if body.name is not None:
+        values["name"] = body.name.strip()
+    if body.enabled is not None:
+        if not body.enabled and host.get("enabled"):
+            others = [h for h in db.ollama_hosts(enabled_only=True) if h["id"] != host_id]
+            if not others:
+                raise HTTPException(400, "Cannot disable the only enabled host")
+        values["enabled"] = int(body.enabled)
+        # Soft-toggle this host's agents so a disabled host is never selected for dispatch.
+        db.set_host_agents_enabled(host_id, body.enabled)
+    if values:
+        db.update_ollama_host(host_id, **values)
+    return db.ollama_host(host_id)
+
+
+@config_router.delete("/api/hosts/{host_id}")
+def host_delete(host_id: str, _: dict = Depends(require_user)):
+    host = db.ollama_host(host_id)
+    if not host:
+        raise HTTPException(404, "Host not found")
+    others_enabled = [h for h in db.ollama_hosts(enabled_only=True) if h["id"] != host_id]
+    if host.get("enabled") and not others_enabled:
+        raise HTTPException(400, "Cannot delete the only enabled host")
+    db.delete_ollama_host(host_id)
+    return {"ok": True}
+
+
+@config_router.post("/api/hosts/scan")
+def hosts_scan(body: HostScanBody | None = None, _: dict = Depends(require_user)):
+    """Probe candidate Ollama endpoints without committing anything.
+
+    Probes a user-entered URL (if any) plus localhost / host.docker.internal — never a
+    blocking LAN subnet sweep. The user then POSTs the one they want to register.
+    """
+    candidates: list[str] = []
+    if body and body.base_url:
+        candidates.append(_validate_host_url(body.base_url))
+    candidates.extend(["http://127.0.0.1:11434", "http://host.docker.internal:11434"])
+    seen: set[str] = set()
+    results: list[dict[str, Any]] = []
+    for url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
+        reachable = host_reachable(url, timeout=2.0)
+        entry: dict[str, Any] = {
+            "base_url": url,
+            "reachable": reachable,
+            "models": [],
+            "registered": bool(db.ollama_host_by_url(url)),
+        }
+        if reachable:
+            with contextlib.suppress(Exception):
+                with httpx.Client(timeout=5) as client:
+                    resp = client.get(url + "/api/tags")
+                    resp.raise_for_status()
+                    entry["models"] = [
+                        m.get("name") or m.get("model")
+                        for m in resp.json().get("models", [])
+                        if (m.get("name") or m.get("model"))
+                    ]
+        results.append(entry)
+    return {"results": results}
 
 
 @config_router.patch("/api/agents/{agent_id}")
@@ -873,19 +1009,35 @@ def models(_: dict = Depends(require_user)):
 
 @config_router.get("/api/status")
 def status_api(_: dict = Depends(require_user)):
-    try:
-        with httpx.Client(timeout=5) as client:
-            response = client.get(settings.ollama_url + "/api/version")
-            response.raise_for_status()
-            version = response.json()
-        return {"ollama_available": True, "ollama": version, "allowed_roots": [str(root) for root in settings.allowed_roots]}
-    except Exception as exc:
-        return {
-            "ollama_available": False,
-            "ollama": None,
-            "ollama_error": str(exc),
-            "allowed_roots": [str(root) for root in settings.allowed_roots],
-        }
+    hosts = db.ollama_hosts()
+    reachable = [h for h in hosts if h.get("status") == "reachable"]
+    enabled = [h for h in hosts if h.get("enabled")]
+    version = None
+    last_error = None
+    # Probe one host for a version payload, refreshing its status as a side effect. Prefer a
+    # host already marked reachable; otherwise try each enabled host until one answers.
+    for host in (reachable[:1] or enabled):
+        try:
+            with httpx.Client(timeout=3) as client:
+                response = client.get(host["base_url"] + "/api/version")
+                response.raise_for_status()
+                version = response.json()
+            db.set_host_status(host["id"], "reachable")
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            db.set_host_status(host["id"], "unreachable", str(exc))
+    hosts = db.ollama_hosts()  # re-read to reflect any status change above
+    available = any(h.get("status") == "reachable" for h in hosts) or version is not None
+    result: dict[str, Any] = {
+        "ollama_available": available,
+        "ollama": version,
+        "hosts": hosts,
+        "allowed_roots": [str(root) for root in settings.allowed_roots],
+    }
+    if not available and last_error:
+        result["ollama_error"] = last_error
+    return result
 
 
 @workspace_router.get("/api/chats")

@@ -44,6 +44,9 @@ class WorkRequest(BaseModel):
     task: str
     max_turns: int = Field(default=24, ge=1, le=40)
     node_id: str | None = None
+    # Which registered Ollama host to route this call to. Carried to the UI's internal proxy,
+    # which resolves it to the host's base_url; absent = the default host.
+    ollama_host_id: str | None = None
 
 
 class CheckRequest(BaseModel):
@@ -99,6 +102,7 @@ async def agent_loop(
                 response = await client.post(
                     settings.ollama_url + "/api/chat",
                     headers={"X-Worker-Token": settings.worker_token},
+                    params={"host_id": request.ollama_host_id} if request.ollama_host_id else None,
                     json={"model": request.model, "messages": messages, "tools": tools, "stream": False},
                 )
             except httpx.HTTPError:

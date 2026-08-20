@@ -78,14 +78,33 @@ class OllamaUnavailable(RuntimeError):
     pass
 
 
-def ollama_available(timeout: float = 3.0) -> bool:
+def host_reachable(base_url: str, timeout: float = 3.0) -> bool:
+    """Probe one Ollama host's /api/version. Pure check — no DB writes."""
     try:
         with httpx.Client(timeout=timeout) as client:
-            response = client.get(settings.ollama_url + "/api/version")
+            response = client.get(base_url + "/api/version")
             response.raise_for_status()
             return bool(response.json().get("version"))
     except Exception:
         return False
+
+
+def refresh_host_statuses(timeout: float = 3.0) -> bool:
+    """Probe every enabled host, persist status/last_seen, and report if any is reachable.
+
+    Single writer of host health so the UI reads fresh status without extra probing.
+    """
+    any_ok = False
+    for host in db.ollama_hosts(enabled_only=True):
+        ok = host_reachable(host["base_url"], timeout)
+        db.set_host_status(host["id"], "reachable" if ok else "unreachable", None if ok else "version probe failed")
+        any_ok = any_ok or ok
+    return any_ok
+
+
+def ollama_available(timeout: float = 3.0) -> bool:
+    """True if at least one enabled host answers. Stops at the first reachable host."""
+    return any(host_reachable(h["base_url"], timeout) for h in db.ollama_hosts(enabled_only=True))
 
 
 def _brain_lock(run_id: str) -> threading.Lock:
@@ -180,7 +199,7 @@ def recover_waiting_ollama() -> int:
 def _ollama_monitor() -> None:
     delay = 5.0
     while not _ollama_monitor_stop.wait(delay):
-        if ollama_available():
+        if refresh_host_statuses():
             recover_waiting_ollama()
             delay = 10.0
         else:
@@ -560,8 +579,10 @@ def call_brain_with_memory(
         return result
 
 
-def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = "workspace", max_turns: int = 24, node_id: str | None = None) -> dict[str, Any]:
-    attempts = 1 if mode == "implementation" else 3
+def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = "workspace", max_turns: int = 24, node_id: str | None = None, host_id: str | None = None) -> dict[str, Any]:
+    # Implementation restages an isolated worktree per attempt, so a transient network blip
+    # is safe to retry once (was attempts=1, which failed a whole subtask on one hiccup).
+    attempts = 2 if mode == "implementation" else 3
     for attempt in range(attempts):
         try:
             with httpx.Client(timeout=1200) as client:
@@ -569,7 +590,7 @@ def worker_call(run_id: str, model: str, mode: str, task: str, workspace: str = 
                     "POST",
                     settings.worker_url + "/execute/stream",
                     headers={"X-Worker-Token": settings.worker_token},
-                    json={"run_id": run_id, "workspace": workspace, "model": model, "mode": mode, "task": task, "max_turns": max_turns, **({"node_id": node_id} if node_id else {})},
+                    json={"run_id": run_id, "workspace": workspace, "model": model, "mode": mode, "task": task, "max_turns": max_turns, **({"node_id": node_id} if node_id else {}), **({"ollama_host_id": host_id} if host_id else {})},
                 ) as response:
                     response.raise_for_status()
                     for line in response.iter_lines():
@@ -623,50 +644,81 @@ def record_worker_activity(run_id: str, mode: str, item: dict[str, Any], *, node
     db.add_event(run_id, "agent.activity", message, data)
 
 
-def discover_agents() -> list[dict[str, Any]]:
+def _score_model(model: str, show: dict[str, Any]) -> dict[str, Any]:
+    """Derive roles / role-scores / priority for a model from its /api/show payload."""
+    capabilities = show.get("capabilities") or []
+    context = max(
+        [int(v) for k, v in (show.get("model_info") or {}).items() if k.endswith(".context_length") and isinstance(v, (int, float))]
+        or [0]
+    )
+    lower = model.lower()
+    roles = ["research", "verification"]
+    if "tools" in capabilities:
+        roles.append("implementation")
+    scores = {
+        "research": 90 if "thinking" in capabilities else 70,
+        "implementation": 95 if "qwen3-coder" in lower else 80 if "tools" in capabilities else 0,
+        "verification": 90 if "gemma" in lower else 75,
+    }
+    priority = 100 if "qwen3-coder" in lower else 90 if "gemma" in lower else 75
+    return {"capabilities": capabilities, "context": context, "roles": roles, "scores": scores, "priority": priority}
+
+
+def discover_agents(host_id: str | None = None) -> list[dict[str, Any]]:
+    """Discover Ollama models across hosts and upsert them as agent_profiles.
+
+    host_id=None sweeps every enabled host; a specific id scans just that host. Each host
+    is probed independently: an unreachable host is flagged and skipped (never aborts the
+    sweep), and a single model whose /api/show fails is skipped without losing the rest.
+    Agents are keyed by (host_id, model), so the same model on two devices is two agents.
+    """
     now = db.utcnow()
-    with httpx.Client(timeout=30) as client:
-        tags_response = client.get(settings.ollama_url + "/api/tags")
-        tags_response.raise_for_status()
-        tags = tags_response.json().get("models", [])
-        discovered: list[dict[str, Any]] = []
+    hosts = [db.ollama_host(host_id)] if host_id else db.ollama_hosts(enabled_only=True)
+    hosts = [h for h in hosts if h]
+    discovered: list[dict[str, Any]] = []
+    for host in hosts:
+        hid, base = host["id"], host["base_url"]
+        try:
+            with httpx.Client(timeout=30) as client:
+                tags_response = client.get(base + "/api/tags")
+                tags_response.raise_for_status()
+                tags = tags_response.json().get("models", [])
+        except Exception as exc:
+            db.set_host_status(hid, "unreachable", str(exc))
+            log.warning("discover_host_unreachable host=%s base=%s err=%s", hid, base, exc)
+            continue
+        db.set_host_status(hid, "reachable")
         for item in tags:
             model = item.get("name") or item.get("model")
             if not model:
                 continue
-            show_response = client.post(settings.ollama_url + "/api/show", json={"model": model})
-            show_response.raise_for_status()
-            show = show_response.json()
-            capabilities = show.get("capabilities") or []
-            context = max(
-                [int(v) for k, v in (show.get("model_info") or {}).items() if k.endswith(".context_length") and isinstance(v, (int, float))]
-                or [0]
-            )
-            lower = model.lower()
-            roles = ["research", "verification"]
-            if "tools" in capabilities:
-                roles.append("implementation")
-            scores = {
-                "research": 90 if "thinking" in capabilities else 70,
-                "implementation": 95 if "qwen3-coder" in lower else 80 if "tools" in capabilities else 0,
-                "verification": 90 if "gemma" in lower else 75,
-            }
-            priority = 100 if "qwen3-coder" in lower else 90 if "gemma" in lower else 75
-            agent_id = "agent-" + secrets.token_hex(8)
-            existing = db.one("select id from agent_profiles where model=?", (model,))
+            try:
+                with httpx.Client(timeout=30) as client:
+                    show_response = client.post(base + "/api/show", json={"model": model})
+                    show_response.raise_for_status()
+                    show = show_response.json()
+            except Exception as exc:
+                log.warning("discover_model_failed host=%s model=%s err=%s", hid, model, exc)
+                continue
+            prof = _score_model(model, show)
+            existing = db.one("select id from agent_profiles where host_id=? and model=?", (hid, model))
             if existing:
                 agent_id = existing["id"]
                 db.execute(
-                    "update agent_profiles set capabilities_json=?,context_size=?,discovered_at=?,updated_at=? where id=?",
-                    (json.dumps(capabilities), context, now, now, agent_id),
+                    "update agent_profiles set capabilities_json=?,context_size=?,host_base_url=?,discovered_at=?,updated_at=? where id=?",
+                    (json.dumps(prof["capabilities"]), prof["context"], base, now, now, agent_id),
                 )
             else:
+                agent_id = "agent-" + secrets.token_hex(8)
+                name = model if hid == db.DEFAULT_HOST_ID else f"{model} @ {host['name']}"
                 db.execute(
-                    "insert into agent_profiles(id,name,model,roles_json,capabilities_json,context_size,priority,role_scores_json,discovered_at,updated_at) values(?,?,?,?,?,?,?,?,?,?)",
-                    (agent_id, model, model, json.dumps(roles), json.dumps(capabilities), context, priority, json.dumps(scores), now, now),
+                    "insert into agent_profiles(id,name,model,roles_json,capabilities_json,context_size,priority,"
+                    "role_scores_json,host_id,host_base_url,discovered_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (agent_id, name, model, json.dumps(prof["roles"]), json.dumps(prof["capabilities"]),
+                     prof["context"], prof["priority"], json.dumps(prof["scores"]), hid, base, now, now),
                 )
             discovered.append(db.one("select * from agent_profiles where id=?", (agent_id,)) or {})
-        return discovered
+    return discovered
 
 
 def _agent_is_eligible(agent: dict[str, Any] | None, role: str, exclude: set[str] | None = None) -> bool:
@@ -677,14 +729,35 @@ def _agent_is_eligible(agent: dict[str, Any] | None, role: str, exclude: set[str
     return role in roles and (role != "implementation" or "tools" in capabilities)
 
 
-def choose_agent(role: str, exclude: set[str] | None = None, discover: bool = True) -> dict[str, Any]:
+def _reachable_host_ids() -> set[str]:
+    """Enabled hosts an agent may be dispatched to.
+
+    'unknown' counts as eligible so a cold start (before the connectivity monitor has run
+    a probe) isn't starved of every agent; a genuinely-down host is still caught at dispatch
+    via the OllamaUnavailable pause/resume path.
+    """
+    return {h["id"] for h in db.ollama_hosts(enabled_only=True) if h["status"] in ("reachable", "unknown")}
+
+
+def _candidate_agents(role: str, exclude: set[str] | None = None) -> list[tuple]:
+    """Score + sort eligible agents on a reachable host for a role. Shared by both choosers."""
     exclude = exclude or set()
+    reachable = _reachable_host_ids()
     candidates = []
     for row in db.all_rows("select * from agent_profiles where enabled=1"):
         if not _agent_is_eligible(row, role, exclude):
             continue
+        if row.get("host_id") and row["host_id"] not in reachable:
+            continue
         scores = json.loads(row["role_scores_json"] or "{}")
         candidates.append((int(scores.get(role, 0)), int(row["priority"]), int(row["context_size"]), row["name"], row))
+    candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].lower()))
+    return candidates
+
+
+def choose_agent(role: str, exclude: set[str] | None = None, discover: bool = True) -> dict[str, Any]:
+    exclude = exclude or set()
+    candidates = _candidate_agents(role, exclude)
     if not candidates:
         if discover:
             discover_agents()
@@ -692,7 +765,6 @@ def choose_agent(role: str, exclude: set[str] | None = None, discover: bool = Tr
         raise RuntimeError(
             f"No enabled {role} agent available. Open Brains & Agents, enable a compatible Ollama model, then retry."
         )
-    candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].lower()))
     return candidates[0][-1]
 
 
@@ -722,43 +794,33 @@ def choose_subtask_agent(
         if assigned_id in exclude or not agent or not _agent_is_eligible(agent, role, exclude):
             raise RuntimeError(f"Pinned agent {assigned_id} is unavailable for role '{role}'")
         return agent
-    candidates = []
-    for row in db.all_rows("select * from agent_profiles where enabled=1"):
-        if not _agent_is_eligible(row, role, exclude):
-            continue
-        scores = json.loads(row["role_scores_json"] or "{}")
-        candidates.append((int(scores.get(role, 0)), int(row["priority"]), int(row["context_size"]), row["name"], row))
+    candidates = _candidate_agents(role, exclude)
     if not candidates:
         return choose_agent(role, exclude)
-    candidates.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3].lower()))
     if node.get("complexity") == "complex":
         return candidates[0][-1]
     suggested = node.get("suggested_model") or ""
     suggested_agent = next((item[-1] for item in candidates if item[-1]["model"] == suggested), None)
-    if suggested_agent and not run_id:
-        return suggested_agent
     if not run_id:
-        return candidates[0][-1]
-    if run_id:
-        with _assignment_lock:
-            counts = _subtask_assignment_counts.setdefault(run_id, {})
-            for row in db.all_rows(
-                "select agent_id,count(*) as assignments from subtasks "
-                "where run_id=? and agent_id is not null group by agent_id",
-                (run_id,),
-            ):
-                counts[row["agent_id"]] = max(counts.get(row["agent_id"], 0), int(row["assignments"]))
-            chosen = min(
-                enumerate(candidates),
-                key=lambda item: (
-                    counts.get(item[1][-1]["id"], 0),
-                    0 if suggested_agent and item[1][-1]["id"] == suggested_agent["id"] else 1,
-                    item[0],
-                ),
-            )[1][-1]
-            counts[chosen["id"]] = counts.get(chosen["id"], 0) + 1
-            return chosen
-    return candidates[0][-1]
+        return suggested_agent or candidates[0][-1]
+    with _assignment_lock:
+        counts = _subtask_assignment_counts.setdefault(run_id, {})
+        for row in db.all_rows(
+            "select agent_id,count(*) as assignments from subtasks "
+            "where run_id=? and agent_id is not null group by agent_id",
+            (run_id,),
+        ):
+            counts[row["agent_id"]] = max(counts.get(row["agent_id"], 0), int(row["assignments"]))
+        chosen = min(
+            enumerate(candidates),
+            key=lambda item: (
+                counts.get(item[1][-1]["id"], 0),
+                0 if suggested_agent and item[1][-1]["id"] == suggested_agent["id"] else 1,
+                item[0],
+            ),
+        )[1][-1]
+        counts[chosen["id"]] = counts.get(chosen["id"], 0) + 1
+        return chosen
 
 
 def save_artifact(run_id: str, kind: str, name: str, content: Any) -> None:
@@ -978,7 +1040,7 @@ def research_run(run_id: str) -> None:
             agent = choose_agent("research")
         update_run(run_id, research_agent_id=agent["id"], status="researching")
         db.add_event(run_id, "research.started", f"Research started with {agent['name']}")
-        result = worker_call(run_id, agent["model"], "research", agent_task(agent, run["task"]), max_turns=18)
+        result = worker_call(run_id, agent["model"], "research", agent_task(agent, run["task"]), max_turns=18, host_id=agent.get("host_id"))
         record_usage(run_id, result)
         if not result.get("ok"):
             raise RuntimeError(result.get("error") or "Research agent failed")
@@ -1270,11 +1332,53 @@ def brain_verdict(run: dict[str, Any], reports: list[str]) -> tuple[bool, str]:
     return verdict.passed, verdict.to_json()
 
 
-QUALIFYING_CHECKS: list[dict[str, Any]] = [
-    {"command": "ruff", "args": ["check", "."], "label": "ruff-lint"},
-    {"command": "pytest", "args": ["--tb=short", "-q"], "label": "pytest"},
-    {"command": "python3", "args": ["-m", "py_compile"], "label": "py-compile", "skip": True},
-]
+_CHECK_EXCLUDED_DIRS = {".git", "node_modules", "__pycache__", ".next", ".cache", "dist", "build", "vendor", ".venv"}
+
+
+def _workspace_file_stats(stage: Path, cap: int = 5000) -> tuple[set[str], bool, int]:
+    """Bounded walk of a staged workspace, skipping vendored/build dirs.
+
+    Returns (root-level file+dir names, whether any *.py exists, total files seen up to cap).
+    """
+    root_names: set[str] = set()
+    has_py = False
+    total = 0
+    if not stage.exists():
+        return root_names, has_py, total
+    root_names = {p.name for p in stage.iterdir()}
+    for path in stage.rglob("*"):
+        if any(part in _CHECK_EXCLUDED_DIRS for part in path.relative_to(stage).parts):
+            continue
+        if path.is_file():
+            total += 1
+            if path.suffix == ".py":
+                has_py = True
+            if total >= cap:
+                break
+    return root_names, has_py, total
+
+
+def _qualifying_checks_for(stage: Path) -> list[dict[str, Any]]:
+    """Pick deterministic checks matching the workspace's toolchain.
+
+    A Python project runs ruff+pytest; a Node project runs its npm test script; a workspace
+    with no recognized toolchain gets a single builtin ``workspace-nonempty`` check. This
+    fixes the apply gate being hardcoded to Python (ruff+pytest), which permanently blocked
+    apply on any non-Python workspace — while still requiring one genuine passing machine
+    check so a run never applies on the brain verdict alone.
+    """
+    root_names, has_py, _ = _workspace_file_stats(stage)
+    py_markers = {"pyproject.toml", "setup.cfg", "setup.py"} | {
+        n for n in root_names if n.startswith("requirements") and n.endswith(".txt")
+    }
+    if (root_names & py_markers) or has_py:
+        return [
+            {"command": "ruff", "args": ["check", "."], "label": "ruff-lint"},
+            {"command": "pytest", "args": ["--tb=short", "-q"], "label": "pytest"},
+        ]
+    if "package.json" in root_names:
+        return [{"command": "npm", "args": ["test", "--silent"], "label": "npm-test"}]
+    return [{"command": "workspace-nonempty", "args": [], "label": "workspace-nonempty", "builtin": True}]
 
 
 def _run_qualifying_checks(
@@ -1283,28 +1387,32 @@ def _run_qualifying_checks(
     """Run deterministic qualifying checks on the staged workspace via the worker.
 
     Records each result as structured check_evidence. Returns the list of evidence
-    records. The checks use the /check endpoint which returns exit codes directly.
+    records. Real checks use the /check endpoint which returns exit codes directly; a
+    builtin check is evaluated locally against the staged files.
     """
     stage = settings.jobs_dir / run_id / workspace
     workspace_hash = manifest_hash(stage) if stage.exists() else ""
     results: list[dict[str, Any]] = []
-    for check in QUALIFYING_CHECKS:
-        if check.get("skip"):
-            continue
+    for check in _qualifying_checks_for(stage):
         command = check["command"]
         args = check["args"]
         started = time.monotonic()
-        try:
-            with httpx.Client(timeout=300) as client:
-                response = client.post(
-                    settings.worker_url + "/check",
-                    headers={"X-Worker-Token": settings.worker_token},
-                    json={"run_id": run_id, "workspace": workspace, "command": command, "args": args, "timeout": 120},
-                )
-                response.raise_for_status()
-                data = response.json()
-        except (httpx.HTTPError, Exception) as exc:
-            data = {"ok": False, "content": f"Check unavailable: {exc}"}
+        if check.get("builtin"):
+            _, _, total = _workspace_file_stats(stage)
+            ok = total > 0
+            data = {"ok": ok, "content": f"exit={0 if ok else 1}\nworkspace files: {total}"}
+        else:
+            try:
+                with httpx.Client(timeout=300) as client:
+                    response = client.post(
+                        settings.worker_url + "/check",
+                        headers={"X-Worker-Token": settings.worker_token},
+                        json={"run_id": run_id, "workspace": workspace, "command": command, "args": args, "timeout": 120},
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+            except Exception as exc:
+                data = {"ok": False, "content": f"Check unavailable: {exc}"}
         duration_ms = int((time.monotonic() - started) * 1000)
         output = data.get("content", "")
         exit_code = 0 if data.get("ok") else 1
@@ -1408,11 +1516,19 @@ def _run_subtask(run_id: str, node: dict[str, Any], base_stage: Path) -> dict[st
         + (f"ACCEPTANCE CRITERIA:\n{node['acceptance_criteria']}\n" if node.get("acceptance_criteria") else "")
         + (f"\nDEPENDENCY HANDOFFS:\n{dependency_context}\n" if dependency_context else "")
     )
-    mode = node.get("role") or "implementation"
+    # Decouple execution-mode from the scoring-role. A node that owns a file scope, or is an
+    # implementation node, is expected to mutate its worktree, so it must run with write tools
+    # (write tools are stripped unless mode == "implementation"). A research/verification node
+    # with no file scope is genuinely read-only (analysis/handoff) and stays read-only. This
+    # fixes silent no-op subtasks where a mutating node was labeled research/verification and
+    # ran without write tools yet was still marked done.
+    role = node.get("role") or "implementation"
+    writes_expected = role == "implementation" or bool(globs)
+    mode = "implementation" if writes_expected else role
     result = worker_call(
         run_id, agent["model"], mode, agent_task(agent, task),
         workspace=f"subtasks/{node['node_id']}/workspace", max_turns=32,
-        node_id=node["node_id"],
+        node_id=node["node_id"], host_id=agent.get("host_id"),
     )
     record_usage(run_id, result)
     db.add_subtask_result(subtask_id, run_id, "implementation", result.get("content", ""))
@@ -1423,6 +1539,10 @@ def _run_subtask(run_id: str, node: dict[str, Any], base_stage: Path) -> dict[st
     output_manifest = workspace_manifest(worktree)
     delta = workspace_delta(input_manifest, output_manifest)
     changed_files = sorted(set(delta["changed"]) | set(delta["deleted"]))
+    if writes_expected and not changed_files:
+        db.update_subtask(subtask_id, status="failed", result_summary="No file changes produced (empty delta)")
+        db.add_event(run_id, "subtask.noop", f"{node['title']} produced no file changes", {"node_id": node["node_id"]})
+        raise RuntimeError(f"Subtask {node['node_id']} produced no file changes")
     checks = [
         {
             "command": event.get("args", {}).get("command"),
@@ -1608,14 +1728,18 @@ def _verify_and_apply(run_id: str, summary: str, implementer_ids: set[str], repa
     for repair in range(3):
         run = db.one("select * from runs where id=?", (run_id,)) or {}
         first = choose_agent("verification", set(implementer_ids))
+        verifiers = [first]
         try:
-            second = choose_agent("verification", implementer_ids | {first["id"]})
+            # A genuinely independent second verifier — a different agent (now possibly on a
+            # different host). If none exists, run one verifier; the brain verdict below is the
+            # independent second signal. (Previously second=first ran the same agent twice.)
+            verifiers.append(choose_agent("verification", implementer_ids | {first["id"]}))
         except RuntimeError:
-            second = first
+            db.add_event(run_id, "verification.single", "Only one independent verifier available; brain verdict is the second signal", {"repair": repair})
         reports = []
         verifier_ids = []
-        for verifier in (first, second):
-            result = worker_call(run_id, verifier["model"], "verification", agent_task(verifier, verification_prompt(run, summary)), max_turns=18)
+        for verifier in verifiers:
+            result = worker_call(run_id, verifier["model"], "verification", agent_task(verifier, verification_prompt(run, summary)), max_turns=18, host_id=verifier.get("host_id"))
             record_usage(run_id, result)
             reports.append(result.get("content", ""))
             verifier_ids.append(verifier["id"])
@@ -1659,7 +1783,7 @@ def _verify_and_apply(run_id: str, summary: str, implementer_ids: set[str], repa
             return
         repair_task = parsed.get("repair_task") or "Fix every defect in these verifier reports:\n" + "\n\n".join(reports)
         update_run(run_id, status="implementing", repair_count=repair + 1)
-        repair_result = worker_call(run_id, repair_agent["model"], "implementation", agent_task(repair_agent, repair_task), max_turns=24)
+        repair_result = worker_call(run_id, repair_agent["model"], "implementation", agent_task(repair_agent, repair_task), max_turns=24, host_id=repair_agent.get("host_id"))
         record_usage(run_id, repair_result)
         if not repair_result.get("ok"):
             raise RuntimeError(repair_result.get("error") or "Repair agent failed")
@@ -1699,7 +1823,7 @@ def _verify_and_apply(run_id: str, summary: str, implementer_ids: set[str], repa
     post = worker_call(
         run_id, verifier["model"], "verification",
         agent_task(verifier, "Post-apply check. Verify copied final server state still satisfies approved plan. Start with PASS or FAIL.\n\n" + (run.get("approved_plan") or "")),
-        workspace="postcheck", max_turns=18,
+        workspace="postcheck", max_turns=18, host_id=verifier.get("host_id"),
     )
     record_usage(run_id, post)
     save_artifact(run_id, "post_check", "Post-apply verification", post)
@@ -1779,7 +1903,7 @@ def implement_run(run_id: str) -> None:
             raise RuntimeError("Implementation agent missing")
         db.add_event(run_id, "implementation.started", f"Implementation started with {agent['name']}")
         task = "Implement this approved plan completely.\n\n" + (run["approved_plan"] or "")
-        implementation = worker_call(run_id, agent["model"], "implementation", agent_task(agent, task), max_turns=32)
+        implementation = worker_call(run_id, agent["model"], "implementation", agent_task(agent, task), max_turns=32, host_id=agent.get("host_id"))
         record_usage(run_id, implementation)
         summary = implementation.get("content", "")
         save_artifact(run_id, "implementation", "Implementation transcript", implementation)

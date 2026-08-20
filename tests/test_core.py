@@ -98,7 +98,7 @@ def test_migration_14_backfills_existing_graph_hash_and_refined_state():
         {"node_id": "existing", "spec": "Existing node"},
     ]}))
     with db.connect() as conn:
-        MIGRATIONS[-1][1](conn)
+        dict(MIGRATIONS)[14](conn)
     run = db.one("select plan_state,graph_plan_hash from runs where id=?", (run_id,))
     assert run["plan_state"] == "refined"
     assert run["graph_plan_hash"] == orchestrator._plan_hash(plan)
@@ -1971,12 +1971,30 @@ def _seed_run() -> str:
     return run_id
 
 
-def test_qualifying_checks_list_structure():
-    """QUALIFYING_CHECKS has expected shape."""
-    for check in orchestrator.QUALIFYING_CHECKS:
-        assert "command" in check
-        assert "args" in check
+def test_qualifying_checks_are_workspace_aware(tmp_path):
+    """_qualifying_checks_for picks checks by detected toolchain, with a builtin fallback."""
+    # Python workspace -> ruff + pytest
+    py = tmp_path / "py"
+    py.mkdir()
+    (py / "pyproject.toml").write_text("[tool.ruff]\n")
+    py_checks = orchestrator._qualifying_checks_for(py)
+    assert {c["command"] for c in py_checks} == {"ruff", "pytest"}
+    for check in py_checks:
         assert isinstance(check["args"], list)
+
+    # Node workspace -> npm test
+    node = tmp_path / "node"
+    node.mkdir()
+    (node / "package.json").write_text("{}\n")
+    node_checks = orchestrator._qualifying_checks_for(node)
+    assert [c["command"] for c in node_checks] == ["npm"]
+
+    # Unknown toolchain -> a builtin non-empty check so the gate still requires one pass
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "README.txt").write_text("hi\n")
+    other_checks = orchestrator._qualifying_checks_for(other)
+    assert len(other_checks) == 1 and other_checks[0].get("builtin")
 
 
 # --- PR4: password policy ---------------------------------------------------
@@ -2386,3 +2404,58 @@ def test_apply_gate_scopes_to_latest_workspace_state():
     record_check_evidence(run_id, 0, "pytest", [], 1, "new failure", 8, "HASH_NEWER")
     blocked = evaluate_apply_gate(run_id, brain_passed=True)
     assert blocked.allowed is False
+
+
+# --- Multi-host Ollama registry -------------------------------------------
+
+def test_ollama_host_crud_and_dedup():
+    """Host helpers normalize URLs, dedupe, toggle, track status, and delete."""
+    default = db.ollama_host("host-default")
+    assert default is not None  # seeded by migration 15
+    host = db.add_ollama_host("Lab box", "http://10.0.0.5:11434/", "network")
+    assert host["base_url"] == "http://10.0.0.5:11434"  # trailing slash trimmed
+    assert db.ollama_host_by_url("http://10.0.0.5:11434")["id"] == host["id"]
+    db.update_ollama_host(host["id"], name="Renamed", enabled=0)
+    assert db.ollama_host(host["id"])["name"] == "Renamed"
+    db.set_host_status(host["id"], "reachable")
+    reachable = db.ollama_host(host["id"])
+    assert reachable["status"] == "reachable" and reachable["last_seen"]
+    db.set_host_status(host["id"], "unreachable", "boom")
+    assert db.ollama_host(host["id"])["last_error"] == "boom"
+    db.delete_ollama_host(host["id"])
+    assert db.ollama_host(host["id"]) is None
+
+
+def _seed_host(host_id: str, url: str, status: str):
+    now = db.utcnow()
+    db.execute(
+        "insert or replace into ollama_hosts(id,name,base_url,kind,enabled,status,created_at,updated_at) "
+        "values(?,?,?,?,1,?,?,?)",
+        (host_id, host_id, url, "network", status, now, now),
+    )
+
+
+def _seed_agent_on_host(agent_id: str, host_id: str):
+    now = db.utcnow()
+    db.execute(
+        "insert into agent_profiles(id,name,model,roles_json,capabilities_json,context_size,priority,"
+        "role_scores_json,host_id,host_base_url,discovered_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (agent_id, agent_id, agent_id, json.dumps(["implementation"]), json.dumps(["tools"]), 32768, 50,
+         json.dumps({"implementation": 80}), host_id, "", now, now),
+    )
+
+
+def test_candidate_agents_filters_unreachable_hosts():
+    """An agent bound to an unreachable host is never a dispatch candidate."""
+    clear_workflow_tables()
+    _seed_host("h-up", "http://up:11434", "reachable")
+    _seed_host("h-down", "http://down:11434", "unreachable")
+    _seed_agent_on_host("a-up", "h-up")
+    _seed_agent_on_host("a-down", "h-down")
+    try:
+        ids = {candidate[-1]["id"] for candidate in orchestrator._candidate_agents("implementation")}
+        assert "a-up" in ids
+        assert "a-down" not in ids
+    finally:
+        db.delete_ollama_host("h-up")
+        db.delete_ollama_host("h-down")
