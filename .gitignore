@@ -23,3 +23,5 @@ backups/
 *.sqlite3-wal
 *.part
 test_edit.txt
+AGENT.md
+CLAUDE.md
