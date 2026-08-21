@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="en" data-expo-product="expochat" data-expo-profile="workspace" data-theme="dark" data-theme-preference="dark">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta id="themeColor" name="theme-color" content="#0f0f0f">
+    <title>ExpoChat</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/expoxr-system.css">
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <!-- ── Login ─────────────────────────────────────────────────────── -->
+    <main id="login" class="login hidden">
+      <form id="loginForm" class="login-panel">
+        <div class="login-brand" aria-label="ExpoXR ExpoChat">
+          <span class="ex-wordmark">EXPO<span class="ex-wordmark__xr">XR</span></span>
+          <span class="ex-wordmark__descriptor">ExpoChat</span>
+        </div>
+        <div class="login-heading">
+          <p class="ex-kicker">LOCAL AI WORKSPACE</p>
+          <h1>Welcome back.</h1>
+          <p>Sign in to plan, build, and verify work with your local agents.</p>
+        </div>
+        <label for="username">Username</label>
+        <input id="username" autocomplete="username" placeholder="Username" aria-label="Username">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" placeholder="Password" aria-label="Password">
+        <button type="submit" class="ex-button">Sign in</button>
+        <p id="loginError" role="alert" aria-live="assertive"></p>
+      </form>
+    </main>
+
+    <!-- ── Workbench ──────────────────────────────────────────────────── -->
+    <main id="app" class="workbench hidden">
+      <header class="titlebar">
+        <div class="app-brand" aria-label="ExpoXR ExpoChat">
+          <span class="ex-wordmark">EXPO<span class="ex-wordmark__xr">XR</span></span>
+          <span class="ex-wordmark__descriptor">ExpoChat</span>
+        </div>
+        <span class="title-context">AI workspace</span>
+        <button id="logoutBtn" class="title-action">Logout</button>
+      </header>
+
+      <div class="main-grid">
+
+        <!-- Activity bar -->
+        <nav class="activitybar" aria-label="Primary navigation">
+          <button id="activityChat"     class="activity active" title="Chat" aria-label="Chat">
+            <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          </button>
+          <button id="activityRuns"     class="activity" title="Run History" aria-label="Run history">
+            <svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h5M8 17h7"/></svg>
+          </button>
+          <button id="activityFiles"    class="activity" title="Explorer" aria-label="Explorer">
+            <svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+          </button>
+          <button id="activityTools"    class="activity" title="Search" aria-label="Search">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          </button>
+          <button id="activitySnaps"    class="activity" title="Snapshots" aria-label="Snapshots">
+            <svg viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+          </button>
+          <button id="activityTimeline" class="activity" title="Timeline" aria-label="Timeline">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </button>
+          <button id="activityPlan"     class="activity" title="Supervisor Run" aria-label="Supervisor run" aria-expanded="false">
+            <svg viewBox="0 0 24 24"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg>
+          </button>
+          <button id="activitySettings" class="activity" title="Settings" aria-label="Settings">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
+          </button>
+          <button id="activityMore" class="activity mobile-only" title="More" aria-label="More">
+            <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg>
+          </button>
+        </nav>
+
+        <!-- Sidebar -->
+        <aside class="sidebar" aria-label="Workspace navigation">
+          <button id="closeSidebarBtn" class="sheet-close" aria-label="Close navigation">Close</button>
+          <!-- Chat pane -->
+          <section id="chatPane" class="side-pane">
+            <div class="section-title">CHAT</div>
+            <label>Target Folder <span class="label-hint">(required for file context)</span></label>
+            <input id="targetPath" placeholder="/datasets/tank/projects" aria-label="Chat target folder">
+            <p id="targetHint" class="field-hint hidden">⚠ Set a target folder so Ollama can see your files.</p>
+            <div class="btn-row">
+              <button id="newChatBtn">New Chat</button>
+              <button id="saveNewChatBtn">Save + New Chat</button>
+            </div>
+            <div class="section-title with-gap">HISTORY</div>
+            <div id="chatList" class="tree"></div>
+            <button id="loadMoreChatsBtn" class="hidden">More chats</button>
+          </section>
+
+          <section id="runsPane" class="side-pane hidden">
+            <div class="section-title">RUN HISTORY</div>
+            <div class="btn-row">
+              <button id="newRunBtn">New Run</button>
+              <button id="refreshRunsBtn">Refresh</button>
+            </div>
+            <div id="runList" class="tree"></div>
+            <button id="loadMoreRunsBtn" class="hidden">More runs</button>
+          </section>
+
+          <!-- Explorer pane -->
+          <section id="filesPane" class="side-pane hidden">
+            <div class="section-title">EXPLORER</div>
+            <div class="pathbar compact">
+              <input id="filePath" placeholder="/datasets/tank" aria-label="Explorer folder path">
+              <button id="openPathBtn">Open</button>
+            </div>
+            <div class="btn-row">
+              <button id="newFileBtn" title="Create a file in the current folder">New File</button>
+              <button id="newFolderBtn" title="Create a folder in the current folder">New Folder</button>
+              <button id="pasteHereBtn" class="hidden" title="Paste clipboard entry into the current folder">Paste</button>
+            </div>
+            <p id="explorerContext" class="explorer-ctx hidden"></p>
+            <div id="fileList" class="tree"></div>
+          </section>
+
+          <!-- Search pane -->
+          <section id="toolsPane" class="side-pane hidden">
+            <div class="section-title">SEARCH</div>
+            <input id="searchTerm" placeholder="Search text…" aria-label="Search workspace text">
+            <button id="searchBtn">Search</button>
+            <div id="searchResults" class="tree"></div>
+            <button id="searchMoreBtn" class="hidden">More results</button>
+          </section>
+
+          <!-- Snapshots pane -->
+          <section id="snapsPane" class="side-pane hidden">
+            <div class="section-title">SNAPSHOTS</div>
+            <div class="btn-row">
+              <button id="refreshSnapsBtn">Refresh</button>
+              <button id="cleanSnapsBtn" title="Expire snapshot archives older than 30 days">Expire Old (&gt;30d)</button>
+            </div>
+            <p id="storageSummary" class="field-hint"></p>
+            <div id="orphanList" class="tree"></div>
+            <div id="snapList" class="tree"></div>
+            <button id="loadMoreSnapsBtn" class="hidden">More snapshots</button>
+          </section>
+
+          <!-- Timeline pane -->
+          <section id="timelinePane" class="side-pane hidden">
+            <div class="section-title">TIMELINE</div>
+            <button id="refreshTimelineBtn">Refresh</button>
+            <div id="timelineList" class="tree"></div>
+            <button id="loadMoreTimelineBtn" class="hidden">More events</button>
+          </section>
+
+          <section id="morePane" class="side-pane hidden">
+            <div class="section-title">MORE</div>
+            <div class="more-menu">
+              <button id="moreSupervisorBtn">Supervisor Run</button>
+              <button id="moreToolsBtn">Search</button>
+              <button id="moreSnapsBtn">Snapshots</button>
+              <button id="moreTimelineBtn">Timeline</button>
+              <button id="moreSettingsBtn">Settings</button>
+            </div>
+          </section>
+        </aside>
+
+        <div id="sidebarResize" class="panel-resizer" role="separator" aria-label="Resize navigation panel" aria-orientation="vertical" tabindex="0"></div>
+
+        <!-- Editor area -->
+        <section class="editor-area">
+          <div class="tabs-row" role="tablist" aria-label="Editor panes">
+            <button class="editor-tab active" role="tab" aria-selected="true"  data-editor="chatEditor">Chat</button>
+            <button class="editor-tab hidden" role="tab" aria-selected="false" data-editor="runEditor">Supervisor Run</button>
+            <button class="editor-tab hidden" role="tab" aria-selected="false" data-editor="fileEditor">File</button>
+            <button class="editor-tab hidden" role="tab" aria-selected="false" data-editor="diffEditor">Diff</button>
+            <button class="editor-tab hidden" role="tab" aria-selected="false" data-editor="artifactEditor">Evidence</button>
+          </div>
+
+          <!-- Chat editor -->
+          <section id="chatEditor" class="editor-pane">
+            <div class="editor-toolbar">
+              <span class="toolbar-label">Chat — <span id="ollamaStatus">connecting…</span></span>
+              <label class="toolbar-model-label" for="chatModelSelect">Model</label>
+              <select id="chatModelSelect" class="toolbar-model" title="Change model for this chat"></select>
+              <span id="workspaceTag" class="workspace-tag hidden" title="Workspace folder + pinned files sent to Ollama"></span>
+              <button id="applyCodeBtn" title="Apply last code block to the active file">Apply to File</button>
+            </div>
+            <div id="messages" class="messages">
+              <span id="streamCursor" class="stream-cursor hidden">▋</span>
+            </div>
+            <form id="chatForm" class="composer">
+              <div class="composer-controls">
+                <label class="check-label agent-toggle" title="Agent Mode: a quick in-chat agentic reply using a Brain. For the full research → plan → approve → implement pipeline, use Supervisor Run."><input id="agentModeToggle" type="checkbox"> Agent Mode</label>
+                <select id="chatBrainSelect" class="hidden" title="Brain used to plan in Agent Mode" aria-label="Agent Mode brain"></select>
+              </div>
+              <div class="composer-input">
+                <textarea id="prompt" rows="3" placeholder="Ask Ollama… (Ctrl+Enter to send)" aria-label="Chat message"></textarea>
+                <button type="submit" id="sendBtn">Send</button>
+              </div>
+            </form>
+            <!-- Sandboxed console — runs only inside active staged workspace -->
+            <div class="term-section">
+              <button class="term-toggle" id="termToggleBtn">▶  Sandbox Console</button>
+              <div id="termBody" class="hidden">
+                <div class="term-input-row">
+                  <textarea id="termCommand" rows="2" placeholder="Allowlisted command and arguments (Ctrl+Enter)"></textarea>
+                  <button id="termRunBtn">Run</button>
+                </div>
+                <pre id="termOutput" class="term-output"></pre>
+              </div>
+            </div>
+          </section>
+
+          <!-- Supervisor Run — main center view -->
+          <section id="runEditor" class="editor-pane hidden">
+            <div class="editor-toolbar">
+              <span class="toolbar-label">Supervisor Run</span>
+              <span id="currentRunBadge" class="run-badge hidden"></span>
+              <span id="planStatus" class="run-inline-status"></span>
+            </div>
+            <div class="run-main-scroll">
+              <p id="runEmptyHint" class="empty-hint">Launch a run from the Supervisor Run panel, or open one from Run History.</p>
+
+              <!-- Generated plan preview + inline editor -->
+              <div id="planResultArea" class="hidden">
+                <!-- Visual task-graph: rendered only once a plan is drafted (subtasks exist). -->
+                <div id="taskGraphSection" class="task-graph-section hidden">
+                  <div class="plan-result-label">TASK GRAPH<span id="taskGraphHint" class="task-graph-hint"></span></div>
+                  <div id="taskGraphViewport" class="task-graph">
+                    <div id="taskGraph" class="task-graph-canvas"></div>
+                  </div>
+                </div>
+                <div class="plan-result-label">GENERATED PLAN</div>
+                <div id="planProof" class="plan-proof"></div>
+                <label id="planEditLabel" class="hidden" style="margin-top:8px">Edit Plan</label>
+                <textarea id="planEditorContent" class="plan-raw-edit hidden" spellcheck="false" placeholder="Plan will appear here after generation…"></textarea>
+              </div>
+
+              <!-- Live run progress -->
+              <div id="runProgress" class="hidden plan-review-area">
+                <div class="plan-result-label">AGENTS</div>
+                <div id="runChoreography" class="agent-lane"></div>
+                <div id="runTokenCounters" class="token-counters">
+                  <div class="token-counter"><span>BRAIN</span><strong id="brainTokenCount">0</strong><small>tokens</small></div>
+                  <div class="token-counter"><span>OLLAMA</span><strong id="ollamaTokenCount">0</strong><small>tokens</small></div>
+                </div>
+                <div id="subtaskSection" class="subtask-section hidden">
+                  <div class="plan-result-label">SUBTASKS</div>
+                  <div id="subtaskCards" class="subtask-cards"></div>
+                </div>
+                <div class="plan-result-label">ACTIVITY</div>
+                <div id="runEventList" class="run-events"></div>
+                <div class="plan-result-label">EVIDENCE</div>
+                <div id="runArtifactList" class="tree"></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- File editor -->
+          <section id="fileEditor" class="editor-pane hidden">
+            <div class="editor-toolbar">
+              <span id="fileTitle">No file selected</span>
+              <button id="pinFileBtn" disabled title="Add or remove this file from chat context">Pin to Chat</button>
+              <button id="saveFileBtn">Save + Snapshot</button>
+            </div>
+            <textarea id="editor" spellcheck="false" placeholder="Select a file from Explorer"></textarea>
+          </section>
+
+          <!-- Diff viewer -->
+          <section id="diffEditor" class="editor-pane hidden">
+            <div class="editor-toolbar">
+              <span>Changed code from original</span>
+            </div>
+            <pre id="diffView"></pre>
+          </section>
+
+          <section id="artifactEditor" class="editor-pane hidden">
+            <div class="editor-toolbar"><span id="artifactTitle">Evidence</span></div>
+            <div id="artifactView" class="plan-proof"></div>
+          </section>
+
+          <section id="settingsEditor" class="editor-pane settings-page hidden">
+            <header class="settings-header">
+              <div>
+                <span class="settings-kicker">EXPOCHAT CONTROL CENTER</span>
+                <h1>Settings</h1>
+                <p>Brains, local models, safety limits, history, snapshots, and run behavior.</p>
+              </div>
+              <button id="closeSettingsBtn">Back to Chat</button>
+            </header>
+
+            <div class="settings-scroll">
+              <section class="settings-section">
+                <div class="settings-section-heading">
+                  <div><h2>Brains</h2><p>Cloud brains plan and supervise work. Local Ollama models execute chat and agent tasks on your machine.</p></div>
+                </div>
+                <div class="settings-grid settings-grid-three">
+                  <article class="settings-card">
+                    <div class="settings-card-title"><span class="provider-mark openai-mark">O</span><div><h3>ChatGPT / OpenAI</h3><p>Strong planning, coding, and verification.</p></div></div>
+                    <label for="codexModel">Model</label><select id="codexModel"></select>
+                    <label for="codexKey">API key</label><input id="codexKey" type="password" autocomplete="off" placeholder="Blank keeps current key">
+                    <div class="btn-row"><button id="saveCodexBtn">Link / Rotate</button><button id="testCodexBtn">Test</button><button id="disconnectCodexBtn">Disconnect</button></div>
+                    <p id="codexState" class="field-hint"></p>
+                  </article>
+                  <article class="settings-card">
+                    <div class="settings-card-title"><span class="provider-mark claude-mark">C</span><div><h3>Claude / Anthropic</h3><p>Long-context analysis and careful implementation.</p></div></div>
+                    <label for="claudeModel">Model</label><select id="claudeModel"></select>
+                    <label for="claudeKey">API key</label><input id="claudeKey" type="password" autocomplete="off" placeholder="Blank keeps current key">
+                    <div class="btn-row"><button id="saveClaudeBtn">Link / Rotate</button><button id="testClaudeBtn">Test</button><button id="disconnectClaudeBtn">Disconnect</button></div>
+                    <p id="claudeState" class="field-hint"></p>
+                  </article>
+                  <article class="settings-card">
+                    <div class="settings-card-title"><span class="provider-mark gemini-mark">G</span><div><h3>Gemini / Google</h3><p>Fast research, large context, and multimodal work.</p></div></div>
+                    <label for="geminiModel">Model</label><select id="geminiModel"></select>
+                    <label for="geminiKey">API key</label><input id="geminiKey" type="password" autocomplete="off" placeholder="Blank keeps current key">
+                    <div class="btn-row"><button id="saveGeminiBtn">Link / Rotate</button><button id="testGeminiBtn">Test</button><button id="disconnectGeminiBtn">Disconnect</button></div>
+                    <p id="geminiState" class="field-hint"></p>
+                  </article>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-heading"><div><h2>Budget &amp; context</h2><p>Caps prevent unexpected cloud usage and oversized responses. Zero means provider default or unlimited.</p></div></div>
+                <div class="settings-grid settings-grid-two">
+                  <article class="settings-card">
+                    <h3>Today’s paid API usage</h3>
+                    <div id="usageMeter" class="usage-meter">
+                      <div class="usage-meter-label"><span id="usageMeterText">—</span></div>
+                      <div class="usage-meter-track"><div id="usageMeterFill" class="usage-meter-fill"></div></div>
+                      <p id="usageMeterBreakdown" class="field-hint"></p>
+                    </div>
+                    <label for="budgetDaily">Daily token budget</label><input id="budgetDaily" type="number" min="0" step="1000">
+                    <label for="budgetRun">Per-run token budget</label><input id="budgetRun" type="number" min="0" step="1000">
+                    <label for="maxOutputTokens">Max output tokens per response</label><input id="maxOutputTokens" type="number" min="0" step="256">
+                    <div class="btn-row"><button id="saveBudgetBtn">Save limits</button><button id="refreshUsageBtn">Refresh usage</button></div>
+                  </article>
+                  <article class="settings-card">
+                    <h3>Agent memory &amp; retries</h3>
+                    <p class="settings-help">Memory budget controls how much run history the brain receives. Retry count applies per failed subtask.</p>
+                    <label for="brainMemoryBudget">Brain memory budget (tokens)</label><input id="brainMemoryBudget" type="number" min="500" max="1000000" step="500">
+                    <label for="subtaskMaxAttempts">Subtask attempts</label><input id="subtaskMaxAttempts" type="number" min="1" max="10">
+                    <button id="saveRunBehaviorBtn">Save run behavior</button>
+                  </article>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-heading"><div><h2>Snapshots, backups &amp; history</h2><p>Snapshots restore workspace files. Database backups preserve chats, plans, settings, and metadata. They are separate safety layers.</p></div></div>
+                <div class="settings-grid settings-grid-three">
+                  <article class="settings-card info-card">
+                    <h3>Snapshots</h3>
+                    <p>Created before destructive file actions and selected run stages. Active-run snapshots stay protected.</p>
+                    <label for="snapshotRetentionDays">Archive retention (days)</label><input id="snapshotRetentionDays" type="number" min="1" max="3650">
+                    <p id="settingsStorageSummary" class="settings-stat">Loading storage…</p>
+                    <button id="openSnapshotsSettingsBtn">Open snapshots</button>
+                  </article>
+                  <article class="settings-card info-card">
+                    <h3>Backups</h3>
+                    <p>Database backups are operator-managed. Use <code>make backup</code> or volume-level backup scheduling. Snapshot archives do not replace database backups.</p>
+                    <p id="settingsBackupSummary" class="settings-stat">Database and snapshot volumes should be backed up together.</p>
+                  </article>
+                  <article class="settings-card info-card">
+                    <h3>Timeline &amp; rescheduling</h3>
+                    <p>Timeline tracks file paths and diffs. Failed or cancelled runs can resume; completed work can clone into a new run. Automatic calendar scheduling is not enabled.</p>
+                    <label for="timelineCap">Timeline entries kept</label><input id="timelineCap" type="number" min="100" max="50000" step="100">
+                    <button id="openTimelineSettingsBtn">Open timeline</button>
+                  </article>
+                </div>
+                <div class="settings-actions"><button id="saveHistoryBtn">Save snapshots &amp; history</button></div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-heading"><div><h2>Evidence retention</h2><p>Controls bounded live telemetry. Durable plan versions and verification results remain preserved.</p></div></div>
+                <div class="settings-grid settings-grid-two">
+                  <article class="settings-card">
+                    <label for="runEventsCap">Events kept per run</label><input id="runEventsCap" type="number" min="50" max="10000" step="50">
+                  </article>
+                  <article class="settings-card">
+                    <label for="runArtifactsCap">Artifacts kept per run</label><input id="runArtifactsCap" type="number" min="20" max="5000" step="20">
+                  </article>
+                </div>
+                <div class="settings-actions"><button id="saveRetentionBtn">Save evidence retention</button></div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-heading"><div><h2>Appearance &amp; defaults</h2><p>Stored server-side and applied on every signed-in browser.</p></div></div>
+                <div class="settings-grid">
+                  <article class="settings-card">
+                    <label for="themeSelect">Theme</label>
+                    <select id="themeSelect"><option value="dark">Dark</option><option value="light">Light</option><option value="auto">Match system</option></select>
+                    <label class="check-label"><input id="agentModeDefault" type="checkbox"> Default new chats to Agent Mode</label>
+                    <button id="saveAppearanceBtn">Save appearance</button>
+                  </article>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-heading"><div><h2>Local models &amp; hosts</h2><p>Run models on this device, your network, or other machines. Add a host, scan to confirm it is reachable, then assign roles to the models it exposes.</p></div></div>
+                <article class="settings-card">
+                  <div class="settings-card-title"><span class="provider-mark ollama-mark">L</span><div><h3>Ollama hosts</h3><p>Register a server; Scan confirms it is reachable and lists its models.</p></div></div>
+                  <div class="host-add-row">
+                    <input id="hostName" placeholder="Name (e.g. Workstation)" aria-label="New host name">
+                    <input id="hostUrl" placeholder="http://127.0.0.1:11434" aria-label="New host URL">
+                    <select id="hostKind" aria-label="New host kind">
+                      <option value="local">Same device</option>
+                      <option value="network" selected>Network</option>
+                    </select>
+                    <button id="addHostBtn">Add</button>
+                    <button id="scanHostsBtn">Scan network</button>
+                  </div>
+                  <div id="scanResults" class="scan-results" hidden></div>
+                  <div id="hostList" class="settings-host-grid"></div>
+                </article>
+
+                <div class="agent-section-head">
+                  <div><h3>Discovered models</h3><p class="settings-help">Models found on your hosts. Assign the roles and priority the Brain uses to pick an agent.</p></div>
+                  <button id="discoverAgentsBtn">Refresh models</button>
+                </div>
+                <div class="agent-list-head" aria-hidden="true"><span>Model</span><span>Roles</span><span>Priority</span></div>
+                <div id="agentList" class="settings-agent-grid"></div>
+              </section>
+
+              <section id="about" class="settings-section about-section" aria-labelledby="aboutTitle">
+                <div class="settings-section-heading">
+                  <div>
+                    <span class="settings-kicker">ABOUT</span>
+                    <h2 id="aboutTitle">Made by ExpoXR</h2>
+                    <p>ExpoChat is designed and built by Ayal Othman at ExpoXR.</p>
+                  </div>
+                </div>
+                <article class="settings-card about-card">
+                  <div class="about-brand">
+                    <span class="ex-wordmark">EXPO<span class="ex-wordmark__xr">XR</span></span>
+                    <span class="ex-wordmark__descriptor">ExpoChat</span>
+                  </div>
+                  <p>Open-source software released under the MIT License.</p>
+                  <nav class="about-links" aria-label="ExpoChat project links">
+                    <a href="https://expoxr.com/" target="_blank" rel="noopener noreferrer">ExpoXR website</a>
+                    <a href="https://expoxr.com/about/" target="_blank" rel="noopener noreferrer">About Ayal Othman</a>
+                    <a href="https://github.com/ExpoXR" target="_blank" rel="noopener noreferrer">ExpoXR on GitHub</a>
+                    <a href="https://github.com/ExpoXR/ExpoChat" target="_blank" rel="noopener noreferrer">ExpoChat source</a>
+                    <a href="mailto:hallo@expoxr.com">Contact</a>
+                  </nav>
+                </article>
+              </section>
+            </div>
+          </section>
+        </section>
+
+        <div id="panelResize" class="panel-resizer" role="separator" aria-label="Resize supervisor panel" aria-orientation="vertical" tabindex="0"></div>
+
+        <!-- Right panel — Supervisor run launcher + controls -->
+        <aside class="panel-area plan-panel" aria-label="Supervisor run panel">
+          <button id="closePlanBtn" class="sheet-close" aria-label="Close supervisor panel">Close</button>
+          <!-- Plan generator form -->
+          <div class="plan-section-title">SUPERVISOR RUN</div>
+          <div id="planFormArea">
+            <label>Target Path</label>
+            <input id="planPath" placeholder="/datasets/tank/myproject" aria-label="Supervisor run target path">
+            <label>Task</label>
+            <textarea id="planTask" rows="4" placeholder="Describe what to build or fix…" aria-label="Supervisor run task description"></textarea>
+            <label>Brain</label>
+            <select id="planProvider" aria-label="Supervisor run brain"></select>
+            <label class="check-label"><input id="webResearch" type="checkbox"> Allow web research for this run</label>
+            <button id="generatePlanBtn">Research &amp; Write Plan</button>
+            <button id="planProviderHint" class="link-hint hidden" type="button">No Brain linked — open Settings → Brains</button>
+          </div>
+
+          <!-- Plan review actions — act on the run shown in the center pane -->
+          <div id="planActions" class="plan-result-actions panel-actions hidden">
+            <button id="approvePlanBtn" class="accent-btn">Approve &amp; Implement</button>
+            <button id="editPlanBtn">Edit</button>
+            <button id="savePlanBtn" class="hidden">Save Changes</button>
+            <button id="cancelPlanEditBtn" class="hidden">Cancel Edit</button>
+            <button id="redoPlanBtn">Redo</button>
+            <button id="rejectPlanBtn">Reject Plan</button>
+          </div>
+
+          <!-- Run lifecycle actions -->
+          <div id="runActions" class="plan-result-actions panel-actions hidden">
+            <button id="cancelRunBtn">Cancel</button>
+            <button id="resumeRunBtn" class="hidden">Resume</button>
+            <button id="rollbackRunBtn" class="hidden">Rollback</button>
+            <button id="cloneRunBtn" class="hidden">Clone</button>
+          </div>
+        </aside>
+
+      </div>
+
+      <footer class="statusbar">
+        <button id="menuBtn" aria-label="Toggle navigation sidebar">Menu</button>
+        <button id="workspaceBtn">Supervisor Run</button>
+        <span id="status">Connecting</span>
+        <span class="status-spacer"></span>
+        <span id="claudeIndicator" class="brain-indicator hidden"></span>
+        <span id="openaiIndicator" class="brain-indicator hidden"></span>
+        <span id="geminiIndicator" class="brain-indicator hidden"></span>
+        <span>Ollama</span>
+      </footer>
+    </main>
+
+    <!-- Toast notification -->
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+    <!-- Floating context (kebab) menu -->
+    <div id="contextMenu" class="context-menu hidden" role="menu"></div>
+    <button id="drawerBackdrop" class="drawer-backdrop hidden" aria-label="Close open panel"></button>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

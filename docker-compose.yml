@@ -1,0 +1,163 @@
+services:
+  ollma-init:
+    image: alpine:3.22
+    container_name: ollma-init
+    user: "0:0"
+    restart: "no"
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        mkdir -p /data /jobs /snapshots &&
+        chown -R ${PUID:-3000}:0 /data /jobs /snapshots &&
+        chmod -R g+rwX /data /jobs /snapshots
+    volumes:
+      - ./data:/data
+      - ./jobs:/jobs
+      - ./snapshots:/snapshots
+
+  ollma-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PUID: ${PUID:-3000}
+    container_name: ollma-ui
+    restart: unless-stopped
+    user: "${PUID:-3000}:0"
+    group_add:
+      - "${PROJECTS_GID:-3001}"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${UI_MEM_LIMIT:-1g}
+    cpus: ${UI_CPUS:-2.0}
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    ports:
+      - "31001:8080"
+    environment:
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-now}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:-}
+      ALLOW_INSECURE_PASSWORD: ${ALLOW_INSECURE_PASSWORD:-}
+      SESSION_SECRET: ${SESSION_SECRET:-change-this-session-secret}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      ALLOWED_ROOTS: ${ALLOWED_ROOTS:-/workspace/apps,/workspace/projects}
+      DATA_DIR: /data
+      JOBS_DIR: /jobs
+      SNAPSHOT_DIR: /snapshots
+      WORKER_URL: http://ollma-worker:8090
+      BRAIN_URL: http://ollma-brain:8091
+      WORKER_TOKEN: ${WORKER_TOKEN:-change-this-worker-token}
+      COMMAND_TIMEOUT: ${COMMAND_TIMEOUT:-120}
+      SNAPSHOT_RETENTION_DAYS: ${SNAPSHOT_RETENTION_DAYS:-30}
+      SNAPSHOT_MAX_BYTES: ${SNAPSHOT_MAX_BYTES:-21474836480}
+      SNAPSHOT_RESERVE_BYTES: ${SNAPSHOT_RESERVE_BYTES:-2147483648}
+      ORPHAN_GRACE_HOURS: ${ORPHAN_GRACE_HOURS:-24}
+      RUNNER_CONCURRENCY: ${RUNNER_CONCURRENCY:-1}
+      WORKER_POOL_SIZE: ${WORKER_POOL_SIZE:-1}
+      CHAT_CONTEXT_BYTES: ${CHAT_CONTEXT_BYTES:-120000}
+      CLAUDE_API_KEY: ${CLAUDE_API_KEY:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-5}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-sol}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      SECURE_COOKIE: ${SECURE_COOKIE:-false}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    volumes:
+      - ./data:/data
+      - ./jobs:/jobs
+      - ./snapshots:/snapshots
+      # Mount your own workspace roots here (must match ALLOWED_ROOTS above).
+      # Example: map host directories to the container paths the app is allowed to touch.
+      - ${APPS_HOST_PATH:-./workspace/apps}:/workspace/apps
+      - ${PROJECTS_HOST_PATH:-./workspace/projects}:/workspace/projects
+    depends_on:
+      ollma-init:
+        condition: service_completed_successfully
+      ollma-worker:
+        condition: service_healthy
+      ollma-brain:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/readyz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - ollma-private
+      - ollma-egress
+
+  ollma-brain:
+    build:
+      context: .
+      dockerfile: Dockerfile.brain
+      args:
+        PUID: ${PUID:-3000}
+    container_name: ollma-brain
+    restart: unless-stopped
+    user: "${PUID:-3000}:0"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${BRAIN_MEM_LIMIT:-1g}
+    cpus: ${BRAIN_CPUS:-1.0}
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    environment:
+      WORKER_TOKEN: ${WORKER_TOKEN:-change-this-worker-token}
+    depends_on:
+      ollma-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/healthz', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    networks:
+      - ollma-private
+      - ollma-egress
+
+  ollma-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      args:
+        PUID: ${PUID:-3000}
+    container_name: ollma-worker
+    restart: unless-stopped
+    user: "${PUID:-3000}:0"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${WORKER_MEM_LIMIT:-2g}
+    cpus: ${WORKER_CPUS:-2.0}
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    environment:
+      JOBS_DIR: /jobs
+      OLLAMA_BASE_URL: http://ollma-ui:8080/internal/ollama
+      WORKER_TOKEN: ${WORKER_TOKEN:-change-this-worker-token}
+      COMMAND_TIMEOUT: ${COMMAND_TIMEOUT:-120}
+    volumes:
+      - ./jobs:/jobs
+    depends_on:
+      ollma-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    networks:
+      - ollma-private
+
+networks:
+  ollma-private:
+    driver: bridge
+    internal: true
+  ollma-egress:
+    driver: bridge

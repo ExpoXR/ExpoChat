@@ -1,0 +1,17 @@
+data
+snapshots
+.git
+.github
+.env
+.env.*
+__pycache__
+*.pyc
+.venv
+.node
+.pwlibs
+.codex
+.claude
+node_modules
+test-results
+playwright-report
+backups

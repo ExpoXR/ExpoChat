@@ -1,0 +1,86 @@
+export function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+export function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let size = bytes;
+  let unit = -1;
+  do { size /= 1024; unit += 1; } while (size >= 1024 && unit < units.length - 1);
+  return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[unit]}`;
+}
+
+function localDate(value) {
+  const source = String(value || "").trim();
+  const normalized = /(?:Z|[+-]\d{2}:\d{2})$/i.test(source) ? source : `${source}Z`;
+  const date = new Date(normalized);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function padTime(value) {
+  return String(value).padStart(2, "0");
+}
+
+export function formatLocalTime(value) {
+  const date = localDate(value);
+  if (!date) return String(value || "");
+  return `${padTime(date.getHours())}:${padTime(date.getMinutes())}:${padTime(date.getSeconds())}`;
+}
+
+export function formatLocalDateTime(value) {
+  const date = localDate(value);
+  if (!date) return String(value || "");
+  const day = `${date.getFullYear()}-${padTime(date.getMonth() + 1)}-${padTime(date.getDate())}`;
+  return `${day} ${formatLocalTime(value)}`;
+}
+
+// Hardened, dependency-free markdown → HTML.
+// SECURITY INVARIANT: the full input is escapeHtml()'d before any transform, and
+// this renderer emits NO links, href, src, or raw HTML sinks — so model output can
+// never inject active content. Do not add link/image/raw-HTML support without a
+// real sanitizer. Input is length-bounded to cap regex backtracking (ReDoS) on
+// pathological model output.
+const MARKDOWN_MAX_CHARS = 100_000;
+
+export function renderMarkdown(value) {
+  let text = String(value);
+  if (text.length > MARKDOWN_MAX_CHARS) {
+    text = `${text.slice(0, MARKDOWN_MAX_CHARS)}\n\n… (truncated)`;
+  }
+  const codeBlocks = [];
+  let codeMarker = "\x00OLLMA_CODE_";
+  while (text.includes(codeMarker)) codeMarker += "_";
+  text = text.replace(/```([\w.-]*)\r?\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push({ lang: lang.trim() || "text", code: escapeHtml(code.replace(/\r\n/g, "\n").trimEnd()) });
+    return `${codeMarker}${idx}\x00`;
+  });
+  text = escapeHtml(text);
+  text = text.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  text = text.replace(/^###\s+(.+)$/gm, "<h3>$1</h3>");
+  text = text.replace(/^##\s+(.+)$/gm, "<h2>$1</h2>");
+  text = text.replace(/^#\s+(.+)$/gm, "<h1>$1</h1>");
+  text = text.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
+  text = text.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  text = text.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  text = text.replace(/((?:^- .+\n?)+)/gm, (block) => `<ul>${block.trim().split("\n").map((line) => `<li>${line.slice(2)}</li>`).join("")}</ul>`);
+  text = text.replace(/((?:^\d+\. .+\n?)+)/gm, (block) => `<ol>${block.trim().split("\n").map((line) => `<li>${line.replace(/^\d+\.\s+/, "")}</li>`).join("")}</ol>`);
+  text = text.replace(/^---+$/gm, "<hr>");
+  text = text.split(/\n{2,}/).map((part) => {
+    const trimmed = part.trim();
+    if (!trimmed) return "";
+    if (/^<(h[1-6]|ul|ol|hr|pre|div)/.test(trimmed)) return trimmed;
+    return `<p>${trimmed.replace(/\n/g, "<br>")}</p>`;
+  }).join("\n");
+  return text.replace(new RegExp(`${codeMarker}(\\d+)\\x00`, "g"), (_, index) => {
+    const { lang, code } = codeBlocks[Number(index)];
+    return `<div class="code-block"><div class="code-lang">${lang}</div><pre><code>${code}</code></pre></div>`;
+  });
+}

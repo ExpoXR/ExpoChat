@@ -1,0 +1,32 @@
+name: E2E
+
+permissions:
+  contents: read
+
+# Playwright e2e is heavier (browser image + fake service harness), so it runs
+# nightly and on demand rather than blocking every PR.
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  playwright:
+    name: Playwright responsive suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          npm ci
+      - name: Run e2e
+        # CI installs into the workflow's interpreter, not a .venv, so override the
+        # Makefile's default PYTHON (?= .venv/bin/python).
+        run: make e2e PYTHON=python

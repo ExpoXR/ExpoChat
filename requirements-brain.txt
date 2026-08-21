@@ -1,0 +1,5 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.0
+openai-codex==0.144.4
+claude-agent-sdk==0.2.128
+google-genai==2.16.0
